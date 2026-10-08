@@ -1,0 +1,21 @@
+From 42de4dbd7fbadfd5b8597ad4cec56a1420d1be97 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 65/91] hw/sd: build the OMAP3 MMCHS
+
+---
+ hw/sd/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/sd/meson.build b/hw/sd/meson.build
+index b43d45b..85f9806 100644
+--- a/hw/sd/meson.build
++++ b/hw/sd/meson.build
+@@ -10,3 +10,4 @@ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_sdhci.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-sdhost.c'))
+ system_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx_sdhci.c'))
+ system_ss.add(when: 'CONFIG_CADENCE_SDHCI', if_true: files('cadence_sdhci.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_hsmmc.c'))
+-- 
+2.55.0
+

@@ -1,0 +1,47 @@
+From 7d604fb871c7a8e4ff0c7b9ea833a5491cdef4be Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 15:06:50 -0400
+Subject: [PATCH 25/36] hw/i2c: imx_i2c completes a NAKed byte with its
+ interrupt
+
+When no target answers the address, or a target NAKs a data byte, the
+i.MX I2C controller still finishes the byte: it sets RXAK and raises
+IIF. The model set RXAK without the interrupt, so Linux's i2c-imx waited
+out its timeout on every transfer to an absent device (half a second per
+backlight change on the flintstone, where nlclient does one every few
+seconds and blocks meanwhile).
+---
+ hw/i2c/imx_i2c.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/hw/i2c/imx_i2c.c b/hw/i2c/imx_i2c.c
+index 9b2d100..df93ab9 100644
+--- a/hw/i2c/imx_i2c.c
++++ b/hw/i2c/imx_i2c.c
+@@ -231,8 +231,14 @@ static void imx_i2c_write(void *opaque, hwaddr offset,
+             if (s->address == ADDR_RESET) {
+                 if (i2c_start_transfer(s->bus, extract32(s->i2dr_write, 1, 7),
+                                        extract32(s->i2dr_write, 0, 1))) {
+-                    /* if non zero is returned, the address is not valid */
++                    /*
++                     * If non zero is returned, the address is not valid.
++                     * The byte still went out: the hardware flags the NAK
++                     * and completes the transfer, so the driver sees it
++                     * at once instead of timing out on the interrupt.
++                     */
+                     s->i2sr |= I2SR_RXAK;
++                    imx_i2c_raise_interrupt(s);
+                 } else {
+                     s->address = s->i2dr_write;
+                     s->i2sr &= ~I2SR_RXAK;
+@@ -244,6 +250,7 @@ static void imx_i2c_write(void *opaque, hwaddr offset,
+                     s->i2sr |= I2SR_RXAK;
+                     s->address = ADDR_RESET;
+                     i2c_end_transfer(s->bus);
++                    imx_i2c_raise_interrupt(s);
+                 } else {
+                     s->i2sr &= ~I2SR_RXAK;
+                     imx_i2c_raise_interrupt(s);
+-- 
+2.55.0
+

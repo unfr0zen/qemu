@@ -1,0 +1,49 @@
+From ae39cf2b1222827a59ba627f9bff25887ffe9954 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 07:14:54 -0400
+Subject: [PATCH 16/20] hw/adc: reset must quiesce the vf610 ADC
+
+A conversion left pending before a warm reset (watchdog reboot) kept the
+model's conversion timer armed and the IRQ line asserted into the fresh
+boot: the magwheel driver's request_irq then ran with COCO already set
+and the line high, and the vendor driver oopsed (NULL deref under
+__setup_irq):
+
+    Unable to handle kernel NULL pointer dereference at virtual address 00000000
+    ...
+    [<c0342bc8>] (magwheel_probe) from [<c0271ecc>] (platform_drv_probe+0x44/0xac)
+
+Reset now deletes the pending timer, clears COCO and de-asserts the
+IRQ line.
+---
+ hw/adc/imx6_adc.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hw/adc/imx6_adc.c b/hw/adc/imx6_adc.c
+index 5c2b2b6..03b602e 100644
+--- a/hw/adc/imx6_adc.c
++++ b/hw/adc/imx6_adc.c
+@@ -274,6 +274,12 @@ static void imx6_adc_reset(DeviceState *dev)
+ {
+     Imx6AdcState *s = IMX6_ADC(dev);
+ 
++    /* A reset must quiesce the device: a conversion left pending from
++     * before (warm reset) would fire into the fresh boot with COCO set
++     * and the IRQ line asserted, oopsing the driver's request_irq. */
++    if (s->convert) {
++        timer_del(s->convert);
++    }
+     s->hc[0] = ADC_CONV_DISABLE;
+     s->hc[1] = ADC_CONV_DISABLE;
+     s->hs = 0;
+@@ -286,6 +292,7 @@ static void imx6_adc_reset(DeviceState *dev)
+     s->ofs = 0;
+     s->cal = 0;
+     s->pctl = 0;
++    adc_update_irq(s);
+ }
+ 
+ static void imx6_adc_realize(DeviceState *dev, Error **errp)
+-- 
+2.55.0
+

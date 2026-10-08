@@ -1,0 +1,58 @@
+From a1b305aaceb77a1a0cf4cba7a746c57b66e6e780 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 75/91] include/hw/display: OMAP3 display subsystem state
+
+---
+ include/hw/display/omap3_dss.h | 39 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+ create mode 100644 include/hw/display/omap3_dss.h
+
+diff --git a/include/hw/display/omap3_dss.h b/include/hw/display/omap3_dss.h
+new file mode 100644
+index 0000000..9fdc194
+--- /dev/null
++++ b/include/hw/display/omap3_dss.h
+@@ -0,0 +1,39 @@
++/*
++ * OMAP3 display subsystem (DSS, DISPC, RFBI, VENC, DSI), parallel LCD out
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_DISPLAY_OMAP3_DSS_H
++#define HW_DISPLAY_OMAP3_DSS_H
++
++#include "hw/core/sysbus.h"
++#include "qemu/timer.h"
++#include "ui/console.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_DSS "omap3-dss"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3DssState, OMAP3_DSS)
++
++#define OMAP3_DSS_BLOCK 0x400
++
++struct Omap3DssState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;         /* 0x48050000: DSS, DISPC, RFBI, VENC */
++    MemoryRegion dsi_iomem;     /* 0x4804fc00 */
++    QemuConsole *con;
++    QEMUTimer *vsync;
++    qemu_irq irq;
++
++    uint32_t dss[OMAP3_DSS_BLOCK / 4];
++    uint32_t dispc[OMAP3_DSS_BLOCK / 4];
++    uint32_t rfbi[OMAP3_DSS_BLOCK / 4];
++    uint32_t venc[OMAP3_DSS_BLOCK / 4];
++    uint32_t dsi[OMAP3_DSS_BLOCK / 4];
++    uint32_t dispc_irqstatus;
++};
++
++#endif
+-- 
+2.55.0
+

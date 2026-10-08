@@ -1,0 +1,94 @@
+From b391f7f69eda154a1a2e4bc93eee1fb87a7bb427 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 85/91] include/hw/arm: OMAP3630 / AM3703 SoC state
+
+---
+ include/hw/arm/omap3630.h | 75 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+ create mode 100644 include/hw/arm/omap3630.h
+
+diff --git a/include/hw/arm/omap3630.h b/include/hw/arm/omap3630.h
+new file mode 100644
+index 0000000..4efdbf2
+--- /dev/null
++++ b/include/hw/arm/omap3630.h
+@@ -0,0 +1,75 @@
++/*
++ * TI OMAP3630 / AM3703 SoC
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_ARM_OMAP3630_H
++#define HW_ARM_OMAP3630_H
++
++#include "hw/core/sysbus.h"
++#include "hw/char/omap3_uart.h"
++#include "hw/display/omap3_dss.h"
++#include "hw/dma/omap3_sdma.h"
++#include "hw/gpio/omap3_gpio.h"
++#include "hw/i2c/omap3_i2c.h"
++#include "hw/intc/omap3_intc.h"
++#include "hw/misc/omap3_gpmc.h"
++#include "hw/misc/omap3_prcm.h"
++#include "hw/sd/omap3_hsmmc.h"
++#include "hw/ssi/omap3_mcspi.h"
++#include "hw/timer/omap3_gptimer.h"
++#include "target/arm/cpu.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3630 "omap3630"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3630State, OMAP3630)
++
++#define OMAP3630_ROM_ADDR       0x40014000
++#define OMAP3630_ROM_SIZE       0x8000
++#define OMAP3630_ROM_ENTRY      (OMAP3630_ROM_ADDR + 0x40)  /* image entry word */
++#define OMAP3630_SRAM_ADDR      0x40200000
++#define OMAP3630_SRAM_SIZE      0x10000
++#define OMAP3630_SDRAM_ADDR     0x80000000
++
++#define OMAP3630_NUM_UART       4
++#define OMAP3630_NUM_I2C        3
++#define OMAP3630_NUM_GPIO       6
++#define OMAP3630_NUM_MMC        3
++#define OMAP3630_NUM_MCSPI      4
++
++/* MPU interrupt numbers */
++#define OMAP3630_IRQ_SYS_NIRQ   7
++
++struct Omap3630State {
++    DeviceState parent_obj;
++
++    ARMCPU cpu;
++    Omap3IntcState intc;
++    Omap3GpTimerState gpt[OMAP3_NUM_GPT];
++    Omap3SyncTimerState synctimer;
++    Omap3CmState cm;
++    Omap3PrmState prm;
++    Omap3ScmState scm;
++    Omap3SdrcState sdrc;
++    Omap3GpmcState gpmc;
++    Omap3SdmaState sdma;
++    Omap3UartState uart[OMAP3630_NUM_UART];
++    Omap3I2cState i2c[OMAP3630_NUM_I2C];
++    Omap3GpioState gpio[OMAP3630_NUM_GPIO];
++    Omap3HsmmcState mmc[OMAP3630_NUM_MMC];
++    Omap3McspiState mcspi[OMAP3630_NUM_MCSPI];
++    Omap3DssState dss;
++    DeviceState *wdt2;
++    DeviceState *musb;
++
++    MemoryRegion rom;
++    MemoryRegion sram;
++};
++
++/* Load a GP-device boot image (size, load address, code) at reset. */
++void omap3630_rom_set_entry(Omap3630State *s, uint32_t entry);
++
++#endif
+-- 
+2.55.0
+

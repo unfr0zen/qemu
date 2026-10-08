@@ -1,0 +1,223 @@
+From 409d479b543277912954af33100af45ece644535 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 79/91] hw/input: ADBS-A320 optical finger navigation, the
+ j49's ring
+
+---
+ hw/input/adbs_a330.c | 203 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 203 insertions(+)
+ create mode 100644 hw/input/adbs_a330.c
+
+diff --git a/hw/input/adbs_a330.c b/hw/input/adbs_a330.c
+new file mode 100644
+index 0000000..dda122f
+--- /dev/null
++++ b/hw/input/adbs_a330.c
+@@ -0,0 +1,203 @@
++/*
++ * Avago ADBS-A320 optical finger navigation sensor (i2c), the j49's ring
++ *
++ * The ring turns over the sensor; Nest's avago-adbs-a330 driver reads the
++ * product and revision IDs at probe, sets the sensor up through its OFN
++ * registers, and on each MOTION_L edge reads DELTA_X and DELTA_Y until both
++ * come back zero, accumulating the configured axis (DELTA_Y on j49).
++ *
++ * Motion arrives on the QOM "motion" property: writing N adds N counts
++ * (signed) to what the sensor has to report. MOTION_L (GPIO output 0,
++ * active low) is held while any is pending, and DELTA_Y hands it out at
++ * most 127 counts per read; DELTA_X reads zero.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/i2c/i2c.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++
++#define TYPE_ADBS_A330 "adbs-a330"
++OBJECT_DECLARE_SIMPLE_TYPE(AdbsA330State, ADBS_A330)
++
++#define REG_PRODUCT_ID          0x00
++#define REG_REVISION_ID         0x01
++#define REG_MOTION              0x02
++#define REG_DELTA_X             0x03
++#define REG_DELTA_Y             0x04
++#define REG_SQUAL               0x05
++#define REG_SOFT_RESET          0x3a
++#define REG_INVERSE_REVISION_ID 0x3e
++#define REG_INVERSE_PRODUCT_ID  0x3f
++
++#define PRODUCT_ID              0x83    /* ADBS-A320 */
++#define REVISION_ID             0x01
++#define MOTION_MOT              0x80
++
++struct AdbsA330State {
++    I2CSlave i2c;
++
++    qemu_irq motion_l;
++    uint8_t regs[256];
++    uint8_t cur;
++    bool first_byte;
++    int32_t pending;            /* counts not yet read out */
++};
++
++static void adbs_update(AdbsA330State *s)
++{
++    qemu_set_irq(s->motion_l, !s->pending);
++}
++
++static uint8_t adbs_take(AdbsA330State *s)
++{
++    int32_t d = MAX(MIN(s->pending, 127), -128);
++
++    s->pending -= d;
++    adbs_update(s);
++    return (uint8_t)(int8_t)d;
++}
++
++static uint8_t adbs_read(AdbsA330State *s, uint8_t reg)
++{
++    switch (reg) {
++    case REG_PRODUCT_ID:
++        return PRODUCT_ID;
++    case REG_REVISION_ID:
++        return REVISION_ID;
++    case REG_INVERSE_PRODUCT_ID:
++        return (uint8_t)~PRODUCT_ID;
++    case REG_INVERSE_REVISION_ID:
++        return (uint8_t)~REVISION_ID;
++    case REG_MOTION:
++        return s->pending ? MOTION_MOT : 0;
++    case REG_DELTA_X:
++        return 0;
++    case REG_DELTA_Y:
++        return adbs_take(s);
++    case REG_SQUAL:
++        return 0x40;                    /* a finger on the ring's surface */
++    }
++    return s->regs[reg];
++}
++
++static int adbs_event(I2CSlave *i2c, enum i2c_event event)
++{
++    AdbsA330State *s = ADBS_A330(i2c);
++
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->first_byte = true;
++    }
++    return 0;
++}
++
++static int adbs_send(I2CSlave *i2c, uint8_t data)
++{
++    AdbsA330State *s = ADBS_A330(i2c);
++
++    if (s->first_byte) {
++        s->cur = data;
++        s->first_byte = false;
++    } else {
++        s->regs[s->cur++] = data;
++    }
++    return 0;
++}
++
++static uint8_t adbs_recv(I2CSlave *i2c)
++{
++    AdbsA330State *s = ADBS_A330(i2c);
++
++    return adbs_read(s, s->cur++);
++}
++
++static void adbs_get_motion(Object *obj, Visitor *v, const char *name,
++                            void *opaque, Error **errp)
++{
++    AdbsA330State *s = ADBS_A330(obj);
++
++    visit_type_int32(v, name, &s->pending, errp);
++}
++
++static void adbs_set_motion(Object *obj, Visitor *v, const char *name,
++                            void *opaque, Error **errp)
++{
++    AdbsA330State *s = ADBS_A330(obj);
++    int32_t counts;
++
++    if (!visit_type_int32(v, name, &counts, errp)) {
++        return;
++    }
++    s->pending += counts;
++    adbs_update(s);
++}
++
++static void adbs_reset(DeviceState *dev)
++{
++    AdbsA330State *s = ADBS_A330(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->cur = 0;
++    s->first_byte = false;
++    s->pending = 0;
++    adbs_update(s);
++}
++
++static void adbs_init(Object *obj)
++{
++    AdbsA330State *s = ADBS_A330(obj);
++
++    qdev_init_gpio_out(DEVICE(obj), &s->motion_l, 1);
++    object_property_add(obj, "motion", "int32", adbs_get_motion,
++                        adbs_set_motion, NULL, NULL);
++}
++
++static const VMStateDescription adbs_vmstate = {
++    .name = TYPE_ADBS_A330,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_I2C_SLAVE(i2c, AdbsA330State),
++        VMSTATE_UINT8_ARRAY(regs, AdbsA330State, 256),
++        VMSTATE_UINT8(cur, AdbsA330State),
++        VMSTATE_BOOL(first_byte, AdbsA330State),
++        VMSTATE_INT32(pending, AdbsA330State),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void adbs_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, adbs_reset);
++    dc->vmsd = &adbs_vmstate;
++    dc->desc = "Avago ADBS-A320 optical finger navigation sensor";
++    k->event = adbs_event;
++    k->send = adbs_send;
++    k->recv = adbs_recv;
++}
++
++static const TypeInfo adbs_info = {
++    .name = TYPE_ADBS_A330,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(AdbsA330State),
++    .instance_init = adbs_init,
++    .class_init = adbs_class_init,
++};
++
++static void adbs_register_types(void)
++{
++    type_register_static(&adbs_info);
++}
++
++type_init(adbs_register_types)
+-- 
+2.55.0
+

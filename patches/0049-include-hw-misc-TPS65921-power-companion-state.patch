@@ -1,0 +1,71 @@
+From 4eb959c9904015e2d496c95a348842aa97e74d9f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 49/91] include/hw/misc: TPS65921 power companion state
+
+---
+ include/hw/misc/tps65921.h | 52 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+ create mode 100644 include/hw/misc/tps65921.h
+
+diff --git a/include/hw/misc/tps65921.h b/include/hw/misc/tps65921.h
+new file mode 100644
+index 0000000..304b760
+--- /dev/null
++++ b/include/hw/misc/tps65921.h
+@@ -0,0 +1,52 @@
++/*
++ * TI TPS65921 power management companion (TWL4030 family)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_TPS65921_H
++#define HW_MISC_TPS65921_H
++
++#include "hw/i2c/i2c.h"
++#include "qom/object.h"
++
++#define TYPE_TPS65921 "tps65921"
++OBJECT_DECLARE_SIMPLE_TYPE(Tps65921State, TPS65921)
++
++#define TYPE_TPS65921_SUB "tps65921-sub"
++OBJECT_DECLARE_SIMPLE_TYPE(Tps65921SubState, TPS65921_SUB)
++
++/* the four I2C slaves: 0x48 (USB), 0x49, 0x4a, 0x4b (power, RTC) */
++#define TPS65921_ADDR   0x48
++#define TPS65921_NUM_ID 4
++
++typedef struct Tps65921Slave {
++    uint8_t ptr;                /* register pointer */
++    bool addressed;             /* first byte of a write sets ptr */
++} Tps65921Slave;
++
++struct Tps65921State {
++    I2CSlave parent_obj;        /* ID 0, at 0x48 */
++
++    Tps65921SubState *sub[TPS65921_NUM_ID - 1];
++    Tps65921Slave slave[TPS65921_NUM_ID];
++    uint8_t regs[TPS65921_NUM_ID][256];
++    qemu_irq irq;               /* SYS_NIRQ, active high here */
++    int64_t rtc_offset;         /* guest RTC - host clock, seconds */
++    uint32_t adcin_mv[16];      /* MADC inputs (mV), QOM "adcinN-mv" */
++    bool pwron;                 /* the PWRON pin (button pressed) */
++    uint8_t pwr_pending;        /* power SIH events, before IMR1 */
++};
++
++/* GPIO input 0: the PWRON pin, 1 while the button is pressed. */
++
++struct Tps65921SubState {
++    I2CSlave parent_obj;
++
++    Tps65921State *core;
++    uint8_t id;
++};
++
++#endif
+-- 
+2.55.0
+

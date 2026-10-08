@@ -1,0 +1,132 @@
+From 5d18f4daf0a3f4da531db1fe476145e1fe201e61 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:38:16 -0400
+Subject: [PATCH 29/36] hw/arm: flintstone: boot a RAM U-Boot with -bios; GPMI
+ raw page reads
+
+-bios FILE makes the boot ROM stub write a raw U-Boot image linked at
+the firmware entry point into DDR and start it there, as SPL would
+leave it, instead of loading fw1 from NAND. The file is read on every
+reset, so a rebuilt image (the repo's build/u-boot-recovery.bin) boots
+on the next reboot.
+
+That U-Boot is 2023.04, whose mxs_nand reads each block's bad-block
+marker with a raw (non-ECC) data read after READ0/READSTART. The GPMI
+model only fed page data through its BCH path, so raw reads returned
+zeros and every block read as bad. READSTART now latches the page for
+a raw stream, and CHANGE READ COLUMN (0x05/0xe0) repositions it: the
+logical page from the column onward, then all-ones for the OOB the
+backend does not hold, i.e. erased, so every marker reads good.
+---
+ hw/arm/flintstone.c             | 19 +++++++++++++++++++
+ hw/misc/imx_gpmi_nand.c         | 22 ++++++++++++++++++++++
+ include/hw/misc/imx_gpmi_nand.h |  2 ++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index a82680a..e81c7b0 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -60,6 +60,7 @@
+ 
+ struct FlintstoneRomBoot {
+     BlockBackend *blk;
++    const char *bios;   /* -bios: a RAM U-Boot to start instead of fw1 */
+ };
+ 
+ static void flintstone_rom_boot(void *opaque)
+@@ -71,6 +72,23 @@ static void flintstone_rom_boot(void *opaque)
+      * reboot would otherwise resume with the MMU and caches still on. */
+     cpu_reset(first_cpu);
+ 
++    if (rom->bios) {
++        /* A raw U-Boot image linked at the entry point (the repo's
++         * build/u-boot-recovery.bin), as SPL would leave it in DDR. Read
++         * at every reset, so a rebuilt file boots on the next reboot. */
++        g_autofree char *img = NULL;
++        gsize len;
++
++        if (!g_file_get_contents(rom->bios, &img, &len, NULL) ||
++            len > FLINTSTONE_RAM_ADDR + FLINTSTONE_RAM_SIZE - FLINTSTONE_FW_ENTRY) {
++            error_report("flintstone: cannot load -bios %s", rom->bios);
++            exit(1);
++        }
++        cpu_physical_memory_write(FLINTSTONE_FW_ENTRY, img, len);
++        cpu_set_pc(first_cpu, FLINTSTONE_FW_ENTRY);
++        return;
++    }
++
+     if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF, FLINTSTONE_FW_SIZE,
+                   buf, 0) < 0) {
+         error_report("flintstone: ROM could not read NAND firmware");
+@@ -165,6 +183,7 @@ static void flintstone_init(MachineState *machine)
+         /* The boot ROM runs after CPU reset, so hook it as a reset
+          * handler: it loads the NAND firmware and starts the CPU. */
+         rom->blk = nand;
++        rom->bios = machine->firmware;
+         qemu_register_reset(flintstone_rom_boot, rom);
+     }
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
+diff --git a/hw/misc/imx_gpmi_nand.c b/hw/misc/imx_gpmi_nand.c
+index eac0f29..8cb727a 100644
+--- a/hw/misc/imx_gpmi_nand.c
++++ b/hw/misc/imx_gpmi_nand.c
+@@ -170,6 +170,19 @@ static void nand_command(ImxGpmiNandState *s, uint8_t cmd)
+     case 0x30: /* read, second cycle */
+         if (s->last_cmd == 0x00) {
+             s->last_cmd = 0x30; /* page latched in s->row, ready to read */
++            if (!s->blk ||
++                blk_pread(s->blk, (int64_t)s->row * IMX_GPMI_NAND_PAGE_SIZE,
++                          IMX_GPMI_NAND_PAGE_SIZE, s->read_buf, 0) < 0) {
++                memset(s->read_buf, 0xff, sizeof(s->read_buf));
++            }
++            s->stream = GPMI_STREAM_PAGE;
++            s->stream_pos = s->col;
++        }
++        break;
++    case 0xe0: /* change read column, second cycle */
++        if (s->last_cmd == 0x30) {
++            s->stream = GPMI_STREAM_PAGE;
++            s->stream_pos = s->col;
+         }
+         break;
+     case 0x80: /* program, first cycle */
+@@ -233,6 +246,15 @@ static uint8_t nand_stream_byte(ImxGpmiNandState *s)
+         return s->status;
+     case GPMI_STREAM_PARAM: /* no valid ONFI table: all-ones */
+         return 0xff;
++    case GPMI_STREAM_PAGE:
++        /*
++         * A raw read gets the logical page (the backend has no ECC
++         * layout to interleave), then all-ones for the OOB the backend
++         * does not hold: erased, so every bad-block marker reads good.
++         * U-Boot 2023's mxs_nand reads the marker this way.
++         */
++        return s->stream_pos < IMX_GPMI_NAND_PAGE_SIZE ?
++               s->read_buf[s->stream_pos++] : (s->stream_pos++, 0xff);
+     default:
+         return 0;
+     }
+diff --git a/include/hw/misc/imx_gpmi_nand.h b/include/hw/misc/imx_gpmi_nand.h
+index 273e4a5..e8bc4eb 100644
+--- a/include/hw/misc/imx_gpmi_nand.h
++++ b/include/hw/misc/imx_gpmi_nand.h
+@@ -48,6 +48,7 @@ enum imx_gpmi_stream {
+     GPMI_STREAM_ID,
+     GPMI_STREAM_STATUS,
+     GPMI_STREAM_PARAM,
++    GPMI_STREAM_PAGE,   /* raw (non-ECC) data read of the latched page */
+ };
+ 
+ struct ImxGpmiNandState {
+@@ -102,6 +103,7 @@ struct ImxGpmiNandState {
+     unsigned stream_pos;
+     uint8_t page_buf[IMX_GPMI_NAND_PAGE_SIZE + IMX_GPMI_NAND_OOB_SIZE];
+     uint32_t page_len;
++    uint8_t read_buf[IMX_GPMI_NAND_PAGE_SIZE]; /* page latched by READSTART */
+     bool programming;
+ };
+ 
+-- 
+2.55.0
+

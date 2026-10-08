@@ -1,0 +1,68 @@
+From bf0582bf10738cb2560a27df2a32bdbf38a208ee Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 70/91] include/hw/dma: OMAP3 system DMA controller state
+
+---
+ include/hw/dma/omap3_sdma.h | 49 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+ create mode 100644 include/hw/dma/omap3_sdma.h
+
+diff --git a/include/hw/dma/omap3_sdma.h b/include/hw/dma/omap3_sdma.h
+new file mode 100644
+index 0000000..47f55cc
+--- /dev/null
++++ b/include/hw/dma/omap3_sdma.h
+@@ -0,0 +1,49 @@
++/*
++ * OMAP3 system DMA controller (SDMA, "DMA4")
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_DMA_OMAP3_SDMA_H
++#define HW_DMA_OMAP3_SDMA_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_SDMA "omap3-sdma"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3SdmaState, OMAP3_SDMA)
++
++#define OMAP3_SDMA_CHANNELS 32
++#define OMAP3_SDMA_LINES    4
++/* GPIO inputs: the DMA requests, numbered as Linux's OMAP24XX_DMA_* (the
++ * hardware's S_DMA_n is input n + 1); input 0 is unused. */
++#define OMAP3_SDMA_REQUESTS 128
++
++typedef struct Omap3SdmaChannel {
++    uint32_t ccr, clnk_ctrl, cicr, csr, csdp, cen, cfn;
++    uint32_t cssa, cdsa, csei, csfi, cdei, cdfi;
++    uint32_t csac, cdac, ccen, ccfn, color;
++    /* progress through the block */
++    uint32_t src, dst;          /* next element's addresses */
++    uint32_t elem, frame;       /* next element and frame numbers */
++} Omap3SdmaChannel;
++
++struct Omap3SdmaState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq[OMAP3_SDMA_LINES];
++
++    uint32_t irqstatus[OMAP3_SDMA_LINES];
++    uint32_t irqenable[OMAP3_SDMA_LINES];
++    uint32_t ocp_sysconfig;
++    uint32_t gcr;
++    Omap3SdmaChannel ch[OMAP3_SDMA_CHANNELS];
++    bool request[OMAP3_SDMA_REQUESTS];
++    bool busy;                  /* inside a transfer: no re-entry */
++    QEMUBH *bh;                 /* serves the synchronised channels */
++};
++
++#endif
+-- 
+2.55.0
+

@@ -1,0 +1,222 @@
+From 4ce108ce86149c7a9515a6bf009dfeeedd09f387 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:36:27 -0400
+Subject: [PATCH 13/20] hw/arm: wire the lcdif, both adcs, the sdma and mmdc
+ stubs and the pfuze200 into the 6SX SoC
+
+- LCDIF at 0x02220000, IRQ 5 (lcdif@02224000 stays unimplemented; its
+  node is disabled in the tree). Registers the board's graphic console.
+- ADC1/ADC2 at 0x02280000/0x02284000, IRQs 100/101, replacing the
+  adc1-2 unimplemented blob. ADC1 runs the wheel (gate-active-low);
+  ADC2 the battery divider. Their gate lines are wired by the board.
+- SDMA at 0x020ec000, IRQ 2, and MMDC at 0x021b0000, as probe stubs.
+- The PFUZE200 on i2c4 bus at address 0x08.
+- BCH VERSION answered at the RM offset 0x160 as well as the legacy
+  0x180.
+---
+ hw/arm/Kconfig              |  3 ++
+ hw/arm/fsl-imx6sx.c         | 63 +++++++++++++++++++++++++++++++++++--
+ include/hw/arm/fsl-imx6sx.h | 16 ++++++++++
+ 3 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 359113c..6adcf9e 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -539,7 +539,10 @@ config FSL_IMX6SX
+     select IMX
+     select IMX_FEC
+     select IMX_I2C
++    select IMX_LCDIF  # display scanout (hx8357 panel on the Display-3.4)
+     select IMX_USBPHY
++    select PFUZE200   # the board's PMIC (i2c4 @ 0x08)
++    select SPLIT_IRQ
+     select WDT_IMX2
+     select PL310  # cache controller
+     select SDHCI
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index 803d2b2..d0e810e 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -23,6 +23,8 @@
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
+ #include "hw/arm/fsl-imx6sx.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/pfuze200.h"
+ #include "hw/misc/unimp.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/qdev-properties.h"
+@@ -39,6 +41,7 @@
+ #define IMX6SX_ESDHC_CAPABILITIES   0x057834b4
+ 
+ #define NAME_SIZE 20
++#define FSL_IMX6SX_NUM_ADCS 2
+ 
+ static const struct {
+     hwaddr addr;
+@@ -53,12 +56,10 @@ static const struct {
+     { FSL_IMX6SX_GPC_ADDR,   0x4000,                "gpc" },
+     { FSL_IMX6SX_IOMUXC_ADDR, 0x4000,               "iomuxc" },
+     { FSL_IMX6SX_IOMUXC_GPR_ADDR, 0x4000,           "iomuxc-gpr" },
+-    { FSL_IMX6SX_SDMA_ADDR,  0x4000,                "sdma" },
+     /* AIPS2 */
+     { FSL_IMX6SX_CAAM_ADDR,  FSL_IMX6SX_CAAM_SIZE,  "caam" },
+     { FSL_IMX6SX_MLB_ADDR,   0x4000,                "mlb" },
+     { FSL_IMX6SX_ROMCP_ADDR, 0x4000,                "romcp" },
+-    { FSL_IMX6SX_MMDC_ADDR,  0x4000,                "mmdc" },
+     { FSL_IMX6SX_WEIM_ADDR,  0x4000,                "weim" },
+     { FSL_IMX6SX_OCOTP_ADDR, 0x4000,                "ocotp" },
+     { FSL_IMX6SX_SAI1_ADDR,  0xC000,                "sai-audmux" },
+@@ -67,7 +68,6 @@ static const struct {
+     { FSL_IMX6SX_QSPI2_MEM_ADDR, FSL_IMX6SX_QSPI2_MEM_SIZE, "qspi2-mem" },
+     { FSL_IMX6SX_QOSC_ADDR,  0x4000,                "qosc" },
+     /* AIPS3 */
+-    { FSL_IMX6SX_ADC1_ADDR,  0x8000,                "adc1-2" },
+     { FSL_IMX6SX_ECSPI4_ADDR, 0x4000,               "ecspi4" },
+     { FSL_IMX6SX_SEMA4_ADDR, 0x4000,                "sema4" },
+     { FSL_IMX6SX_MU_ADDR,    0x4000,                "mu" },
+@@ -90,6 +90,14 @@ static void fsl_imx6sx_init(Object *obj)
+ 
+     object_initialize_child(obj, "gpmi", &s->gpmi, TYPE_IMX_GPMI_NAND);
+ 
++    object_initialize_child(obj, "sdma", &s->sdma, TYPE_IMX6_SDMA);
++    object_initialize_child(obj, "mmdc", &s->mmdc, TYPE_IMX6_MMDC);
++    object_initialize_child(obj, "lcdif", &s->lcdif, TYPE_IMX_LCDIF);
++    for (i = 0; i < FSL_IMX6SX_NUM_ADCS; i++) {
++        snprintf(name, NAME_SIZE, "adc%d", i + 1);
++        object_initialize_child(obj, name, &s->adc[i], TYPE_IMX6_ADC);
++    }
++
+     for (i = 0; i < FSL_IMX6SX_NUM_UARTS; i++) {
+         snprintf(name, NAME_SIZE, "uart%d", i + 1);
+         object_initialize_child(obj, name, &s->uart[i], TYPE_IMX_SERIAL);
+@@ -273,6 +281,17 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+     sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmi), 1,
+                        qdev_get_gpio_in(gic, FSL_IMX6SX_APBH_IRQ));
+ 
++    /* SDMA and MMDC: probe-answer stubs (see imx6_sdma.c / imx6_mmdc.c). */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdma), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdma), 0, FSL_IMX6SX_SDMA_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdma), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_SDMA_IRQ));
++
++    sysbus_realize(SYS_BUS_DEVICE(&s->mmdc), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mmdc), 0, FSL_IMX6SX_MMDC_ADDR);
++
+     /* Initialize all UARTs */
+     {
+         static const struct {
+@@ -348,6 +367,9 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+             sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
+                                qdev_get_gpio_in(gic, i2c_table[i].irq));
+         }
++
++        /* The PFUZE200 PMIC, i2c4 address 0x08 (see hw/i2c/pfuze200.c). */
++        i2c_slave_create_simple(s->i2c[3].bus, TYPE_PFUZE200, 0x08);
+     }
+ 
+     /* Initialize ECSPI1-4: contiguous 16 KiB blocks, consecutive IRQs */
+@@ -400,6 +422,41 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+         }
+     }
+ 
++    /*
++     * The board's ADC front ends: adc1 is the magwheel (two Hall channels
++     * in quadrature, gated by the hall-enable line GPIO7_IO02, active
++     * low); adc2 reads the battery divider, gated by GPIO6_IO16 (active
++     * high). The wheel sees the UI through its wheel-position property
++     * (the machine aliases it as /machine/wheel-position).
++     */
++    object_property_set_bool(OBJECT(&s->adc[0]), "gate-active-low", true,
++                             &error_abort);
++    for (i = 0; i < FSL_IMX6SX_NUM_ADCS; i++) {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } adc_table[FSL_IMX6SX_NUM_ADCS] = {
++            { FSL_IMX6SX_ADC1_ADDR, FSL_IMX6SX_ADC1_IRQ },
++            { FSL_IMX6SX_ADC2_ADDR, FSL_IMX6SX_ADC2_IRQ },
++        };
++
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->adc[i]), 0, adc_table[i].addr);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc[i]), 0,
++                           qdev_get_gpio_in(gic, adc_table[i].irq));
++    }
++    /* The gate lines come from the board wiring in flintstone_init. */
++
++    /* LCDIF: scanout for the hx8357 panel (480x640@32bpp over the CMA fb). */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->lcdif), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->lcdif), 0, FSL_IMX6SX_LCDIF_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->lcdif), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_LCDIF_IRQ));
++
+     /* Initialize all SDHC */
+     {
+         static const struct {
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+index da3fda1..ce05d7c 100644
+--- a/include/hw/arm/fsl-imx6sx.h
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -27,8 +27,12 @@
+ #define FSL_IMX6SX_H
+ 
+ #include "cpu.h"
++#include "hw/adc/imx6_adc.h"
+ #include "hw/char/imx_serial.h"
++#include "hw/display/imx_lcdif.h"
+ #include "hw/misc/imx_gpmi_nand.h"
++#include "hw/misc/imx6_mmdc.h"
++#include "hw/misc/imx6_sdma.h"
+ #include "hw/cpu/a9mpcore.h"
+ #include "hw/gpio/imx_gpio.h"
+ #include "hw/i2c/imx_i2c.h"
+@@ -145,6 +149,7 @@ DECLARE_INSTANCE_CHECKER(FslIMX6SXState, FSL_IMX6SX, TYPE_FSL_IMX6SX)
+ #define FSL_IMX6SX_IOMUXC_ADDR      0x020E0000
+ #define FSL_IMX6SX_IOMUXC_GPR_ADDR  0x020E4000
+ #define FSL_IMX6SX_SDMA_ADDR        0x020EC000
++#define FSL_IMX6SX_SDMA_IRQ         2
+ 
+ /* AIPS2 */
+ #define FSL_IMX6SX_CAAM_ADDR        0x02100000
+@@ -204,12 +209,18 @@ DECLARE_INSTANCE_CHECKER(FslIMX6SXState, FSL_IMX6SX, TYPE_FSL_IMX6SX)
+ 
+ /* AIPS3 (the 6SX-only third bus) */
+ #define FSL_IMX6SX_ADC1_ADDR        0x02280000
++#define FSL_IMX6SX_ADC1_IRQ         100
+ #define FSL_IMX6SX_ADC2_ADDR        0x02284000
++#define FSL_IMX6SX_ADC2_IRQ         101
+ #define FSL_IMX6SX_WDOG3_ADDR       0x02288000
+ #define FSL_IMX6SX_WDOG3_IRQ        11
+ #define FSL_IMX6SX_ECSPI4_ADDR      0x0228C000
+ #define FSL_IMX6SX_SEMA4_ADDR       0x02290000
+ #define FSL_IMX6SX_MU_ADDR          0x02294000
++#define FSL_IMX6SX_LCDIF_ADDR       0x02220000
++#define FSL_IMX6SX_LCDIF_SIZE       0x4000
++#define FSL_IMX6SX_LCDIF_IRQ        5
++#define FSL_IMX6SX_LCDIF2_ADDR      0x02224000
+ #define FSL_IMX6SX_UART6_ADDR       0x022A0000
+ #define FSL_IMX6SX_UART6_IRQ        17
+ 
+@@ -243,6 +254,11 @@ struct FslIMX6SXState {
+ 
+     ImxGpmiNandState gpmi;
+ 
++    Imx6SdmaState sdma;
++    Imx6MmdcState mmdc;
++    ImxLcdifState lcdif;
++    Imx6AdcState adc[2];
++
+     MemoryRegion rom;
+     MemoryRegion caam;
+     MemoryRegion ocram;
+-- 
+2.55.0
+

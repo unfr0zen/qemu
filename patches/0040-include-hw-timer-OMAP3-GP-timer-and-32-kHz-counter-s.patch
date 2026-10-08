@@ -1,0 +1,90 @@
+From de9935bf1b14b79a51c4f7d96a295e3c8aa95f63 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 40/91] include/hw/timer: OMAP3 GP timer and 32 kHz counter
+ state
+
+---
+ include/hw/timer/omap3_gptimer.h | 70 ++++++++++++++++++++++++++++++++
+ 1 file changed, 70 insertions(+)
+ create mode 100644 include/hw/timer/omap3_gptimer.h
+
+diff --git a/include/hw/timer/omap3_gptimer.h b/include/hw/timer/omap3_gptimer.h
+new file mode 100644
+index 0000000..11e0a18
+--- /dev/null
++++ b/include/hw/timer/omap3_gptimer.h
+@@ -0,0 +1,70 @@
++/*
++ * OMAP3 general-purpose timers (GPTIMER1..12) and the 32 kHz sync counter
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_TIMER_OMAP3_GPTIMER_H
++#define HW_TIMER_OMAP3_GPTIMER_H
++
++#include "hw/core/sysbus.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_GPTIMER "omap3-gptimer"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3GpTimerState, OMAP3_GPTIMER)
++
++#define TYPE_OMAP3_SYNCTIMER "omap3-synctimer"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3SyncTimerState, OMAP3_SYNCTIMER)
++
++/* Named input "clksel": 0 runs the timer from the 32768 Hz clock, 1 from
++ * sys_clk (the PRCM's CM_CLKSEL_* bit for this timer). */
++#define OMAP3_GPTIMER_CLKSEL "clksel"
++/* Named output "pwm-hz": the PWM pin's frequency in Hz while the timer
++ * runs with a PWM trigger (TCLR.TRG), 0 otherwise. */
++#define OMAP3_GPTIMER_PWM_HZ "pwm-hz"
++
++struct Omap3GpTimerState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    QEMUTimer *timer;
++    qemu_irq irq;
++    qemu_irq pwm_hz;
++    int pwm_level;
++
++    uint32_t sys_clk_hz;        /* property */
++    bool clk_sys;               /* clksel input */
++
++    uint32_t tiocp_cfg;
++    uint32_t tisr;
++    uint32_t tier;
++    uint32_t twer;
++    uint32_t tclr;
++    uint32_t tldr;
++    uint32_t tmar;
++    uint32_t tsicr;
++    uint32_t tpir;
++    uint32_t tnir;
++    uint32_t tcvr;
++    uint32_t tocr;
++    uint32_t towr;
++
++    /* TCRR is counter_base at base_ns, advancing at the input clock while
++     * TCLR.ST is set. */
++    uint32_t counter_base;
++    int64_t base_ns;
++    int64_t overflow_ns;        /* next deadlines, or INT64_MAX */
++    int64_t match_ns;
++};
++
++struct Omap3SyncTimerState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    uint32_t sysconfig;
++};
++
++#endif
+-- 
+2.55.0
+

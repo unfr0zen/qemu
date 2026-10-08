@@ -1,0 +1,29 @@
+# Patched source checkouts, compiler output, and device-run records
+/.work/
+/.qemu/
+/build/
+/WORKLOG.md
+
+# Local Python environments and caches
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor / OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Generated firmware and intermediate compiler artifacts, wherever emitted
+*.bin
+*.imx
+*.elf
+*.o
+*.map
+
+# QEMU clone and its build outputs (patches under patches/ are tracked)
+/qemu-src/
+

@@ -1,0 +1,110 @@
+From 9d39dd9b05edd5cdce0603b017a6edb8881cdd5c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 13:16:51 -0400
+Subject: [PATCH 24/36] hw/arm: flintstone: the BCM43341 wifi module on usdhc2
+
+An sdio-card with Broadcom's IDs on usdhc2 and the bcm43341 behind it.
+WL_REG_ON is GPIO1_IO04 (the brcm_wifi reset line): it powers the card
+and the chip and is still reported to the board companion. The chip's
+out-of-band interrupt is GPIO5_IO15, level high, as in the DT's
+brcm-wlan node. The chip takes the -nic whose model is bcm43341.
+---
+ hw/arm/Kconfig      |  1 +
+ hw/arm/flintstone.c | 55 ++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 6adcf9e..8128417 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -203,6 +203,7 @@ config FLINTSTONE
+     default y
+     depends on TCG && ARM
+     select FSL_IMX6SX
++    select BCM43341
+ 
+ config STELLARIS
+     bool
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 5a7fc0f..6ab8b1c 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -22,6 +22,9 @@
+ #include "hw/adc/imx6_adc.h"
+ #include "hw/arm/flintstone_board.h"
+ #include "hw/arm/fsl-imx6sx.h"
++#include "hw/net/bcm43341.h"
++#include "hw/sd/sd.h"
++#include "net/net.h"
+ #include "hw/arm/machines-qom.h"
+ #include "hw/core/irq.h"
+ #include "hw/core/boards.h"
+@@ -89,6 +92,54 @@ static void flintstone_set_wheel(Object *obj, Visitor *v, const char *name,
+     visit_type_int64(v, name, opaque, errp);
+ }
+ 
++/*
++ * The wifi module on usdhc2: a BCM43341 behind an SDIO card. WL_REG_ON is
++ * GPIO1_IO04, which powers both and is reported to the board; the chip's
++ * out-of-band interrupt is GPIO5_IO15, level high (the DT's brcm-wlan).
++ * -nic user,model=bcm43341 is the network behind the access point.
++ */
++static void flintstone_init_wifi(DeviceState *soc, DeviceState *board)
++{
++    DeviceState *usdhc2 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                                "sdhc2"));
++    DeviceState *gpio1 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio1"));
++    DeviceState *gpio5 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio5"));
++    DeviceState *card = qdev_new(TYPE_SDIO_CARD);
++    DeviceState *chip = qdev_new(TYPE_BCM43341);
++    DeviceState *reg_on = qdev_new(TYPE_SPLIT_IRQ);
++
++    qemu_configure_nic_device(chip, true, NULL);
++    qdev_realize_and_unref(chip, NULL, &error_fatal);
++
++    /* Broadcom's IDs, and no standard class: the driver matches either. */
++    qdev_prop_set_uint8(card, "class", 0);
++    qdev_prop_set_uint16(card, "vendor-id", 0x02d0);
++    qdev_prop_set_uint16(card, "device-id", 0xa94d);
++    qdev_prop_set_uint16(card, "device-id-f2", 0xa94d);
++    object_property_set_link(OBJECT(card), "function-device", OBJECT(chip),
++                             &error_fatal);
++    qdev_realize_and_unref(card, qdev_get_child_bus(usdhc2, "sd-bus"),
++                           &error_fatal);
++
++    qdev_prop_set_uint32(reg_on, "num-lines", 3);
++    qdev_realize_and_unref(reg_on, NULL, &error_fatal);
++    qdev_connect_gpio_out(gpio1, 4, qdev_get_gpio_in(reg_on, 0));
++    qdev_connect_gpio_out(reg_on, 0,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_WIFI_RESET));
++    qdev_connect_gpio_out(reg_on, 1,
++                          qdev_get_gpio_in_named(card, "power", 0));
++    qdev_connect_gpio_out(reg_on, 2,
++                          qdev_get_gpio_in_named(chip, "power", 0));
++
++    qdev_connect_gpio_out_named(chip, "card-int", 0,
++                                qdev_get_gpio_in_named(card, "card-int", 0));
++    qdev_connect_gpio_out_named(chip, "host-wake", 0,
++                                qdev_get_gpio_in(gpio5, 15));
++}
++
+ static void flintstone_init(MachineState *machine)
+ {
+     DeviceState *soc;
+@@ -159,9 +210,7 @@ static void flintstone_init(MachineState *machine)
+     qdev_connect_gpio_out(gpio1, 11,
+                           qdev_get_gpio_in(board,
+                                            FLINTSTONE_BOARD_IN_POWEROFF));
+-    qdev_connect_gpio_out(gpio1, 4,
+-                          qdev_get_gpio_in(board,
+-                                           FLINTSTONE_BOARD_IN_WIFI_RESET));
++    flintstone_init_wifi(soc, board);
+     qdev_connect_gpio_out(gpio7, 2, qdev_get_gpio_in(hall_split, 0));
+     qdev_connect_gpio_out(hall_split, 0, qdev_get_gpio_in(adc1, 0));
+     qdev_connect_gpio_out(hall_split, 1,
+-- 
+2.55.0
+

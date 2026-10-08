@@ -1,0 +1,57 @@
+From 3aac84f4e79fba49fbada834d16b12dcf63c323b Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 63/91] include/hw/sd: OMAP3 MMCHS state
+
+---
+ include/hw/sd/omap3_hsmmc.h | 38 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+ create mode 100644 include/hw/sd/omap3_hsmmc.h
+
+diff --git a/include/hw/sd/omap3_hsmmc.h b/include/hw/sd/omap3_hsmmc.h
+new file mode 100644
+index 0000000..c15709c
+--- /dev/null
++++ b/include/hw/sd/omap3_hsmmc.h
+@@ -0,0 +1,38 @@
++/*
++ * OMAP3 high-speed MMC/SD/SDIO host controller (MMCHS)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_SD_OMAP3_HSMMC_H
++#define HW_SD_OMAP3_HSMMC_H
++
++#include "hw/core/sysbus.h"
++#include "hw/sd/sdhci.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_HSMMC "omap3-hsmmc"
++#define OMAP3_HSMMC_DMA "dma"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3HsmmcState, OMAP3_HSMMC)
++
++struct Omap3HsmmcState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion container;
++    MemoryRegion iomem;         /* the OMAP registers below 0x100 */
++    MemoryRegion std;           /* 0x100: forwarded to the SDHCI core */
++    SDHCIState sdhci;           /* the standard block */
++    qemu_irq irq;
++    qemu_irq dma[2];            /* "dma": 0 TX (DMA_TX), 1 RX (DMA_RX) */
++    bool de;                    /* CMD.DE: the transfer uses DMA requests */
++
++    uint32_t sysconfig;
++    uint32_t csre;
++    uint32_t systest;
++    uint32_t con;
++    uint32_t pwcnt;
++};
++
++#endif
+-- 
+2.55.0
+

@@ -1,0 +1,589 @@
+From 73ed8c0dfec1058530f147333c42b359a1e2c401 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:22:07 -0400
+Subject: [PATCH 02/20] hw/arm: add i.MX6SX SoC container
+
+Single Cortex-A9 with the A9 MPCore/PL310 and the boot-relevant i.MX6
+peripheral set at 6SX addresses, reusing mainline device models
+(imx6 CCM/SRC/SNVS, imx-serial, GPT/EPIT, GPIO, I2C, uSDHC, ChipIdea
+USB + PHY, FEC, imx2_wdt). The GPMI NAND subsystem is stubbed for now;
+an actual model follows. Unmodeled registers are unimplemented-device
+stubs so reads return 0 and writes are dropped.
+---
+ hw/arm/fsl-imx6sx.c | 564 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 564 insertions(+)
+ create mode 100644 hw/arm/fsl-imx6sx.c
+
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+new file mode 100644
+index 0000000..20c5585
+--- /dev/null
++++ b/hw/arm/fsl-imx6sx.c
+@@ -0,0 +1,564 @@
++/*
++ * Copyright (c) 2026
++ *
++ * i.MX6SX SoC emulation for the Nest Display-3.4 ("Flintstone") board.
++ *
++ * Based on hw/arm/fsl-imx6.c, re-pointed at the i.MX6 SoloX map taken from
++ * the board's stock Device Tree (see the header for the source of truth).
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License as published by the
++ *  Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT
++ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ *  FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ *  more details.
++ *
++ *  You should have received a copy of the GNU General Public License along
++ *  with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/arm/fsl-imx6sx.h"
++#include "hw/misc/unimp.h"
++#include "hw/core/boards.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/usb/imx-usb-phy.h"
++#include "net/net.h"
++#include "system/system.h"
++#include "system/reset.h"
++#include "system/address-spaces.h"
++#include "chardev/char.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
++#include "target/arm/cpu-qom.h"
++
++#define IMX6SX_ESDHC_CAPABILITIES   0x057834b4
++
++#define NAME_SIZE 20
++
++static const struct {
++    hwaddr addr;
++    hwaddr size;
++    const char *name;
++} fsl_imx6sx_unimplemented[] = {
++    /* GPMI NAND subsystem — real model arrives with the NAND phase */
++    { FSL_IMX6SX_APBH_ADDR,  FSL_IMX6SX_APBH_SIZE,  "apbh-dma" },
++    { FSL_IMX6SX_GPMI_ADDR,  FSL_IMX6SX_GPMI_SIZE,  "gpmi-nand" },
++    { FSL_IMX6SX_BCH_ADDR,   FSL_IMX6SX_BCH_SIZE,   "bch" },
++    /* AIPS1 */
++    { FSL_IMX6SX_LPM_SRAM_ADDR, FSL_IMX6SX_LPM_SRAM_SIZE, "lpm-sram" },
++    { FSL_IMX6SX_PWM1_ADDR,  0x4000 * 4,            "pwm1-4" },
++    { FSL_IMX6SX_CAN1_ADDR,  0x8000,                "flexcan1-2" },
++    { FSL_IMX6SX_ANATOP_ADDR, FSL_IMX6SX_ANATOP_SIZE, "anatop" },
++    { FSL_IMX6SX_GPC_ADDR,   0x4000,                "gpc" },
++    { FSL_IMX6SX_IOMUXC_ADDR, 0x4000,               "iomuxc" },
++    { FSL_IMX6SX_IOMUXC_GPR_ADDR, 0x4000,           "iomuxc-gpr" },
++    { FSL_IMX6SX_SDMA_ADDR,  0x4000,                "sdma" },
++    /* AIPS2 */
++    { FSL_IMX6SX_CAAM_ADDR,  FSL_IMX6SX_CAAM_SIZE,  "caam" },
++    { FSL_IMX6SX_MLB_ADDR,   0x4000,                "mlb" },
++    { FSL_IMX6SX_ROMCP_ADDR, 0x4000,                "romcp" },
++    { FSL_IMX6SX_MMDC_ADDR,  0x4000,                "mmdc" },
++    { FSL_IMX6SX_WEIM_ADDR,  0x4000,                "weim" },
++    { FSL_IMX6SX_OCOTP_ADDR, 0x4000,                "ocotp" },
++    { FSL_IMX6SX_SAI1_ADDR,  0xC000,                "sai-audmux" },
++    { FSL_IMX6SX_QSPI1_ADDR, 0x8000,                "qspi1-2" },
++    { FSL_IMX6SX_QSPI1_MEM_ADDR, FSL_IMX6SX_QSPI1_MEM_SIZE, "qspi1-mem" },
++    { FSL_IMX6SX_QSPI2_MEM_ADDR, FSL_IMX6SX_QSPI2_MEM_SIZE, "qspi2-mem" },
++    { FSL_IMX6SX_QOSC_ADDR,  0x4000,                "qosc" },
++    /* AIPS3 */
++    { FSL_IMX6SX_ADC1_ADDR,  0x8000,                "adc1-2" },
++    { FSL_IMX6SX_ECSPI4_ADDR, 0x4000,               "ecspi4" },
++    { FSL_IMX6SX_SEMA4_ADDR, 0x4000,                "sema4" },
++    { FSL_IMX6SX_MU_ADDR,    0x4000,                "mu" },
++    { FSL_IMX6SX_UART6_ADDR + 0x4000, 0x10000,      "pwm5-8" },
++};
++
++static void fsl_imx6sx_init(Object *obj)
++{
++    FslIMX6SXState *s = FSL_IMX6SX(obj);
++    char name[NAME_SIZE];
++    int i;
++
++    object_initialize_child(obj, "a9mpcore", &s->a9mpcore, TYPE_A9MPCORE_PRIV);
++
++    object_initialize_child(obj, "ccm", &s->ccm, TYPE_IMX6_CCM);
++
++    object_initialize_child(obj, "src", &s->src, TYPE_IMX6_SRC);
++
++    object_initialize_child(obj, "snvs", &s->snvs, TYPE_IMX7_SNVS);
++
++    for (i = 0; i < FSL_IMX6SX_NUM_UARTS; i++) {
++        snprintf(name, NAME_SIZE, "uart%d", i + 1);
++        object_initialize_child(obj, name, &s->uart[i], TYPE_IMX_SERIAL);
++    }
++
++    object_initialize_child(obj, "gpt", &s->gpt, TYPE_IMX6_GPT);
++
++    for (i = 0; i < FSL_IMX6SX_NUM_EPITS; i++) {
++        snprintf(name, NAME_SIZE, "epit%d", i + 1);
++        object_initialize_child(obj, name, &s->epit[i], TYPE_IMX_EPIT);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_I2CS; i++) {
++        snprintf(name, NAME_SIZE, "i2c%d", i + 1);
++        object_initialize_child(obj, name, &s->i2c[i], TYPE_IMX_I2C);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_ECSPIS; i++) {
++        snprintf(name, NAME_SIZE, "spi%d", i + 1);
++        object_initialize_child(obj, name, &s->spi[i], TYPE_IMX_SPI);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_GPIOS; i++) {
++        snprintf(name, NAME_SIZE, "gpio%d", i + 1);
++        object_initialize_child(obj, name, &s->gpio[i], TYPE_IMX_GPIO);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_USDHCS; i++) {
++        snprintf(name, NAME_SIZE, "sdhc%d", i + 1);
++        object_initialize_child(obj, name, &s->usdhc[i], TYPE_IMX_USDHC);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_USB_PHYS; i++) {
++        snprintf(name, NAME_SIZE, "usbphy%d", i);
++        object_initialize_child(obj, name, &s->usbphy[i], TYPE_IMX_USBPHY);
++    }
++    for (i = 0; i < FSL_IMX6SX_NUM_USBS; i++) {
++        snprintf(name, NAME_SIZE, "usb%d", i);
++        object_initialize_child(obj, name, &s->usb[i], TYPE_CHIPIDEA);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_ETHS; i++) {
++        snprintf(name, NAME_SIZE, "eth%d", i + 1);
++        object_initialize_child(obj, name, &s->eth[i], TYPE_IMX_ENET);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_WDTS; i++) {
++        snprintf(name, NAME_SIZE, "wdt%d", i);
++        object_initialize_child(obj, name, &s->wdt[i], TYPE_IMX2_WDT);
++    }
++}
++
++/*
++ * The CCM is QEMU's i.MX6Q model; its CSCMR2 reset value 0x02B92F06 has
++ * VID_CLK_SEL (bits 23:21) = 5, which is out of range for the 6SX vid_sel
++ * mux (5 parents) and makes the 4.1.15 imx6sx clock init oops in
++ * clk_register. Apply the 6SX-family reset value (the i.MX6UL CCM model,
++ * a 6SX derivative, uses the same 0x03192F06) after the CCM's own reset.
++ */
++#define FSL_IMX6SX_CCM_CSCMR2       (FSL_IMX6SX_CCM_ADDR + 0x20)
++
++static void fsl_imx6sx_ccm_reset(void *opaque)
++{
++    address_space_stl_le(&address_space_memory, FSL_IMX6SX_CCM_CSCMR2,
++                         0x03192F06, MEMTXATTRS_UNSPECIFIED, NULL);
++}
++
++/*
++ * The sysbus (and with it the CCM) joins the reset chain only once machine
++ * init is done; registering the fixup from here orders it after the CCM's
++ * own reset.
++ */
++static void fsl_imx6sx_ccm_init_done(Notifier *n, void *data)
++{
++    qemu_register_reset(fsl_imx6sx_ccm_reset, NULL);
++}
++
++static Notifier fsl_imx6sx_ccm_notifier = {
++    .notify = fsl_imx6sx_ccm_init_done,
++};
++
++/*
++ * GPU3D register stub. The vendor galcore driver's _ResetGPU loops (with a
++ * 1 ms sleep) until AQHiIdle (+0x04) reports the front end idle and
++ * AQHiClockControl (+0x00) reports IDLE_2D/IDLE_3D (bits 16/17). Report an
++ * idle core; everything else, including the chip ID, reads as zero.
++ */
++static uint64_t fsl_imx6sx_gpu_read(void *opaque, hwaddr off, unsigned size)
++{
++    FslIMX6SXState *s = opaque;
++
++    switch (off) {
++    case 0x00:
++        return s->gpu_clock_ctrl | (3u << 16);
++    case 0x04:
++        return 0x7fffffff;
++    default:
++        return 0;
++    }
++}
++
++static void fsl_imx6sx_gpu_write(void *opaque, hwaddr off, uint64_t val,
++                                 unsigned size)
++{
++    FslIMX6SXState *s = opaque;
++
++    if (off == 0x00) {
++        s->gpu_clock_ctrl = val;
++    }
++}
++
++static const MemoryRegionOps fsl_imx6sx_gpu_ops = {
++    .read = fsl_imx6sx_gpu_read,
++    .write = fsl_imx6sx_gpu_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
++{
++    MachineState *ms = MACHINE(qdev_get_machine());
++    FslIMX6SXState *s = FSL_IMX6SX(dev);
++    uint16_t i;
++    DeviceState *mpcore;
++    DeviceState *gic;
++    char name[NAME_SIZE];
++
++    if (ms->smp.cpus > FSL_IMX6SX_NUM_CPUS) {
++        error_setg(errp, "%s: Only %d CPU is supported (%d requested)",
++                   TYPE_FSL_IMX6SX, FSL_IMX6SX_NUM_CPUS, ms->smp.cpus);
++        return;
++    }
++
++    snprintf(name, NAME_SIZE, "cpu%d", 0);
++    object_initialize_child(OBJECT(dev), name, &s->cpu,
++                            ARM_CPU_TYPE_NAME("cortex-a9"));
++    if (!qdev_realize(DEVICE(&s->cpu), NULL, errp)) {
++        return;
++    }
++
++    mpcore = DEVICE(&s->a9mpcore);
++    object_property_set_int(OBJECT(mpcore), "num-cpu", ms->smp.cpus,
++                            &error_abort);
++    object_property_set_int(OBJECT(mpcore), "num-irq",
++                            FSL_IMX6SX_MAX_IRQ + GIC_INTERNAL, &error_abort);
++    if (!sysbus_realize(SYS_BUS_DEVICE(mpcore), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(mpcore), 0, FSL_IMX6SX_A9MPCORE_ADDR);
++
++    gic = mpcore;
++    sysbus_connect_irq(SYS_BUS_DEVICE(gic), 0,
++                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_IRQ));
++    sysbus_connect_irq(SYS_BUS_DEVICE(gic), ms->smp.cpus,
++                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_FIQ));
++
++    /* L2 cache controller */
++    sysbus_create_simple("l2x0", FSL_IMX6SX_PL310_ADDR, NULL);
++
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ccm), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->ccm), 0, FSL_IMX6SX_CCM_ADDR);
++    qemu_add_machine_init_done_notifier(&fsl_imx6sx_ccm_notifier);
++
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->src), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->src), 0, FSL_IMX6SX_SRC_ADDR);
++
++    /* Initialize all UARTs */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } serial_table[FSL_IMX6SX_NUM_UARTS] = {
++            { FSL_IMX6SX_UART1_ADDR, FSL_IMX6SX_UART1_IRQ },
++            { FSL_IMX6SX_UART2_ADDR, FSL_IMX6SX_UART2_IRQ },
++            { FSL_IMX6SX_UART3_ADDR, FSL_IMX6SX_UART3_IRQ },
++            { FSL_IMX6SX_UART4_ADDR, FSL_IMX6SX_UART4_IRQ },
++            { FSL_IMX6SX_UART5_ADDR, FSL_IMX6SX_UART5_IRQ },
++            { FSL_IMX6SX_UART6_ADDR, FSL_IMX6SX_UART6_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_UARTS; i++) {
++            qdev_prop_set_chr(DEVICE(&s->uart[i]), "chardev", serial_hd(i));
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart[i]), 0,
++                            serial_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart[i]), 0,
++                               qdev_get_gpio_in(gic, serial_table[i].irq));
++        }
++    }
++
++    s->gpt.ccm = IMX_CCM(&s->ccm);
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpt), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpt), 0, FSL_IMX6SX_GPT_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpt), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_GPT_IRQ));
++
++    /* Initialize all EPIT timers */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } epit_table[FSL_IMX6SX_NUM_EPITS] = {
++            { FSL_IMX6SX_EPIT1_ADDR, FSL_IMX6SX_EPIT1_IRQ },
++            { FSL_IMX6SX_EPIT2_ADDR, FSL_IMX6SX_EPIT2_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_EPITS; i++) {
++            s->epit[i].ccm = IMX_CCM(&s->ccm);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->epit[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->epit[i]), 0, epit_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->epit[i]), 0,
++                               qdev_get_gpio_in(gic, epit_table[i].irq));
++        }
++    }
++
++    /* Initialize all I2C */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } i2c_table[FSL_IMX6SX_NUM_I2CS] = {
++            { FSL_IMX6SX_I2C1_ADDR, FSL_IMX6SX_I2C1_IRQ },
++            { FSL_IMX6SX_I2C2_ADDR, FSL_IMX6SX_I2C2_IRQ },
++            { FSL_IMX6SX_I2C3_ADDR, FSL_IMX6SX_I2C3_IRQ },
++            { FSL_IMX6SX_I2C4_ADDR, FSL_IMX6SX_I2C4_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_I2CS; i++) {
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->i2c[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->i2c[i]), 0, i2c_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
++                               qdev_get_gpio_in(gic, i2c_table[i].irq));
++        }
++    }
++
++    /* Initialize ECSPI1-4: contiguous 16 KiB blocks, consecutive IRQs */
++    for (i = 0; i < FSL_IMX6SX_NUM_ECSPIS; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->spi[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi[i]), 0,
++                        FSL_IMX6SX_ECSPI1_ADDR + i * 0x4000);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi[i]), 0,
++                           qdev_get_gpio_in(gic, FSL_IMX6SX_ECSPI1_IRQ + i));
++    }
++
++    /* Initialize all GPIOs */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq_low;
++            unsigned int irq_high;
++        } gpio_table[FSL_IMX6SX_NUM_GPIOS] = {
++            { FSL_IMX6SX_GPIO1_ADDR, FSL_IMX6SX_GPIO1_LOW_IRQ,
++              FSL_IMX6SX_GPIO1_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO2_ADDR, FSL_IMX6SX_GPIO2_LOW_IRQ,
++              FSL_IMX6SX_GPIO2_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO3_ADDR, FSL_IMX6SX_GPIO3_LOW_IRQ,
++              FSL_IMX6SX_GPIO3_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO4_ADDR, FSL_IMX6SX_GPIO4_LOW_IRQ,
++              FSL_IMX6SX_GPIO4_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO5_ADDR, FSL_IMX6SX_GPIO5_LOW_IRQ,
++              FSL_IMX6SX_GPIO5_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO6_ADDR, FSL_IMX6SX_GPIO6_LOW_IRQ,
++              FSL_IMX6SX_GPIO6_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO7_ADDR, FSL_IMX6SX_GPIO7_LOW_IRQ,
++              FSL_IMX6SX_GPIO7_HIGH_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_GPIOS; i++) {
++            object_property_set_bool(OBJECT(&s->gpio[i]), "has-edge-sel",
++                                     true, &error_abort);
++            object_property_set_bool(OBJECT(&s->gpio[i]), "has-upper-pin-irq",
++                                     true, &error_abort);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio[i]), 0, gpio_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio[i]), 0,
++                               qdev_get_gpio_in(gic, gpio_table[i].irq_low));
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio[i]), 1,
++                               qdev_get_gpio_in(gic, gpio_table[i].irq_high));
++        }
++    }
++
++    /* Initialize all SDHC */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } esdhc_table[FSL_IMX6SX_NUM_USDHCS] = {
++            { FSL_IMX6SX_uSDHC1_ADDR, FSL_IMX6SX_uSDHC1_IRQ },
++            { FSL_IMX6SX_uSDHC2_ADDR, FSL_IMX6SX_uSDHC2_IRQ },
++            { FSL_IMX6SX_uSDHC3_ADDR, FSL_IMX6SX_uSDHC3_IRQ },
++            { FSL_IMX6SX_uSDHC4_ADDR, FSL_IMX6SX_uSDHC4_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_USDHCS; i++) {
++            /* UHS-I SDIO3.0 SDR104 1.8V ADMA */
++            object_property_set_uint(OBJECT(&s->usdhc[i]), "capareg",
++                                     IMX6SX_ESDHC_CAPABILITIES, &error_abort);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->usdhc[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->usdhc[i]), 0,
++                            esdhc_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->usdhc[i]), 0,
++                               qdev_get_gpio_in(gic, esdhc_table[i].irq));
++        }
++    }
++
++    /* USB */
++    for (i = 0; i < FSL_IMX6SX_NUM_USB_PHYS; i++) {
++        static const hwaddr usbphy_addr[FSL_IMX6SX_NUM_USB_PHYS] = {
++            FSL_IMX6SX_USBPHY1_ADDR,
++            FSL_IMX6SX_USBPHY2_ADDR,
++        };
++
++        sysbus_realize(SYS_BUS_DEVICE(&s->usbphy[i]), &error_abort);
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->usbphy[i]), 0, usbphy_addr[i]);
++    }
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } usb_table[FSL_IMX6SX_NUM_USBS] = {
++            { FSL_IMX6SX_USBOH3_USB_ADDR + 0 * 0x200, FSL_IMX6SX_USB_OTG_IRQ },
++            { FSL_IMX6SX_USBOH3_USB_ADDR + 1 * 0x200, FSL_IMX6SX_USB_HOST1_IRQ },
++            { FSL_IMX6SX_USBOH3_USB_ADDR + 2 * 0x200, FSL_IMX6SX_USB_HOST2_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_USBS; i++) {
++            sysbus_realize(SYS_BUS_DEVICE(&s->usb[i]), &error_abort);
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->usb[i]), 0, usb_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->usb[i]), 0,
++                               qdev_get_gpio_in(gic, usb_table[i].irq));
++        }
++    }
++
++    /* Initialize both FECs */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++            unsigned int irq_1588;
++        } eth_table[FSL_IMX6SX_NUM_ETHS] = {
++            { FSL_IMX6SX_ENET1_ADDR, FSL_IMX6SX_ENET1_IRQ,
++              FSL_IMX6SX_ENET1_1588_IRQ },
++            { FSL_IMX6SX_ENET2_ADDR, FSL_IMX6SX_ENET2_IRQ,
++              FSL_IMX6SX_ENET2_1588_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_ETHS; i++) {
++            if (i == 0) {
++                object_property_set_uint(OBJECT(&s->eth[i]), "phy-num",
++                                         s->phy_num, &error_abort);
++            }
++            qemu_configure_nic_device(DEVICE(&s->eth[i]), true, NULL);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->eth[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->eth[i]), 0, eth_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->eth[i]), 0,
++                               qdev_get_gpio_in(gic, eth_table[i].irq));
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->eth[i]), 1,
++                               qdev_get_gpio_in(gic, eth_table[i].irq_1588));
++        }
++    }
++
++    /* SNVS */
++    sysbus_realize(SYS_BUS_DEVICE(&s->snvs), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->snvs), 0, FSL_IMX6SX_SNVSHP_ADDR);
++
++    /* Watchdogs */
++    {
++        static const hwaddr wdt_addr[FSL_IMX6SX_NUM_WDTS] = {
++            FSL_IMX6SX_WDOG1_ADDR,
++            FSL_IMX6SX_WDOG2_ADDR,
++            FSL_IMX6SX_WDOG3_ADDR,
++        };
++        static const int wdt_irq[FSL_IMX6SX_NUM_WDTS] = {
++            FSL_IMX6SX_WDOG1_IRQ,
++            FSL_IMX6SX_WDOG2_IRQ,
++            FSL_IMX6SX_WDOG3_IRQ,
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_WDTS; i++) {
++            object_property_set_bool(OBJECT(&s->wdt[i]), "pretimeout-support",
++                                     true, &error_abort);
++            sysbus_realize(SYS_BUS_DEVICE(&s->wdt[i]), &error_abort);
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt[i]), 0, wdt_addr[i]);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->wdt[i]), 0,
++                               qdev_get_gpio_in(gic, wdt_irq[i]));
++        }
++    }
++
++    /* Memory regions */
++    memory_region_init_rom(&s->rom, OBJECT(dev), "imx6sx.rom",
++                           FSL_IMX6SX_ROM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_ROM_ADDR,
++                                &s->rom);
++
++    memory_region_init_ram(&s->ocram, NULL, "imx6sx.ocram",
++                           FSL_IMX6SX_OCRAM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_OCRAM_ADDR,
++                                &s->ocram);
++
++    memory_region_init_ram(&s->caam, NULL, "imx6sx.caam",
++                           FSL_IMX6SX_CAAM_MEM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_CAAM_MEM_ADDR,
++                                &s->caam);
++
++    memory_region_init_io(&s->gpu, OBJECT(dev), &fsl_imx6sx_gpu_ops, s,
++                          "imx6sx.gpu3d", FSL_IMX6SX_GPU_SIZE);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_GPU_ADDR,
++                                &s->gpu);
++
++    /* Regions the boot software touches but we do not (yet) model */
++    for (i = 0; i < ARRAY_SIZE(fsl_imx6sx_unimplemented); i++) {
++        const char *nm = fsl_imx6sx_unimplemented[i].name;
++        if (!nm) {
++            continue;
++        }
++        create_unimplemented_device(nm, fsl_imx6sx_unimplemented[i].addr,
++                                    fsl_imx6sx_unimplemented[i].size);
++    }
++}
++
++static const Property fsl_imx6sx_properties[] = {
++    DEFINE_PROP_UINT32("fec-phy-num", FslIMX6SXState, phy_num, 0),
++};
++
++static void fsl_imx6sx_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    device_class_set_props(dc, fsl_imx6sx_properties);
++    dc->realize = fsl_imx6sx_realize;
++    dc->desc = "i.MX6SX SoC";
++    /* Reason: Uses serial_hd() in the realize() function */
++    dc->user_creatable = false;
++}
++
++static const TypeInfo fsl_imx6sx_type_info = {
++    .name = TYPE_FSL_IMX6SX,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(FslIMX6SXState),
++    .instance_init = fsl_imx6sx_init,
++    .class_init = fsl_imx6sx_class_init,
++};
++
++static void fsl_imx6sx_register_types(void)
++{
++    type_register_static(&fsl_imx6sx_type_info);
++}
++
++type_init(fsl_imx6sx_register_types)
+-- 
+2.55.0
+

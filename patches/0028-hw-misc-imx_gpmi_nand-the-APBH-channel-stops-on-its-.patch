@@ -1,0 +1,60 @@
+From 18a1065631171b2cb821a460c65f67931051b713 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:38:09 -0400
+Subject: [PATCH 28/36] hw/misc: imx_gpmi_nand: the APBH channel stops on its
+ semaphore
+
+The DMA engine followed CHAIN until its 32-descriptor guard ran out and
+ignored DECREMENT_SEMAPHORE. U-Boot's mxs_nand sets CHAIN on every
+descriptor, including the last one, whose DECREMENT_SEMAPHORE is what
+stops the real channel, so every command chain ran 32 times: 32 RESETs,
+32 READ0s, 32 READSTARTs. The 2014 driver's BCH page reads survive the
+repeats, but anything that keys off the command sequence does not.
+
+Run the channel only while its semaphore is nonzero, and decrement it
+for each descriptor that asks to, as the hardware does. The stock
+firmware still boots to user space with every UBI volume attached.
+---
+ hw/misc/imx_gpmi_nand.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/hw/misc/imx_gpmi_nand.c b/hw/misc/imx_gpmi_nand.c
+index 835e52c..eac0f29 100644
+--- a/hw/misc/imx_gpmi_nand.c
++++ b/hw/misc/imx_gpmi_nand.c
+@@ -411,6 +411,7 @@ static void gpmi_bch_op(ImxGpmiNandState *s)
+ #define DESC_COMMAND_DMA_READ  0x2 /* memory -> peripheral */
+ #define DESC_IRQ               (1u << 3)
+ #define DESC_NAND_WAIT_4_READY (1u << 5)
++#define DESC_DEC_SEMAPHORE     (1u << 6)
+ #define DESC_CHAIN             (1u << 2)
+ #define DESC_PIO_WORDS_OFF     12
+ #define DESC_BYTES_OFF         16
+@@ -523,7 +524,13 @@ static void apbh_run_channel(ImxGpmiNandState *s, unsigned n)
+     }
+     ch->curcmdar = cur;
+ 
+-    for (guard = 0; guard < 32; guard++) {
++    /*
++     * The channel runs while its semaphore is nonzero: a descriptor with
++     * DECREMENT_SEMAPHORE ends the chain when the count reaches zero, even
++     * with CHAIN set. U-Boot's mxs_nand chains every descriptor, so
++     * following CHAIN alone would re-run the last command.
++     */
++    for (guard = 0; guard < 32 && (ch->sema & 0xff); guard++) {
+         uint32_t words[3];
+ 
+         if (address_space_read(&address_space_memory, cur,
+@@ -534,6 +541,9 @@ static void apbh_run_channel(ImxGpmiNandState *s, unsigned n)
+         ch->bar = words[2];
+         gpmi_execute(s, words[1], cur, words[2],
+                      (words[1] >> DESC_PIO_WORDS_OFF) & 0xf);
++        if (words[1] & DESC_DEC_SEMAPHORE) {
++            ch->sema = (ch->sema & ~0xffu) | ((ch->sema - 1) & 0xff);
++        }
+         if (!(words[1] & DESC_CHAIN)) {
+             break;
+         }
+-- 
+2.55.0
+

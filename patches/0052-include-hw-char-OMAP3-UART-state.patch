@@ -1,0 +1,75 @@
+From 3c990b19be69ef393ada52563a79131053058941 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 52/91] include/hw/char: OMAP3 UART state
+
+---
+ include/hw/char/omap3_uart.h | 56 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+ create mode 100644 include/hw/char/omap3_uart.h
+
+diff --git a/include/hw/char/omap3_uart.h b/include/hw/char/omap3_uart.h
+new file mode 100644
+index 0000000..a533805
+--- /dev/null
++++ b/include/hw/char/omap3_uart.h
+@@ -0,0 +1,56 @@
++/*
++ * OMAP3 UART (16C750-compatible, with the OMAP mode and FIFO registers)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_CHAR_OMAP3_UART_H
++#define HW_CHAR_OMAP3_UART_H
++
++#include "hw/core/sysbus.h"
++#include "chardev/char-fe.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_UART "omap3-uart"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3UartState, OMAP3_UART)
++
++#define OMAP3_UART_FIFO 64
++
++struct Omap3UartState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    CharFrontend chr;
++    qemu_irq irq;
++
++    uint8_t rx_fifo[OMAP3_UART_FIFO];
++    uint32_t rx_head;
++    uint32_t rx_count;
++
++    uint8_t ier;
++    uint8_t fcr;
++    uint8_t lcr;
++    uint8_t mcr;
++    uint8_t spr;
++    uint8_t dll;
++    uint8_t dlh;
++    uint8_t efr;
++    uint8_t xon1, xon2, xoff1, xoff2;
++    uint8_t tcr;
++    uint8_t tlr;
++    uint8_t mdr1;
++    uint8_t mdr2;
++    uint8_t mdr3;
++    uint8_t scr;
++    uint8_t acreg;
++    uint8_t blr;
++    uint8_t ier2;
++    uint8_t wer;
++    uint8_t cfps;
++    uint32_t sysc;
++    bool thr_pending;           /* THR-empty interrupt not yet read via IIR */
++};
++
++#endif
+-- 
+2.55.0
+

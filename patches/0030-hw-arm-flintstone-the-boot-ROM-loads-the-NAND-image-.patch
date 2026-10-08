@@ -1,0 +1,99 @@
+From 7e454b8c3d92604fb8c1fa47ced38f058a97e7b3 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:00:52 -0400
+Subject: [PATCH 30/36] hw/arm: flintstone: the boot ROM loads the NAND image
+ its IVT describes
+
+The stub loaded a fixed 0x61000 bytes to 0x877ff000, the stock U-Boot
+2014.04's boot data. A system update (6.4-8) writes a U-Boot 2015.04
+whose IVT asks for 0x66000: the tail it lost holds .rel.dyn, so after
+relocating itself U-Boot kept running unrelocated code, corrupted its
+heap and was reset by its own watchdog, in a loop.
+
+Read the IVT 0x400 into fw1 like the i.MX boot ROM does, and load
+boot_data.size bytes to boot_data.start, then jump to the IVT entry.
+---
+ hw/arm/flintstone.c | 48 ++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 37 insertions(+), 11 deletions(-)
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index e81c7b0..641c1be 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -49,14 +49,14 @@
+ /*
+  * Boot ROM stub: on the real board the i.MX6SX boot ROM loads the NAND
+  * firmware image into DRAM per its IVT and jumps to the entry point. The
+- * image location and load/entry addresses are pinned by the stock image's
+- * own IVT (NAND mtd0 fw1: boot_data.start 0x877ff000, entry 0x87800000,
+- * size 0x61000 — see qemu/SPEC.md).
++ * image sits at NAND mtd0 fw1 with its IVT 0x400 in; the IVT's boot data
++ * gives the load address and size (the stock image: 0x877ff000, 0x61000,
++ * entry 0x87800000 — see qemu/SPEC.md; a system update writes its own).
+  */
+ #define FLINTSTONE_FW_NAND_OFF  0x100000
+-#define FLINTSTONE_FW_SIZE      0x61000
+-#define FLINTSTONE_FW_LOAD      0x877ff000
+-#define FLINTSTONE_FW_ENTRY     0x87800000
++#define FLINTSTONE_FW_IVT_OFF   0x400
++#define FLINTSTONE_IVT_TAG      0xd1
++#define FLINTSTONE_FW_ENTRY     0x87800000   /* where -bios images start */
+ 
+ struct FlintstoneRomBoot {
+     BlockBackend *blk;
+@@ -66,7 +66,9 @@ struct FlintstoneRomBoot {
+ static void flintstone_rom_boot(void *opaque)
+ {
+     struct FlintstoneRomBoot *rom = opaque;
+-    g_autofree uint8_t *buf = g_malloc(FLINTSTONE_FW_SIZE);
++    g_autofree uint8_t *buf = NULL;
++    uint32_t ivt[8], boot_data[2];
++    uint32_t entry, self, start, size;
+ 
+     /* Nothing else resets the CPU (no arm_load_kernel), so a watchdog
+      * reboot would otherwise resume with the MMU and caches still on. */
+@@ -89,13 +91,37 @@ static void flintstone_rom_boot(void *opaque)
+         return;
+     }
+ 
+-    if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF, FLINTSTONE_FW_SIZE,
+-                  buf, 0) < 0) {
++    /* IVT: header, entry, reserved, dcd, boot_data, self, csf, reserved;
++     * boot_data: start (the image's load address), size, plugin. */
++    if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF,
++                  sizeof(ivt), ivt, 0) < 0) {
++        error_report("flintstone: ROM could not read the NAND firmware IVT");
++        exit(1);
++    }
++    entry = le32_to_cpu(ivt[1]);
++    self = le32_to_cpu(ivt[5]);
++    if ((le32_to_cpu(ivt[0]) & 0xff) != FLINTSTONE_IVT_TAG ||
++        blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF +
++                  (le32_to_cpu(ivt[4]) - self), sizeof(boot_data),
++                  boot_data, 0) < 0) {
++        error_report("flintstone: ROM found no IVT in the NAND firmware");
++        exit(1);
++    }
++    start = le32_to_cpu(boot_data[0]);
++    size = le32_to_cpu(boot_data[1]);
++    if (start < FLINTSTONE_RAM_ADDR ||
++        size > FLINTSTONE_RAM_ADDR + FLINTSTONE_RAM_SIZE - start) {
++        error_report("flintstone: NAND firmware loads outside DRAM "
++                     "(0x%" PRIx32 " + 0x%" PRIx32 ")", start, size);
++        exit(1);
++    }
++    buf = g_malloc(size);
++    if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF, size, buf, 0) < 0) {
+         error_report("flintstone: ROM could not read NAND firmware");
+         exit(1);
+     }
+-    cpu_physical_memory_write(FLINTSTONE_FW_LOAD, buf, FLINTSTONE_FW_SIZE);
+-    cpu_set_pc(first_cpu, FLINTSTONE_FW_ENTRY);
++    cpu_physical_memory_write(start, buf, size);
++    cpu_set_pc(first_cpu, entry);
+ }
+ 
+ /* /machine/wheel-position: the adc's signed detent count, either way round. */
+-- 
+2.55.0
+

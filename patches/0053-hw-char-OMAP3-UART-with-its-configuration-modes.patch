@@ -1,0 +1,485 @@
+From 41f3083daf20d39d6b15471c8d0d0d4091e57f7b Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 53/91] hw/char: OMAP3 UART with its configuration modes
+
+---
+ hw/char/omap3_uart.c | 466 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 466 insertions(+)
+ create mode 100644 hw/char/omap3_uart.c
+
+diff --git a/hw/char/omap3_uart.c b/hw/char/omap3_uart.c
+new file mode 100644
+index 0000000..13222ee
+--- /dev/null
++++ b/hw/char/omap3_uart.c
+@@ -0,0 +1,466 @@
++/*
++ * OMAP3 UART (16C750-compatible, with the OMAP mode and FIFO registers)
++ *
++ * Registers sit at a 4-byte stride. What offsets 0x00-0x1c mean depends on
++ * LCR: operational mode, configuration mode A (LCR[7] set: DLL/DLH) and
++ * configuration mode B (LCR == 0xbf: DLL/DLH, EFR, XON/XOFF), with TCR/TLR
++ * behind MSR/SPR when EFR[4] and MCR[6] are set. Linux's omap-serial
++ * depends on these modes; a plain 16550 would take its EFR and XON1 writes
++ * for FCR and MCR (and loop the port back).
++ *
++ * Transmission is immediate, so the transmitter is always empty. Received
++ * bytes queue in a 64-byte FIFO.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/char/omap3_uart.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define UART_RHR_THR    0x00
++#define UART_IER        0x04
++#define UART_IIR_FCR    0x08
++#define UART_LCR        0x0c
++#define UART_MCR        0x10
++#define UART_LSR        0x14
++#define UART_MSR        0x18
++#define UART_SPR        0x1c
++#define UART_MDR1       0x20
++#define UART_MDR2       0x24
++#define UART_SFLSR      0x28
++#define UART_RESUME     0x2c
++#define UART_SFREGL     0x30
++#define UART_SFREGH     0x34
++#define UART_UASR_BLR   0x38
++#define UART_ACREG      0x3c
++#define UART_SCR        0x40
++#define UART_SSR        0x44
++#define UART_EBLR       0x48
++#define UART_MVR        0x50
++#define UART_SYSC       0x54
++#define UART_SYSS       0x58
++#define UART_WER        0x5c
++#define UART_CFPS       0x60
++#define UART_RXFIFO_LVL 0x64
++#define UART_TXFIFO_LVL 0x68
++#define UART_IER2       0x6c
++#define UART_ISR2       0x70
++#define UART_MDR3       0x80
++
++#define IER_RHR         0x01
++#define IER_THR         0x02
++#define IER_LINE        0x04
++
++#define IIR_NO_INT      0x01
++#define IIR_THR         0x02
++#define IIR_RHR         0x04
++
++#define LSR_RX_FIFO_E   0x01
++#define LSR_TX_FIFO_E   0x20
++#define LSR_TX_SR_E     0x40
++
++#define FCR_FIFO_EN     0x01
++#define FCR_RX_CLEAR    0x02
++
++#define LCR_DIV_EN      0x80
++#define LCR_MODE_B      0xbf
++
++#define EFR_ENHANCED    0x10
++#define MCR_TCR_TLR     0x40
++#define MCR_LOOPBACK    0x10
++
++static bool uart_tcr_tlr(Omap3UartState *s)
++{
++    return (s->efr & EFR_ENHANCED) && (s->mcr & MCR_TCR_TLR);
++}
++
++static void uart_update_irq(Omap3UartState *s)
++{
++    bool level = ((s->ier & IER_RHR) && s->rx_count) ||
++                 ((s->ier & IER_THR) && s->thr_pending);
++
++    qemu_set_irq(s->irq, level);
++}
++
++static uint8_t uart_iir(Omap3UartState *s)
++{
++    uint8_t fifo = (s->fcr & FCR_FIFO_EN) ? 0xc0 : 0;
++
++    if ((s->ier & IER_RHR) && s->rx_count) {
++        return fifo | IIR_RHR;
++    }
++    if ((s->ier & IER_THR) && s->thr_pending) {
++        s->thr_pending = false;         /* reading IIR acknowledges THR */
++        uart_update_irq(s);
++        return fifo | IIR_THR;
++    }
++    return fifo | IIR_NO_INT;
++}
++
++static uint8_t uart_pop(Omap3UartState *s)
++{
++    uint8_t c;
++
++    if (!s->rx_count) {
++        return 0;
++    }
++    c = s->rx_fifo[s->rx_head];
++    s->rx_head = (s->rx_head + 1) % OMAP3_UART_FIFO;
++    s->rx_count--;
++    qemu_chr_fe_accept_input(&s->chr);
++    uart_update_irq(s);
++    return c;
++}
++
++static void uart_transmit(Omap3UartState *s, uint8_t c)
++{
++    if (s->mcr & MCR_LOOPBACK) {
++        if (s->rx_count < OMAP3_UART_FIFO) {
++            s->rx_fifo[(s->rx_head + s->rx_count++) % OMAP3_UART_FIFO] = c;
++        }
++    } else {
++        /* XXX this blocks the whole system if the chardev blocks */
++        qemu_chr_fe_write_all(&s->chr, &c, 1);
++    }
++    s->thr_pending = true;
++    uart_update_irq(s);
++}
++
++static uint64_t uart_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3UartState *s = opaque;
++    bool mode_b = s->lcr == LCR_MODE_B;
++    bool mode_a = (s->lcr & LCR_DIV_EN) && !mode_b;
++
++    switch (addr) {
++    case UART_RHR_THR:
++        return (mode_a || mode_b) ? s->dll : uart_pop(s);
++    case UART_IER:
++        return (mode_a || mode_b) ? s->dlh : s->ier;
++    case UART_IIR_FCR:
++        return mode_b ? s->efr : uart_iir(s);
++    case UART_LCR:
++        return s->lcr;
++    case UART_MCR:
++        return mode_b ? s->xon1 : s->mcr;
++    case UART_LSR:
++        if (mode_b) {
++            return s->xon2;
++        }
++        return (s->rx_count ? LSR_RX_FIFO_E : 0) | LSR_TX_FIFO_E | LSR_TX_SR_E;
++    case UART_MSR:
++        if (uart_tcr_tlr(s)) {
++            return s->tcr;
++        }
++        return mode_b ? s->xoff1 : 0xb0;        /* DCD, DSR, CTS */
++    case UART_SPR:
++        if (uart_tcr_tlr(s)) {
++            return s->tlr;
++        }
++        return mode_b ? s->xoff2 : s->spr;
++    case UART_MDR1:
++        return s->mdr1;
++    case UART_MDR2:
++        return s->mdr2;
++    case UART_SFLSR:
++    case UART_RESUME:
++    case UART_SFREGL:
++    case UART_SFREGH:
++    case UART_EBLR:
++    case UART_ISR2:
++        return 0;
++    case UART_UASR_BLR:
++        return s->blr;
++    case UART_ACREG:
++        return s->acreg;
++    case UART_SCR:
++        return s->scr;
++    case UART_SSR:
++        return 0;                       /* TX FIFO never full */
++    case UART_MVR:
++        return 0x46;
++    case UART_SYSC:
++        return s->sysc;
++    case UART_SYSS:
++        return 1;                       /* RESETDONE */
++    case UART_WER:
++        return s->wer;
++    case UART_CFPS:
++        return s->cfps;
++    case UART_RXFIFO_LVL:
++        return s->rx_count;
++    case UART_TXFIFO_LVL:
++        return 0;
++    case UART_IER2:
++        return s->ier2;
++    case UART_MDR3:
++        return s->mdr3;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-uart: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void uart_reset(DeviceState *dev)
++{
++    Omap3UartState *s = OMAP3_UART(dev);
++
++    s->rx_head = 0;
++    s->rx_count = 0;
++    s->ier = 0;
++    s->fcr = 0;
++    s->lcr = 0;
++    s->mcr = 0;
++    s->spr = 0;
++    s->dll = 0;
++    s->dlh = 0;
++    s->efr = 0;
++    s->xon1 = s->xon2 = s->xoff1 = s->xoff2 = 0;
++    s->tcr = 0x0f;
++    s->tlr = 0;
++    s->mdr1 = 0x07;
++    s->mdr2 = 0;
++    s->mdr3 = 0;
++    s->scr = 0;
++    s->acreg = 0;
++    s->blr = 0x40;
++    s->ier2 = 0;
++    s->wer = 0x7f;
++    s->cfps = 0x69;
++    s->sysc = 0;
++    s->thr_pending = false;
++    uart_update_irq(s);
++}
++
++static void uart_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3UartState *s = opaque;
++    bool mode_b = s->lcr == LCR_MODE_B;
++    bool mode_a = (s->lcr & LCR_DIV_EN) && !mode_b;
++
++    switch (addr) {
++    case UART_RHR_THR:
++        if (mode_a || mode_b) {
++            s->dll = val;
++        } else {
++            uart_transmit(s, val);
++        }
++        return;
++    case UART_IER:
++        if (mode_a || mode_b) {
++            s->dlh = val & 0x3f;
++            return;
++        }
++        if ((val & IER_THR) && !(s->ier & IER_THR)) {
++            s->thr_pending = true;      /* THR is empty */
++        }
++        s->ier = val;
++        uart_update_irq(s);
++        return;
++    case UART_IIR_FCR:
++        if (mode_b) {
++            s->efr = val;
++            return;
++        }
++        if (val & FCR_RX_CLEAR) {
++            s->rx_head = s->rx_count = 0;
++        }
++        s->fcr = val & ~0x06;
++        uart_update_irq(s);
++        return;
++    case UART_LCR:
++        s->lcr = val;
++        return;
++    case UART_MCR:
++        if (mode_b) {
++            s->xon1 = val;
++        } else {
++            s->mcr = val;
++        }
++        return;
++    case UART_LSR:
++        if (mode_b) {
++            s->xon2 = val;
++        }
++        return;
++    case UART_MSR:
++        if (uart_tcr_tlr(s)) {
++            s->tcr = val;
++        } else if (mode_b) {
++            s->xoff1 = val;
++        }
++        return;
++    case UART_SPR:
++        if (uart_tcr_tlr(s)) {
++            s->tlr = val;
++        } else if (mode_b) {
++            s->xoff2 = val;
++        } else {
++            s->spr = val;
++        }
++        return;
++    case UART_MDR1:
++        s->mdr1 = val;
++        return;
++    case UART_MDR2:
++        s->mdr2 = val;
++        return;
++    case UART_UASR_BLR:
++        s->blr = val;
++        return;
++    case UART_ACREG:
++        s->acreg = val;
++        return;
++    case UART_SCR:
++        s->scr = val;
++        return;
++    case UART_SYSC:
++        if (val & 2) {                  /* SOFTRESET */
++            uart_reset(DEVICE(s));
++        }
++        s->sysc = val & ~2;
++        return;
++    case UART_WER:
++        s->wer = val;
++        return;
++    case UART_CFPS:
++        s->cfps = val;
++        return;
++    case UART_IER2:
++        s->ier2 = val;
++        return;
++    case UART_MDR3:
++        s->mdr3 = val;
++        return;
++    case UART_SFLSR:
++    case UART_RESUME:
++    case UART_SFREGL:
++    case UART_SFREGH:
++    case UART_EBLR:
++    case UART_ISR2:
++    case UART_SSR:
++    case UART_TXFIFO_LVL:
++        return;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-uart: bad write at 0x%" HWADDR_PRIx "\n",
++                  addr);
++}
++
++static const MemoryRegionOps uart_ops = {
++    .read = uart_read,
++    .write = uart_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static int uart_can_receive(void *opaque)
++{
++    Omap3UartState *s = opaque;
++
++    return OMAP3_UART_FIFO - s->rx_count;
++}
++
++static void uart_receive(void *opaque, const uint8_t *buf, int size)
++{
++    Omap3UartState *s = opaque;
++
++    for (int i = 0; i < size && s->rx_count < OMAP3_UART_FIFO; i++) {
++        s->rx_fifo[(s->rx_head + s->rx_count++) % OMAP3_UART_FIFO] = buf[i];
++    }
++    uart_update_irq(s);
++}
++
++static void uart_realize(DeviceState *dev, Error **errp)
++{
++    Omap3UartState *s = OMAP3_UART(dev);
++
++    qemu_chr_fe_set_handlers(&s->chr, uart_can_receive, uart_receive, NULL,
++                             NULL, s, NULL, true);
++}
++
++static void uart_init(Object *obj)
++{
++    Omap3UartState *s = OMAP3_UART(obj);
++
++    memory_region_init_io(&s->iomem, obj, &uart_ops, s, "omap3-uart", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static const Property uart_properties[] = {
++    DEFINE_PROP_CHR("chardev", Omap3UartState, chr),
++};
++
++static const VMStateDescription uart_vmstate = {
++    .name = TYPE_OMAP3_UART,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8_ARRAY(rx_fifo, Omap3UartState, OMAP3_UART_FIFO),
++        VMSTATE_UINT32(rx_head, Omap3UartState),
++        VMSTATE_UINT32(rx_count, Omap3UartState),
++        VMSTATE_UINT8(ier, Omap3UartState),
++        VMSTATE_UINT8(fcr, Omap3UartState),
++        VMSTATE_UINT8(lcr, Omap3UartState),
++        VMSTATE_UINT8(mcr, Omap3UartState),
++        VMSTATE_UINT8(spr, Omap3UartState),
++        VMSTATE_UINT8(dll, Omap3UartState),
++        VMSTATE_UINT8(dlh, Omap3UartState),
++        VMSTATE_UINT8(efr, Omap3UartState),
++        VMSTATE_UINT8(xon1, Omap3UartState),
++        VMSTATE_UINT8(xon2, Omap3UartState),
++        VMSTATE_UINT8(xoff1, Omap3UartState),
++        VMSTATE_UINT8(xoff2, Omap3UartState),
++        VMSTATE_UINT8(tcr, Omap3UartState),
++        VMSTATE_UINT8(tlr, Omap3UartState),
++        VMSTATE_UINT8(mdr1, Omap3UartState),
++        VMSTATE_UINT8(mdr2, Omap3UartState),
++        VMSTATE_UINT8(mdr3, Omap3UartState),
++        VMSTATE_UINT8(scr, Omap3UartState),
++        VMSTATE_UINT8(acreg, Omap3UartState),
++        VMSTATE_UINT8(blr, Omap3UartState),
++        VMSTATE_UINT8(ier2, Omap3UartState),
++        VMSTATE_UINT8(wer, Omap3UartState),
++        VMSTATE_UINT8(cfps, Omap3UartState),
++        VMSTATE_UINT32(sysc, Omap3UartState),
++        VMSTATE_BOOL(thr_pending, Omap3UartState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void uart_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = uart_realize;
++    device_class_set_legacy_reset(dc, uart_reset);
++    device_class_set_props(dc, uart_properties);
++    dc->vmsd = &uart_vmstate;
++    dc->desc = "OMAP3 UART";
++}
++
++static const TypeInfo uart_info = {
++    .name = TYPE_OMAP3_UART,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3UartState),
++    .instance_init = uart_init,
++    .class_init = uart_class_init,
++};
++
++static void uart_register_types(void)
++{
++    type_register_static(&uart_info);
++}
++
++type_init(uart_register_types)
+-- 
+2.55.0
+

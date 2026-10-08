@@ -1,0 +1,1136 @@
+From 0ef35dfa3fd259e99def0393a9171469a501d136 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:22:09 -0400
+Subject: [PATCH 06/20] hw/misc: add i.MX6 GPMI NAND controller model (APBH DMA
+ + BCH)
+
+Models the NAND subsystem at the register level the stock software
+drives it through, backed by a flat de-ECC'd page image (page N at
+offset N*2048, BCH treated as error-free):
+
+- APBH: CTRL0 SFTRST/CLKGATE latches, per-channel IRQ enable/status,
+  CHANNEL_CTRL channel resets, 4 channels with the 16-byte register
+  groups (CURCMDAR/NXTCMDAR/CMD/BAR/SEMA at 0x100 + n*0x70), and a
+  synchronous mxs-style descriptor engine (12-byte hardware command
+  + inline PIO words forwarded to consecutive GPMI registers).
+- GPMI: CTRL0/1, ECCCTRL, PAYLOAD/AUXILIARY, STAT; a raw-NAND chip
+  state machine (reset, READID, status, page read/program/erase with
+  CLE+INCREMENT command/address byte encoding).
+- BCH: pass-through decode/encode into the payload/auxiliary buffers,
+  COMPLETE_IRQ semantics; layout registers are stored and used for
+  the auxiliary status layout.
+
+Boots the stock U-Boot 2014.04 through its full startup cycle: probe,
+environment, bootcmd with UBI mount attempts and the unlocked/normal
+boot decision logic. The chip identity probe still returns no device
+(next task); all other paths run.
+
+Verified with the gen3 NAND dump repacked as a logical image.
+---
+ hw/arm/flintstone.c             |   9 +
+ hw/arm/fsl-imx6sx.c             |  18 +-
+ hw/misc/imx_gpmi_nand.c         | 854 ++++++++++++++++++++++++++++++++
+ hw/misc/meson.build             |   1 +
+ include/hw/arm/fsl-imx6sx.h     |   5 +
+ include/hw/misc/imx_gpmi_nand.h | 108 ++++
+ 6 files changed, 991 insertions(+), 4 deletions(-)
+ create mode 100644 hw/misc/imx_gpmi_nand.c
+ create mode 100644 include/hw/misc/imx_gpmi_nand.h
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 97f051d..a474260 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -22,7 +22,9 @@
+ #include "hw/arm/machines-qom.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
+ #include "hw/core/sysbus.h"
++#include "system/blockdev.h"
+ #include "system/system.h"
+ #include "qemu/error-report.h"
+ #include "qemu/units.h"
+@@ -33,6 +35,8 @@
+ static void flintstone_init(MachineState *machine)
+ {
+     DeviceState *soc;
++    DeviceState *gpmi;
++    BlockBackend *nand;
+ 
+     if (machine->ram_size != FLINTSTONE_RAM_SIZE) {
+         error_report("flintstone: this board has %lu MiB of DDR3",
+@@ -41,6 +45,11 @@ static void flintstone_init(MachineState *machine)
+     }
+ 
+     soc = qdev_new(TYPE_FSL_IMX6SX);
++    gpmi = DEVICE(object_resolve_path_component(OBJECT(soc), "gpmi"));
++    nand = blk_by_name("nand");
++    if (nand) {
++        qdev_prop_set_drive_err(gpmi, "drive", nand, &error_fatal);
++    }
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
+ 
+     memory_region_add_subregion(get_system_memory(), FLINTSTONE_RAM_ADDR,
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index 20c5585..803d2b2 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -45,10 +45,6 @@ static const struct {
+     hwaddr size;
+     const char *name;
+ } fsl_imx6sx_unimplemented[] = {
+-    /* GPMI NAND subsystem — real model arrives with the NAND phase */
+-    { FSL_IMX6SX_APBH_ADDR,  FSL_IMX6SX_APBH_SIZE,  "apbh-dma" },
+-    { FSL_IMX6SX_GPMI_ADDR,  FSL_IMX6SX_GPMI_SIZE,  "gpmi-nand" },
+-    { FSL_IMX6SX_BCH_ADDR,   FSL_IMX6SX_BCH_SIZE,   "bch" },
+     /* AIPS1 */
+     { FSL_IMX6SX_LPM_SRAM_ADDR, FSL_IMX6SX_LPM_SRAM_SIZE, "lpm-sram" },
+     { FSL_IMX6SX_PWM1_ADDR,  0x4000 * 4,            "pwm1-4" },
+@@ -92,6 +88,8 @@ static void fsl_imx6sx_init(Object *obj)
+ 
+     object_initialize_child(obj, "snvs", &s->snvs, TYPE_IMX7_SNVS);
+ 
++    object_initialize_child(obj, "gpmi", &s->gpmi, TYPE_IMX_GPMI_NAND);
++
+     for (i = 0; i < FSL_IMX6SX_NUM_UARTS; i++) {
+         snprintf(name, NAME_SIZE, "uart%d", i + 1);
+         object_initialize_child(obj, name, &s->uart[i], TYPE_IMX_SERIAL);
+@@ -263,6 +261,18 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+     }
+     sysbus_mmio_map(SYS_BUS_DEVICE(&s->src), 0, FSL_IMX6SX_SRC_ADDR);
+ 
++    /* GPMI NAND subsystem (APBH DMA at 0x01804000, GPMI 0x01806000, BCH
++     * 0x01808000) — one device, one MMIO block, two interrupt outputs.
++     * The machine attaches the NAND backend directly to the child. */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpmi), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpmi), 0, FSL_IMX6SX_APBH_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmi), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_BCH_IRQ));
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmi), 1,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_APBH_IRQ));
++
+     /* Initialize all UARTs */
+     {
+         static const struct {
+diff --git a/hw/misc/imx_gpmi_nand.c b/hw/misc/imx_gpmi_nand.c
+new file mode 100644
+index 0000000..8f14464
+--- /dev/null
++++ b/hw/misc/imx_gpmi_nand.c
+@@ -0,0 +1,854 @@
++/*
++ * i.MX6 GPMI NAND flash controller emulation (APBH DMA + GPMI + BCH)
++ *
++ * See the header for the modelling assumptions. Notable simplifications:
++ *
++ *  - BCH is a pass-through: the backend image is already de-ECC'd, so a
++ *    decode reports zero bit errors (STATUS_BLK0_ZERO) and an encode
++ *    stores the payload verbatim.
++ *  - The auxiliary buffer is filled with zeros; the per-chunk ECC status
++ *    bytes the drivers read from it then all read "no corrections".
++ *  - Ready-for-ready waits (NAND_WAIT_4_READY descriptors) complete
++ *    instantly; the emulated chip is always instantly ready.
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License as published by the
++ *  Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "hw/misc/imx_gpmi_nand.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/core/irq.h"
++#include "system/address-spaces.h"
++#include "system/block-backend-io.h"
++#include "system/block-backend-global-state.h"
++#include "system/dma.h"
++#include "system/memory.h"
++#include "qemu/module.h"
++#include "qemu/units.h"
++
++/* ------------------------------------------------------------------ */
++/* MXS-style register groups: reg, +4 SET, +8 CLR, +C TOG              */
++/* ------------------------------------------------------------------ */
++
++static void mxs_reg_write(uint32_t *reg, hwaddr off, uint32_t val)
++{
++    switch (off & 0xc) {
++    case 0x0:
++        *reg = val;
++        break;
++    case 0x4:
++        *reg |= val;
++        break;
++    case 0x8:
++        *reg &= ~val;
++        break;
++    case 0xc:
++        *reg ^= val;
++        break;
++    }
++}
++
++/* SFTRST on any MXS control register implies CLKGATE (readable latch). */
++#define APBH_CTRL0_SFTRST   (1u << 31)
++#define APBH_CTRL0_CLKGATE  (1u << 30)
++#define GPMI_CTRL0_SFTRST   (1u << 31)
++#define GPMI_CTRL0_CLKGATE  (1u << 30)
++#define BCH_CTRL_SFTRST     (1u << 31)
++#define BCH_CTRL_CLKGATE    (1u << 30)
++
++/* ------------------------------------------------------------------ */
++/* Raw NAND chip                                                       */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Emulated chip: Micron MT29F4G08ABADA ID string — 512 MiB, 2 KiB
++ * page, 128 KiB block, 64 B oob, x8. Its extended-ID byte (0x95) makes
++ * the generic nand_decode_ext_id path compute exactly the backend geometry:
++ *   writesize = 1024 << (id[3] & 3)          = 2048
++ *   oobsize   = (8 << ((id[3]>>2) & 1)) * 4  = 64
++ *   erasesize = 64KiB << ((id[3]>>4) & 3)    = 128KiB
++ *   buswidth  = (id[3]>>6) & 1               = 0 (x8)
++ */
++static const uint8_t nand_id[8] = { 0x2c, 0xdc, 0x90, 0x95, 0x56, 0, 0, 0 };
++
++static void nand_reset_chip(ImxGpmiNandState *s)
++{
++    s->last_cmd = 0;
++    s->addr_len = 0;
++    s->addr_expect = 0;
++    s->col = 0;
++    s->row = 0;
++    s->status = 0xc0; /* ready, not write-protected, no error */
++    s->stream = GPMI_STREAM_NONE;
++    s->stream_pos = 0;
++    s->page_len = 0;
++    s->programming = false;
++}
++
++static void nand_latch_addresses(ImxGpmiNandState *s)
++{
++    switch (s->addr_expect) {
++    case 5: /* column(2) + row(3) */
++        s->col = s->addr_bytes[0] | (s->addr_bytes[1] << 8);
++        s->row = s->addr_bytes[2] | (s->addr_bytes[3] << 8) |
++                 (s->addr_bytes[4] << 16);
++        break;
++    case 2: /* column(2), change read column */
++        s->col = s->addr_bytes[0] | (s->addr_bytes[1] << 8);
++        break;
++    case 3: /* row(3), erase */
++        s->row = s->addr_bytes[0] | (s->addr_bytes[1] << 8) |
++                 (s->addr_bytes[2] << 16);
++        break;
++    default:
++        break;
++    }
++}
++
++/*
++ * NAND program: bits can only go from 1 to 0, so AND the data into the
++ * page at `col`. The backend holds no OOB, so bytes past the page drop.
++ */
++static void nand_program(ImxGpmiNandState *s, uint32_t col,
++                         const uint8_t *data, uint32_t len)
++{
++    uint8_t page[IMX_GPMI_NAND_PAGE_SIZE];
++    int64_t off = (int64_t)s->row * IMX_GPMI_NAND_PAGE_SIZE;
++    uint32_t i;
++
++    if (!s->blk || !blk_is_writable(s->blk) ||
++        col >= IMX_GPMI_NAND_PAGE_SIZE) {
++        return;
++    }
++    len = MIN(len, IMX_GPMI_NAND_PAGE_SIZE - col);
++    if (blk_pread(s->blk, off, sizeof(page), page, 0) < 0) {
++        return;
++    }
++    for (i = 0; i < len; i++) {
++        page[col + i] &= data[i];
++    }
++    blk_pwrite(s->blk, off, sizeof(page), page, 0);
++}
++
++static void nand_command(ImxGpmiNandState *s, uint8_t cmd)
++{
++    s->stream = GPMI_STREAM_NONE;
++    s->stream_pos = 0;
++    s->addr_len = 0; /* every command starts a fresh address sequence */
++
++    switch (cmd) {
++    case 0xff: /* reset */
++        nand_reset_chip(s);
++        break;
++    case 0x90: /* read ID */
++        s->last_cmd = 0x90;
++        s->addr_expect = 1;
++        s->stream = GPMI_STREAM_ID;
++        s->stream_pos = 0;
++        break;
++    case 0xec: /* read parameter page (ONFI): fail gracefully */
++    case 0xed: /* read unique ID: ditto */
++        s->last_cmd = cmd;
++        s->addr_expect = 1;
++        s->stream = GPMI_STREAM_PARAM;
++        break;
++    case 0x70: /* read status */
++        s->stream = GPMI_STREAM_STATUS;
++        break;
++    case 0x00: /* read, first cycle */
++        s->last_cmd = 0x00;
++        s->addr_expect = 5;
++        break;
++    case 0x05: /* change read column (RNDOUT), confirmed by 0xe0 */
++        s->addr_expect = 2;
++        break;
++    case 0x30: /* read, second cycle */
++        if (s->last_cmd == 0x00) {
++            s->last_cmd = 0x30; /* page latched in s->row, ready to read */
++        }
++        break;
++    case 0x80: /* program, first cycle */
++        s->last_cmd = 0x80;
++        s->addr_expect = 5;
++        s->page_len = 0;
++        s->programming = true;
++        break;
++    case 0x10: /* program, second cycle */
++        /* Raw data sent over the bus; an ECC program already wrote the
++         * page from the BCH payload and leaves page_len at zero. */
++        if (s->programming && s->page_len) {
++            nand_program(s, s->col, s->page_buf, s->page_len);
++        }
++        s->programming = false;
++        s->status = 0xc0;
++        break;
++    case 0x60: /* erase, first cycle */
++        s->last_cmd = 0x60;
++        s->addr_expect = 3;
++        break;
++    case 0xd0: /* erase, second cycle */
++        if (s->last_cmd == 0x60 && s->blk && blk_is_writable(s->blk)) {
++            int64_t off = (int64_t)(s->row / IMX_GPMI_NAND_BLOCK_PAGES) *
++                          IMX_GPMI_NAND_BLOCK_PAGES * IMX_GPMI_NAND_PAGE_SIZE;
++            g_autofree uint8_t *ones = g_malloc(IMX_GPMI_NAND_BLOCK_PAGES *
++                                                IMX_GPMI_NAND_PAGE_SIZE);
++
++            /* Erased NAND reads all ones, not zeroes. */
++            memset(ones, 0xff, IMX_GPMI_NAND_BLOCK_PAGES *
++                               IMX_GPMI_NAND_PAGE_SIZE);
++            blk_pwrite(s->blk, off,
++                       IMX_GPMI_NAND_BLOCK_PAGES * IMX_GPMI_NAND_PAGE_SIZE,
++                       ones, 0);
++        }
++        s->status = 0xc0;
++        break;
++    default:
++        s->last_cmd = cmd;
++        break;
++    }
++}
++
++static void nand_address(ImxGpmiNandState *s, uint8_t b)
++{
++    if (s->addr_len < ARRAY_SIZE(s->addr_bytes)) {
++        s->addr_bytes[s->addr_len++] = b;
++    }
++    if (s->addr_expect && s->addr_len >= s->addr_expect) {
++        nand_latch_addresses(s);
++    }
++}
++
++static uint8_t nand_stream_byte(ImxGpmiNandState *s)
++{
++    switch (s->stream) {
++    case GPMI_STREAM_ID:
++        return s->stream_pos < ARRAY_SIZE(nand_id) ?
++               nand_id[s->stream_pos++] : 0;
++    case GPMI_STREAM_STATUS:
++        return s->status;
++    case GPMI_STREAM_PARAM: /* no valid ONFI table: all-ones */
++        return 0xff;
++    default:
++        return 0;
++    }
++}
++
++static void nand_data_out(ImxGpmiNandState *s, hwaddr addr, uint32_t len)
++{
++    /*
++     * Device -> memory: ID/_status/parameter byte streams. Only chip
++     * select 0 is populated; the other selects float the bus (all ones),
++     * so the driver's multi-chip probe stops after the first one.
++     */
++    uint8_t buf[512];
++    uint32_t cs = (s->g_ctrl0 >> 20) & 0x7;
++
++    while (len) {
++        uint32_t n = MIN(len, sizeof(buf));
++        unsigned i;
++
++        for (i = 0; i < n; i++) {
++            buf[i] = cs ? 0xff : nand_stream_byte(s);
++        }
++        address_space_write(&address_space_memory, addr,
++                            MEMTXATTRS_UNSPECIFIED, buf, n);
++        addr += n;
++        len -= n;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* BCH operations (pass-through)                                       */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The mxs driver swaps the payload bits that overlay the physical bad-block
++ * marker with metadata[0] on every ECC page read and write. The backend
++ * image holds de-swapped logical data, so the model mirrors that swap:
++ * reads put the payload byte at the mark into aux[0] (making the driver's
++ * swap a no-op), writes take the true byte back out of aux[0]. The mark
++ * position follows mxs_nand_get_mark_offset() for the programmed layout.
++ */
++static void gpmi_mark_offset(ImxGpmiNandState *s, uint32_t *byte,
++                             uint32_t *shift)
++{
++    uint32_t meta = (s->bch_flash_layout[0] >> 16) & 0xff;
++    uint32_t ecc_bits = ((s->bch_flash_layout[0] >> 11) & 0x1f) * 2 * 13;
++    uint32_t chunk_bits = 512 * 8 + ecc_bits;
++    uint32_t bits = IMX_GPMI_NAND_PAGE_SIZE * 8 - meta * 8;
++
++    bits -= (bits / chunk_bits) * ecc_bits;
++    *byte = MIN(bits / 8, IMX_GPMI_NAND_PAGE_SIZE - 2);
++    *shift = bits % 8;
++}
++
++static bool gpmi_page_read(ImxGpmiNandState *s)
++{
++    uint8_t page[IMX_GPMI_NAND_PAGE_SIZE];
++    uint8_t aux[128];
++    uint32_t chunks, ecc_bytes, aux_len, mark, shift, meta, parity, first;
++
++    if (s->blk) {
++        if (blk_pread(s->blk, (int64_t)s->row * IMX_GPMI_NAND_PAGE_SIZE,
++                      IMX_GPMI_NAND_PAGE_SIZE, page, 0) < 0) {
++            memset(page, 0, sizeof(page));
++        }
++    } else {
++        memset(page, 0xff, sizeof(page));
++    }
++
++    /*
++     * Auxiliary buffer: metadata + per-chunk ECC bytes, then one status
++     * byte per chunk. Zero means "zero bit errors" in every status byte.
++     */
++    chunks = ((s->bch_flash_layout[0] >> 24) & 0xff) + 1;
++    ecc_bytes = (((s->bch_flash_layout[0] >> 11) & 0x1f) * 13 + 7) / 8;
++    if (chunks == 0 || chunks > 32 || ecc_bytes == 0 || ecc_bytes > 32) {
++        chunks = 4;
++        ecc_bytes = 13;
++    }
++
++    /*
++     * Subpage reads (Linux gpmi_ecc_read_subpage) move the column with
++     * RNDOUT to the raw start of chunk `first` (meta + (512 + parity) *
++     * first), shrink NBLOCKS and drop META_SIZE to 0. Return exactly those
++     * chunks of the logical page.
++     */
++    meta = (s->bch_flash_layout[0] >> 16) & 0xff;
++    parity = (((s->bch_flash_layout[0] >> 11) & 0x1f) * 2 * 13 + 7) / 8;
++    first = 0;
++    if (s->col > IMX_GPMI_NAND_META_SIZE) {
++        first = (s->col - IMX_GPMI_NAND_META_SIZE) / (512 + parity);
++    }
++    first = MIN(first, IMX_GPMI_NAND_PAGE_SIZE / 512 - 1);
++    chunks = MIN(chunks, IMX_GPMI_NAND_PAGE_SIZE / 512 - first);
++    address_space_write(&address_space_memory, s->g_payload,
++                        MEMTXATTRS_UNSPECIFIED, page + first * 512,
++                        chunks * 512);
++
++    aux_len = IMX_GPMI_NAND_META_SIZE + chunks * (ecc_bytes + 1);
++    aux_len = MIN(aux_len, sizeof(aux));
++    memset(aux, 0, aux_len);
++    if (meta) {
++        gpmi_mark_offset(s, &mark, &shift);
++        aux[0] = (page[mark] >> shift) | (page[mark + 1] << (8 - shift));
++    }
++    address_space_write(&address_space_memory, s->g_auxiliary,
++                        MEMTXATTRS_UNSPECIFIED, aux, aux_len);
++
++    s->bch_status0 = 0x00 << 8; /* STATUS_BLK0_ZERO */
++    return true;
++}
++
++static bool gpmi_page_write(ImxGpmiNandState *s)
++{
++    uint8_t page[IMX_GPMI_NAND_PAGE_SIZE];
++    uint8_t aux0;
++    uint32_t mark, shift;
++
++    if (address_space_read(&address_space_memory, s->g_payload,
++                           MEMTXATTRS_UNSPECIFIED, page,
++                           sizeof(page)) != MEMTX_OK ||
++        address_space_read(&address_space_memory, s->g_auxiliary,
++                           MEMTXATTRS_UNSPECIFIED, &aux0, 1) != MEMTX_OK) {
++        return false;
++    }
++    gpmi_mark_offset(s, &mark, &shift);
++    page[mark] = (page[mark] & ~(0xff << shift)) | (aux0 << shift);
++    page[mark + 1] = (page[mark + 1] & (0xff << shift)) |
++                     (aux0 >> (8 - shift));
++    nand_program(s, 0, page, sizeof(page));
++    s->bch_status0 = 0x00 << 8;
++    return true;
++}
++
++static void gpmi_bch_op(ImxGpmiNandState *s)
++{
++    bool auxonly = (s->g_eccctrl & 0x1ff) == 0x100;
++    bool encode = (s->g_eccctrl & (1u << 13)) != 0;
++
++    if (!(s->g_eccctrl & (1u << 12))) { /* ENABLE_ECC */
++        return;
++    }
++    if (encode) {
++        gpmi_page_write(s);
++    } else if (!auxonly) {
++        gpmi_page_read(s);
++    } else {
++        uint8_t aux[128];
++        uint32_t aux_len = 66; /* metadata + ecc + chunk status, all zero */
++
++        memset(aux, 0, aux_len);
++        address_space_write(&address_space_memory, s->g_auxiliary,
++                            MEMTXATTRS_UNSPECIFIED, aux, aux_len);
++        s->bch_status0 = 0x00 << 8;
++    }
++    s->bch_ctrl |= 1u << 0; /* COMPLETE_IRQ */
++    qemu_set_irq(s->irq_bch,
++                 (s->bch_ctrl & (1u << 0)) && (s->bch_ctrl & (1u << 8)));
++}
++
++/* ------------------------------------------------------------------ */
++/* GPMI DMA client side                                                */
++/* ------------------------------------------------------------------ */
++
++#define GPMI_CTRL0_COMMAND_MODE_READ             (0x1u << 24)
++#define GPMI_CTRL0_COMMAND_MODE_WRITE            (0x0u << 24)
++#define GPMI_CTRL0_ADDRESS_MASK                  (0x7u << 17)
++#define GPMI_CTRL0_ADDRESS_NAND_DATA             (0x0u << 17)
++#define GPMI_CTRL0_ADDRESS_NAND_CLE              (0x1u << 17)
++#define GPMI_CTRL0_ADDRESS_NAND_ALE              (0x2u << 17)
++#define GPMI_ECCCTRL_ENABLE_ECC                  (1u << 12)
++
++#define DESC_COMMAND_MASK      0x3
++#define DESC_COMMAND_NO_XFER   0x0
++#define DESC_COMMAND_DMA_WRITE 0x1 /* peripheral -> memory */
++#define DESC_COMMAND_DMA_READ  0x2 /* memory -> peripheral */
++#define DESC_IRQ               (1u << 3)
++#define DESC_NAND_WAIT_4_READY (1u << 5)
++#define DESC_CHAIN             (1u << 2)
++#define DESC_PIO_WORDS_OFF     12
++#define DESC_BYTES_OFF         16
++
++static void gpmi_data_in(ImxGpmiNandState *s, hwaddr addr, uint32_t len)
++{
++    /* Memory -> device: command/address bytes or page-program data. */
++    uint32_t address = s->g_ctrl0 & GPMI_CTRL0_ADDRESS_MASK;
++    uint8_t buf[512];
++
++    while (len) {
++        uint32_t n = MIN(len, sizeof(buf));
++        unsigned i;
++
++        address_space_read(&address_space_memory, addr,
++                           MEMTXATTRS_UNSPECIFIED, buf, n);
++        if (address == GPMI_CTRL0_ADDRESS_NAND_CLE) {
++            /* First byte is a command, the rest are address cycles. */
++            for (i = 0; i < n; i++) {
++                if (i == 0) {
++                    nand_command(s, buf[i]);
++                } else {
++                    nand_address(s, buf[i]);
++                }
++            }
++        } else if (address == GPMI_CTRL0_ADDRESS_NAND_ALE) {
++            for (i = 0; i < n; i++) {
++                nand_address(s, buf[i]);
++            }
++        } else { /* NAND_DATA: program-page payload */
++            for (i = 0; i < n; i++) {
++                if (s->col + s->page_len <
++                    IMX_GPMI_NAND_PAGE_SIZE + IMX_GPMI_NAND_OOB_SIZE) {
++                    s->page_buf[s->page_len++] = buf[i];
++                }
++            }
++        }
++        addr += n;
++        len -= n;
++    }
++}
++
++static void gpmi_execute(ImxGpmiNandState *s, uint32_t cmd, hwaddr desc,
++                         hwaddr bar, uint32_t nwords)
++{
++    uint32_t pio[15];
++    uint32_t command = cmd & DESC_COMMAND_MASK;
++    uint32_t bytes = cmd >> DESC_BYTES_OFF;
++    unsigned i;
++
++    if (nwords > ARRAY_SIZE(pio)) {
++        nwords = ARRAY_SIZE(pio);
++    }
++    if (nwords &&
++        address_space_read(&address_space_memory, desc + 12,
++                           MEMTXATTRS_UNSPECIFIED, pio,
++                           nwords * 4) != MEMTX_OK) {
++        return;
++    }
++    /* PIO words land on consecutive GPMI registers from CTRL0 upwards. */
++    for (i = 0; i < nwords; i++) {
++        switch (i) {
++        case 0: s->g_ctrl0 = pio[i]; break;
++        case 1: s->g_ctrl1 = pio[i]; break;
++        case 2: s->g_eccctrl = pio[i]; break;
++        case 3: s->g_ecccount = pio[i]; break;
++        case 4: s->g_payload = pio[i]; break;
++        case 5: s->g_auxiliary = pio[i]; break;
++        case 6: s->g_timing0 = pio[i]; break;
++        case 7: s->g_timing1 = pio[i]; break;
++        case 8: s->g_timing2 = pio[i]; break;
++        }
++    }
++
++    switch (command) {
++    case DESC_COMMAND_NO_XFER:
++        /*
++         * The PIO words alone carry the operation. A BCH page op is only
++         * implied when THIS descriptor enables ECC in its own PIO block —
++         * wait-for-ready descriptors reuse stale words beyond pio[0] and
++         * must not be mistaken for one.
++         */
++        if (nwords >= 3 && (pio[2] & GPMI_ECCCTRL_ENABLE_ECC)) {
++            gpmi_bch_op(s);
++        }
++        break;
++    case DESC_COMMAND_DMA_WRITE: /* peripheral -> memory */
++        nand_data_out(s, bar, bytes);
++        break;
++    case DESC_COMMAND_DMA_READ: /* memory -> peripheral */
++        gpmi_data_in(s, bar, bytes);
++        break;
++    default:
++        break;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* APBH DMA engine                                                     */
++/* ------------------------------------------------------------------ */
++
++static void apbh_run_channel(ImxGpmiNandState *s, unsigned n)
++{
++    ImxGpmiNandChannel *ch = &s->ch[n];
++    hwaddr cur = ch->nxtcmdar;
++    unsigned guard;
++
++    if (s->apbh_ctrl0 & (APBH_CTRL0_SFTRST | APBH_CTRL0_CLKGATE)) {
++        return;
++    }
++    ch->curcmdar = cur;
++
++    for (guard = 0; guard < 32; guard++) {
++        uint32_t words[3];
++
++        if (address_space_read(&address_space_memory, cur,
++                               MEMTXATTRS_UNSPECIFIED, words,
++                               sizeof(words)) != MEMTX_OK) {
++            break;
++        }
++        ch->bar = words[2];
++        gpmi_execute(s, words[1], cur, words[2],
++                     (words[1] >> DESC_PIO_WORDS_OFF) & 0xf);
++        if (!(words[1] & DESC_CHAIN)) {
++            break;
++        }
++        cur = words[0];
++    }
++
++    ch->sema = 0; /* all descriptors consumed */
++    s->apbh_ctrl1 |= 1u << n; /* CMDCMPLT_IRQ */
++    qemu_log_mask(LOG_GUEST_ERROR, "apbh ch%u chain done, ctrl1=0x%x\n", n,
++                  s->apbh_ctrl1);
++    qemu_set_irq(s->irq_apbh,
++                 (s->apbh_ctrl1 & (1u << n)) && (s->apbh_ctrl1 & (0x10000u << n)));
++}
++
++/* ------------------------------------------------------------------ */
++/* Memory region handlers                                              */
++/* ------------------------------------------------------------------ */
++
++static uint64_t apbh_read(void *opaque, hwaddr off, unsigned size)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(opaque);
++    unsigned n;
++    hwaddr within;
++
++    switch (off & ~0xc) {
++    case 0x000: return s->apbh_ctrl0;
++    case 0x010: return s->apbh_ctrl1;
++    case 0x020: return s->apbh_ctrl2;
++    case 0x030: return s->apbh_channel_ctrl;
++    case 0x800: return 0x00030000; /* version */
++    default:
++        break;
++    }
++    if (off >= 0x100 && off < 0x100 + 0x70 * IMX_GPMI_NAND_NUM_CHANNELS) {
++        n = (off - 0x100) / 0x70;
++        within = off - 0x100 - n * 0x70;
++        switch (within) {
++        case 0x00: return s->ch[n].curcmdar;
++        case 0x10: return s->ch[n].nxtcmdar;
++        case 0x30: return s->ch[n].bar;
++        case 0x40: return (s->ch[n].sema & 0xff) << 16; /* PHORE */
++        default: return 0;
++        }
++    }
++    return 0;
++}
++
++static void apbh_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(opaque);
++    unsigned n;
++    hwaddr within;
++
++    qemu_log_mask(LOG_GUEST_ERROR, "apbh w off=0x%04x val=0x%08x\n",
++                  (unsigned)off, (unsigned)val);
++
++    if (off >= 0x100 && off < 0x100 + 0x70 * IMX_GPMI_NAND_NUM_CHANNELS) {
++        n = (off - 0x100) / 0x70;
++        within = off - 0x100 - n * 0x70;
++        switch (within) {
++        case 0x00:
++            mxs_reg_write(&s->ch[n].curcmdar, off, val);
++            return;
++        case 0x10:
++            mxs_reg_write(&s->ch[n].nxtcmdar, off, val);
++            return;
++        case 0x30:
++            mxs_reg_write(&s->ch[n].bar, off, val);
++            return;
++        case 0x40:
++            mxs_reg_write(&s->ch[n].sema, off, val);
++            /* A nonzero increment kicks the channel from NXTCMDAR. */
++            if ((s->ch[n].sema & 0xff) && !(s->ch[n].sema & 0xff0000)) {
++                apbh_run_channel(s, n);
++            }
++            return;
++        default:
++            return;
++        }
++    }
++
++    switch (off & ~0xc) {
++    case 0x000:
++        mxs_reg_write(&s->apbh_ctrl0, off, val);
++        if (s->apbh_ctrl0 & APBH_CTRL0_SFTRST) {
++            s->apbh_ctrl0 |= APBH_CTRL0_CLKGATE;
++        }
++        return;
++    case 0x010:
++        mxs_reg_write(&s->apbh_ctrl1, off, val);
++        qemu_set_irq(s->irq_apbh,
++                     (s->apbh_ctrl1 & 0xffff & (s->apbh_ctrl1 >> 16)) != 0);
++        return;
++    case 0x020:
++        mxs_reg_write(&s->apbh_ctrl2, off, val);
++        return;
++    case 0x030:
++        /* Channel reset bits self-clear. */
++        s->apbh_channel_ctrl = 0;
++        return;
++    default:
++        return;
++    }
++}
++
++static const MemoryRegionOps apbh_ops = {
++    .read = apbh_read,
++    .write = apbh_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static uint64_t gpmi_read(void *opaque, hwaddr off, unsigned size)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(opaque);
++
++    switch (off & ~0xc) {
++    case 0x000: return s->g_ctrl0;
++    case 0x010: return s->g_compare;
++    case 0x020: return s->g_eccctrl;
++    case 0x030: return s->g_ecccount;
++    case 0x040: return s->g_payload;
++    case 0x050: return s->g_auxiliary;
++    case 0x060: return s->g_ctrl1;
++    case 0x070: return s->g_timing0;
++    case 0x080: return s->g_timing1;
++    case 0x090: return s->g_timing2;
++    case 0x0a0: /* DATA: pop one byte from the active byte stream */
++        return nand_stream_byte(s);
++    case 0x0b0: /* STAT: present, CS0 ready (READY_BUSY bit 24 + cs), FIFO
++                 * empty. Linux and U-Boot poll this in nand_wait_ready;
++                 * reading it as busy costs a 20 ms timeout per operation. */
++        return (1u << 0) | (1u << 24) | (1u << 2);
++    case 0x0d0: return 0x00020000; /* version */
++    default:
++        return 0;
++    }
++}
++
++static void gpmi_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(opaque);
++
++    switch (off & ~0xc) {
++    case 0x000:
++        mxs_reg_write(&s->g_ctrl0, off, val);
++        if (s->g_ctrl0 & GPMI_CTRL0_SFTRST) {
++            s->g_ctrl0 |= GPMI_CTRL0_CLKGATE;
++        }
++        return;
++    case 0x010: mxs_reg_write(&s->g_compare, off, val); return;
++    case 0x020: mxs_reg_write(&s->g_eccctrl, off, val); return;
++    case 0x030: mxs_reg_write(&s->g_ecccount, off, val); return;
++    case 0x040: mxs_reg_write(&s->g_payload, off, val); return;
++    case 0x050: mxs_reg_write(&s->g_auxiliary, off, val); return;
++    case 0x060: mxs_reg_write(&s->g_ctrl1, off, val); return;
++    case 0x070: mxs_reg_write(&s->g_timing0, off, val); return;
++    case 0x080: mxs_reg_write(&s->g_timing1, off, val); return;
++    case 0x090: mxs_reg_write(&s->g_timing2, off, val); return;
++    default: return;
++    }
++}
++
++static const MemoryRegionOps gpmi_ops = {
++    .read = gpmi_read,
++    .write = gpmi_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static uint64_t bch_read(void *opaque, hwaddr off, unsigned size)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(opaque);
++
++    switch (off & ~0xc) {
++    case 0x000: return s->bch_ctrl;
++    case 0x010: return s->bch_status0;
++    case 0x020: return s->bch_mode;
++    case 0x030: return s->bch_encodeptr;
++    case 0x040: return s->bch_dataptr;
++    case 0x050: return s->bch_metaptr;
++    case 0x070: return s->bch_layoutselect;
++    case 0x080: /* FLASH0LAYOUT0 .. FLASH3LAYOUT1 */
++    case 0x090:
++    case 0x0a0:
++    case 0x0b0:
++    case 0x0c0:
++    case 0x0d0:
++    case 0x0e0:
++    case 0x0f0:
++        return s->bch_flash_layout[((off & ~0xc) - 0x080) / 0x10];
++    case 0x180: return 0x00010000; /* version */
++    default:
++        return 0;
++    }
++}
++
++static void bch_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(opaque);
++
++    switch (off & ~0xc) {
++    case 0x000:
++        mxs_reg_write(&s->bch_ctrl, off, val);
++        if (s->bch_ctrl & BCH_CTRL_SFTRST) {
++            s->bch_ctrl |= BCH_CTRL_CLKGATE;
++        }
++        qemu_set_irq(s->irq_bch,
++                     (s->bch_ctrl & (1u << 0)) && (s->bch_ctrl & (1u << 8)));
++        return;
++    case 0x020: s->bch_mode = val; return;
++    case 0x030: s->bch_encodeptr = val; return;
++    case 0x040: s->bch_dataptr = val; return;
++    case 0x050: s->bch_metaptr = val; return;
++    case 0x070: s->bch_layoutselect = val; return;
++    case 0x080: /* FLASH0LAYOUT0 .. FLASH3LAYOUT1 */
++    case 0x090:
++    case 0x0a0:
++    case 0x0b0:
++    case 0x0c0:
++    case 0x0d0:
++    case 0x0e0:
++    case 0x0f0:
++        s->bch_flash_layout[((off & ~0xc) - 0x080) / 0x10] = val;
++        return;
++    default:
++        return;
++    }
++}
++
++static const MemoryRegionOps bch_ops = {
++    .read = bch_read,
++    .write = bch_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++/* ------------------------------------------------------------------ */
++/* QOM                                                                 */
++/* ------------------------------------------------------------------ */
++
++static void imx_gpmi_nand_realize(DeviceState *dev, Error **errp)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(dev);
++
++    memory_region_init(&s->container, OBJECT(s), "imx-gpmi-nand",
++                       IMX_GPMI_NAND_SIZE);
++    memory_region_init_io(&s->apbh_mr, OBJECT(s), &apbh_ops, s,
++                          "imx-gpmi-nand.apbh", 0x2000);
++    memory_region_init_io(&s->gpmi_mr, OBJECT(s), &gpmi_ops, s,
++                          "imx-gpmi-nand.gpmi", 0x2000);
++    memory_region_init_io(&s->bch_mr, OBJECT(s), &bch_ops, s,
++                          "imx-gpmi-nand.bch", 0x4000);
++    memory_region_add_subregion(&s->container, IMX_GPMI_NAND_APBH_OFF,
++                                &s->apbh_mr);
++    memory_region_add_subregion(&s->container, IMX_GPMI_NAND_GPMI_OFF,
++                                &s->gpmi_mr);
++    memory_region_add_subregion(&s->container, IMX_GPMI_NAND_BCH_OFF,
++                                &s->bch_mr);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->container);
++    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq_bch);
++    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq_apbh);
++
++    /* Program/erase write through to the backend (run.sh keeps it behind
++     * snapshot=on), so ask for write permission when the drive allows it. */
++    if (s->blk) {
++        uint64_t perm = BLK_PERM_CONSISTENT_READ;
++
++        if (blk_supports_write_perm(s->blk)) {
++            perm |= BLK_PERM_WRITE;
++        }
++        if (blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) < 0) {
++            return;
++        }
++    }
++
++    nand_reset_chip(s);
++}
++
++static const Property imx_gpmi_nand_properties[] = {
++    DEFINE_PROP_DRIVE("drive", ImxGpmiNandState, blk),
++};
++
++static void imx_gpmi_nand_reset_hold(Object *obj, ResetType type)
++{
++    ImxGpmiNandState *s = IMX_GPMI_NAND(obj);
++
++    nand_reset_chip(s);
++}
++
++static void imx_gpmi_nand_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    ResettableClass *rc = RESETTABLE_CLASS(oc);
++
++    dc->realize = imx_gpmi_nand_realize;
++    dc->desc = "i.MX GPMI NAND controller (APBH DMA + BCH)";
++    device_class_set_props(dc, imx_gpmi_nand_properties);
++    dc->user_creatable = false;
++    rc->phases.hold = imx_gpmi_nand_reset_hold;
++}
++
++static const TypeInfo imx_gpmi_nand_info = {
++    .name = TYPE_IMX_GPMI_NAND,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ImxGpmiNandState),
++    .class_init = imx_gpmi_nand_class_init,
++};
++
++static void imx_gpmi_nand_register_types(void)
++{
++    type_register_static(&imx_gpmi_nand_info);
++}
++
++type_init(imx_gpmi_nand_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 092f70b..df7e141 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -69,6 +69,7 @@ system_ss.add(when: 'CONFIG_IMX', if_true: files(
+   'imx7_gpr.c',
+   'imx7_snvs.c',
+   'imx_ccm.c',
++  'imx_gpmi_nand.c',
+   'imx_rngc.c',
+ ))
+ system_ss.add(when: 'CONFIG_MAX78000_AES', if_true: files('max78000_aes.c'))
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+index 3419540..da3fda1 100644
+--- a/include/hw/arm/fsl-imx6sx.h
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -28,6 +28,7 @@
+ 
+ #include "cpu.h"
+ #include "hw/char/imx_serial.h"
++#include "hw/misc/imx_gpmi_nand.h"
+ #include "hw/cpu/a9mpcore.h"
+ #include "hw/gpio/imx_gpio.h"
+ #include "hw/i2c/imx_i2c.h"
+@@ -88,6 +89,8 @@ DECLARE_INSTANCE_CHECKER(FslIMX6SXState, FSL_IMX6SX, TYPE_FSL_IMX6SX)
+ #define FSL_IMX6SX_GPMI_SIZE        0x2000
+ #define FSL_IMX6SX_BCH_ADDR         0x01808000
+ #define FSL_IMX6SX_BCH_SIZE         0x4000
++#define FSL_IMX6SX_APBH_IRQ         13
++#define FSL_IMX6SX_BCH_IRQ          15
+ 
+ /* AIPS1 / SPBA1 */
+ #define FSL_IMX6SX_UART1_ADDR       0x02020000
+@@ -238,6 +241,8 @@ struct FslIMX6SXState {
+     IMXFECState eth[FSL_IMX6SX_NUM_ETHS];
+     IMX2WdtState wdt[FSL_IMX6SX_NUM_WDTS];
+ 
++    ImxGpmiNandState gpmi;
++
+     MemoryRegion rom;
+     MemoryRegion caam;
+     MemoryRegion ocram;
+diff --git a/include/hw/misc/imx_gpmi_nand.h b/include/hw/misc/imx_gpmi_nand.h
+new file mode 100644
+index 0000000..273e4a5
+--- /dev/null
++++ b/include/hw/misc/imx_gpmi_nand.h
+@@ -0,0 +1,108 @@
++/*
++ * i.MX6 GPMI NAND flash controller emulation (with APBH DMA and BCH ECC)
++ *
++ * Modelled against the register-level behavior the stock software depends
++ * on: U-Boot 2014.04 `mxs_nand` + `apbh_dma`, and (for the later kernel
++ * boot) the 4.1.15 `gpmi-nand`/`mxs-dma` drivers. The NAND backend is a
++ * flat, de-ECC'd page image: page N is at offset N * 2048, with BCH parity
++ * already stripped, so the model treats every transfer as error-free.
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License as published by the
++ *  Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ */
++
++#ifndef HW_MISC_IMX_GPMI_NAND_H
++#define HW_MISC_IMX_GPMI_NAND_H
++
++#include "hw/core/sysbus.h"
++#include "system/block-backend.h"
++
++#define TYPE_IMX_GPMI_NAND "imx-gpmi-nand"
++OBJECT_DECLARE_SIMPLE_TYPE(ImxGpmiNandState, IMX_GPMI_NAND)
++
++/* The whole subsystem is one contiguous block: APBH, GPMI, BCH. */
++#define IMX_GPMI_NAND_APBH_OFF   0x0000
++#define IMX_GPMI_NAND_GPMI_OFF   0x2000
++#define IMX_GPMI_NAND_BCH_OFF    0x4000
++#define IMX_GPMI_NAND_SIZE       0xC000
++
++#define IMX_GPMI_NAND_NUM_CHANNELS 4
++
++typedef struct ImxGpmiNandChannel {
++    uint32_t curcmdar;
++    uint32_t nxtcmdar;
++    uint32_t bar;
++    uint32_t sema;
++} ImxGpmiNandChannel;
++
++/* NAND geometry of the gen3 part (MT29F4G08-class, 512 MiB) */
++#define IMX_GPMI_NAND_PAGE_SIZE   2048
++#define IMX_GPMI_NAND_OOB_SIZE    64
++#define IMX_GPMI_NAND_BLOCK_PAGES 64
++#define IMX_GPMI_NAND_META_SIZE   10
++
++enum imx_gpmi_stream {
++    GPMI_STREAM_NONE,
++    GPMI_STREAM_ID,
++    GPMI_STREAM_STATUS,
++    GPMI_STREAM_PARAM,
++};
++
++struct ImxGpmiNandState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion container;
++    MemoryRegion apbh_mr;
++    MemoryRegion gpmi_mr;
++    MemoryRegion bch_mr;
++    qemu_irq irq_bch;
++    qemu_irq irq_apbh;
++    BlockBackend *blk;
++
++    /* APBH DMA */
++    uint32_t apbh_ctrl0;
++    uint32_t apbh_ctrl1;
++    uint32_t apbh_ctrl2;
++    uint32_t apbh_channel_ctrl;
++    ImxGpmiNandChannel ch[IMX_GPMI_NAND_NUM_CHANNELS];
++
++    /* GPMI */
++    uint32_t g_ctrl0;
++    uint32_t g_compare;
++    uint32_t g_eccctrl;
++    uint32_t g_ecccount;
++    uint32_t g_payload;
++    uint32_t g_auxiliary;
++    uint32_t g_ctrl1;
++    uint32_t g_timing0;
++    uint32_t g_timing1;
++    uint32_t g_timing2;
++
++    /* BCH */
++    uint32_t bch_ctrl;
++    uint32_t bch_status0;
++    uint32_t bch_mode;
++    uint32_t bch_encodeptr;
++    uint32_t bch_dataptr;
++    uint32_t bch_metaptr;
++    uint32_t bch_layoutselect;
++    uint32_t bch_flash_layout[8];
++
++    /* Raw NAND chip state */
++    uint8_t last_cmd;
++    uint8_t addr_bytes[8];
++    unsigned addr_len;
++    unsigned addr_expect;
++    uint32_t col;
++    uint32_t row;
++    uint8_t status;
++    enum imx_gpmi_stream stream;
++    unsigned stream_pos;
++    uint8_t page_buf[IMX_GPMI_NAND_PAGE_SIZE + IMX_GPMI_NAND_OOB_SIZE];
++    uint32_t page_len;
++    bool programming;
++};
++
++#endif /* HW_MISC_IMX_GPMI_NAND_H */
+-- 
+2.55.0
+

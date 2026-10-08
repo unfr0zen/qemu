@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nest · QEMU</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<style>
+  /* The wordmark: Inter (SIL OFL, ui/fonts/OFL-Inter.txt). */
+  @font-face { font-family: "Inter"; font-weight: 100 900;
+               src: url("/font/Inter-Variable.ttf") format("truetype"); }
+  :root {
+    --bg: #55565a;
+    --bg-2: #3a3b3f;
+    --panel: #f3f1ec;
+    --line: #d1cec6;
+    --ink: #2b2a27;
+    --muted: #77746c;
+    --log-bg: #1d1e20;
+    --log-ink: #d7d4cc;
+    --accent: #e8553f;
+    --on-bg: #f4f2ec;
+    --on-bg-muted: #dcd9d1;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg-2); }
+  html, body { margin: 0; }
+  body {
+    min-height: 100vh;
+    background: radial-gradient(ellipse at 30% 15%, #67686d 0%, var(--bg) 45%, var(--bg-2) 100%);
+    color: var(--ink);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  main {
+    display: grid;
+    grid-template-columns: minmax(340px, 520px) 1fr;
+    gap: 24px;
+    height: 100vh;
+    padding: 20px 24px;
+  }
+  .stage { display: flex; flex-direction: column; align-items: center; min-height: 0; position: relative; }
+  header { width: 100%; display: flex; align-items: baseline; justify-content: space-between; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: .02em; margin: 0; }
+  .stage h1 { color: var(--on-bg); }
+  .state { font-size: 12px; color: var(--on-bg-muted); display: flex; align-items: center; gap: 6px; }
+  .state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #b5b1a8; }
+  .state.on::before { background: #7ec495; box-shadow: 0 0 6px #7ec495; }
+  .head-right { display: flex; align-items: center; gap: 12px; }
+  .sound { font: inherit; font-size: 12px; color: var(--on-bg-muted); background: none;
+           border: 1px solid currentColor; border-radius: 10px; padding: 0 8px; cursor: pointer; }
+  .sound.on { color: var(--on-bg); }
+  svg.device { width: 100%; max-height: calc(100vh - 120px); flex: 1; min-height: 0; overflow: visible; }
+  .hint { position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%); width: max-content; max-width: 92%;
+          font-size: 12px; color: var(--on-bg-muted); text-align: center; padding: 4px 10px; border-radius: 8px;
+          background: rgba(40, 39, 37, .55); backdrop-filter: blur(4px); }
+  kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--line); border-bottom-width: 2px;
+        border-radius: 4px; padding: 0 4px; background: var(--panel); color: var(--ink); }
+
+  .side { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .panel h2 { font-size: 12px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase;
+              letter-spacing: .06em; }
+  .pins { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px 24px; }
+  .pin { display: grid; grid-template-columns: minmax(0, 1fr) auto; font-size: 12px; align-items: baseline; gap: 3px 10px; }
+  .pin .name { color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  .pin .gpio { color: var(--muted); font: 11px ui-monospace, Menlo, monospace; white-space: nowrap; }
+  .pin .bar { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: #e2dfd8; overflow: hidden; }
+  .pin .bar i { display: block; height: 100%; width: 0; background: var(--accent); }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .wheel-row { display: flex; align-items: center; gap: 14px; margin-top: 10px; }
+  .wheel-row .pos { font: 22px ui-monospace, Menlo, monospace; color: var(--ink); min-width: 70px; text-align: right; }
+  .wheel-row .lbl { color: var(--muted); font-size: 12px; }
+
+  .logs { flex: 1; min-height: 200px; display: flex; flex-direction: column; background: var(--log-bg);
+          border-radius: 10px; overflow: hidden; }
+  .logs .bar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #2e2f32;
+               color: #9a978f; font-size: 12px; }
+  .logs .bar b { color: var(--log-ink); font-weight: 600; }
+  .logs .bar .tip { margin-left: auto; }
+  #term { flex: 1; min-height: 0; padding: 6px 4px 6px 10px; }
+
+  .button { cursor: pointer; outline: none; }
+  svg.device, svg.device * { outline: none; }  /* no focus rectangle */
+  .off { filter: saturate(.5) brightness(.9); }
+  #knob { cursor: grab; }
+  #knob:active { cursor: grabbing; }
+  .wheelmark { opacity: .55; transition: opacity .2s; }
+  .wheelmark.lit { opacity: 1; }
+  #led { fill: #1b211d; }
+  #led.lit { fill: #2fbf55; filter: drop-shadow(0 0 1.5px rgba(47, 191, 85, .6)); }
+
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; height: auto; padding: 16px; }
+    svg.device { max-height: 60vh; }
+    .logs { min-height: 300px; }
+  }
+  @media (max-width: 520px) {
+    .pair { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <section class="stage">
+    <header>
+      <h1 id="title">Nest · QEMU</h1>
+      <span class="head-right">
+        <button class="sound" id="sound" type="button"
+                title="Play the piezo: the clicks and tones the firmware makes">sound off</button>
+        <span class="state" id="state">waiting for QEMU…</span>
+      </span>
+    </header>
+
+    <!-- The product: a round steel face. The ring turns (the wheel), the
+         glass in the middle is both the display and the button, as on the
+         real board: gpio-keys "HU Button" is the front press, the wheel is
+         two Hall channels the ADC decodes. -->
+    <svg class="device" id="device" viewBox="0 0 340 340" role="img" aria-label="Nest">
+      <defs>
+        <!-- brushed stainless, mid grey: lighter up-left, darker down-right -->
+        <linearGradient id="steel" x1=".15" y1="0" x2=".85" y2="1">
+          <stop offset="0"   stop-color="#cfd1d4"/>
+          <stop offset=".4"  stop-color="#b4b7bb"/>
+          <stop offset=".65" stop-color="#9a9da1"/>
+          <stop offset="1"   stop-color="#85888c"/>
+        </linearGradient>
+        <!-- the ring's rolled profile across its width (r 151..166): a dark
+             seam at the lens, a thin highlight just inside, then the face
+             rolling off into shadow toward the outer edge -->
+        <radialGradient id="ringRoll" gradientUnits="userSpaceOnUse" cx="170" cy="170" r="166">
+          <stop offset=".91"  stop-color="#000" stop-opacity=".6"/>
+          <stop offset=".918" stop-color="#000" stop-opacity="0"/>
+          <stop offset=".93"  stop-color="#fff" stop-opacity=".38"/>
+          <stop offset=".948" stop-color="#fff" stop-opacity="0"/>
+          <stop offset=".975" stop-color="#000" stop-opacity=".12"/>
+          <stop offset="1"    stop-color="#000" stop-opacity=".38"/>
+        </radialGradient>
+        <radialGradient id="glass" cx=".5" cy=".45" r=".6">
+          <stop offset="0"   stop-color="#0b0b0c"/>
+          <stop offset=".85" stop-color="#101012"/>
+          <stop offset="1"   stop-color="#1c1c1f"/>
+        </radialGradient>
+        <filter id="drop" x="-30%" y="-30%" width="160%" height="160%">
+          <feGaussianBlur stdDeviation="10"/>
+        </filter>
+        <filter id="contact" x="-10%" y="-10%" width="120%" height="120%">
+          <feGaussianBlur stdDeviation="2.5"/>
+        </filter>
+        <!-- light on the cover glass from the upper left: a broad sheen
+             fading toward the middle, brightest along the rim -->
+        <linearGradient id="sheen" x1=".08" y1=".05" x2=".62" y2=".6">
+          <stop offset="0"   stop-color="#fff" stop-opacity=".2"/>
+          <stop offset=".45" stop-color="#fff" stop-opacity=".07"/>
+          <stop offset="1"   stop-color="#fff" stop-opacity="0"/>
+        </linearGradient>
+        <radialGradient id="rimGlow" gradientUnits="userSpaceOnUse" cx="170" cy="170" r="151">
+          <stop offset=".86" stop-color="#fff" stop-opacity="0"/>
+          <stop offset=".97" stop-color="#fff" stop-opacity=".16"/>
+          <stop offset="1"   stop-color="#fff" stop-opacity="0"/>
+        </radialGradient>
+        <linearGradient id="rimFade" x1="0" y1="0" x2=".7" y2=".7">
+          <stop offset="0"   stop-color="#fff"/>
+          <stop offset=".6"  stop-color="#000"/>
+        </linearGradient>
+        <mask id="upperLeft">
+          <circle cx="170" cy="170" r="151" fill="url(#rimFade)"/>
+        </mask>
+        <clipPath id="screenClip">
+          <circle id="screenCircle" cx="170" cy="170" r="112"/>
+        </clipPath>
+      </defs>
+
+      <!-- shadows for light from the upper left: a soft one cast down and to
+           the right, a tighter one where the ring meets the wall -->
+      <circle cx="179" cy="181" r="165" fill="#000" opacity=".38" filter="url(#drop)"/>
+      <circle cx="172" cy="173" r="165" fill="#000" opacity=".35" filter="url(#contact)"/>
+
+      <!-- the wheel: the thin stainless ring (and the black lens it holds;
+           the display in the middle is the button). Drag it around, or
+           scroll over the device. -->
+      <g id="knob">
+        <circle cx="170" cy="170" r="166" fill="url(#steel)"/>
+        <circle cx="170" cy="170" r="166" fill="url(#ringRoll)"/>
+        <circle cx="170" cy="170" r="165.6" fill="none" stroke="#4d5054" stroke-width=".8"/>
+        <circle cx="170" cy="170" r="151" fill="url(#glass)"/>
+        <circle cx="170" cy="170" r="151" fill="none" stroke="#050505" stroke-width="1.5"/>
+        <g id="marks"></g>
+      </g>
+
+      <!-- the face under the glass: the wordmark, the round display (the
+           panel is 480x640; nlclient draws the round UI in its top 480x480,
+           a quarter turn clockwise for how the panel is mounted; turn it
+           back) and the sensor window's edge near the bottom -->
+      <text x="170" y="49" text-anchor="middle" fill="#8e8f92" font-size="21"
+            font-family="Inter, Helvetica Neue, Helvetica, Arial, sans-serif"
+            font-weight="500" letter-spacing="-.3" pointer-events="none">nest</text>
+      <!-- a status LED over the wordmark: a green blink every second while
+           the unit runs -->
+      <circle id="led" cx="170" cy="28" r="1.2" pointer-events="none"/>
+      <path d="M 82 291 Q 170 303 258 291" fill="none" stroke="#2a2a2c" stroke-width="1.2"
+            pointer-events="none"/>
+      <g id="screenHolder" clip-path="url(#screenClip)">
+        <rect id="screenPlaceholder" x="58" y="58" width="224" height="224" fill="#000"/>
+        <image id="screen" x="58" y="58" width="224" height="299" preserveAspectRatio="none"
+               transform="rotate(-90 170 170)" href="" style="display:none"/>
+      </g>
+      <!-- the cover glass catching the light (over the display too) -->
+      <g pointer-events="none">
+        <circle cx="170" cy="170" r="151" fill="url(#sheen)"/>
+        <circle cx="170" cy="170" r="151" fill="url(#rimGlow)" mask="url(#upperLeft)"/>
+      </g>
+      <!-- the button: the face, and the glass below the sensor window's
+           line down to the ring -->
+      <g id="button" class="button" role="button" tabindex="0"
+         aria-label="Display button (hold to press)">
+        <circle cx="170" cy="170" r="140" fill="transparent"/>
+        <path d="M 82 291 Q 170 303 258 291 A 151 151 0 0 1 82 291 Z" fill="transparent"/>
+      </g>
+    </svg>
+
+    <div class="hint">
+      <span id="help">Drag the ring or scroll over the device to turn the wheel · arrow keys and Enter/Space when focused<br>
+      Hold the face to press the button<br>
+      <span style="opacity:.75">The fake backplate reports a lit room and someone in front
+      (ui/backplate.py).</span></span>
+      <span id="banner" hidden><b>Powered off</b><br>
+      The firmware raised its poweroff line; QEMU exited. Start it again with <code>./run.sh --ui</code>.</span>
+    </div>
+  </section>
+
+  <section class="side">
+    <div class="panel">
+      <h2>Board lines</h2>
+      <div class="pins" id="pins"></div>
+    </div>
+    <div class="pair">
+      <div class="panel">
+        <h2>Wheel</h2>
+        <div class="wheel-row">
+          <span class="pos" id="wheelPos">—</span>
+          <span class="lbl">detents (the guest's decoded position may differ)<br>
+          <span id="wheelState">waiting…</span></span>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Screen</h2>
+        <div class="wheel-row">
+          <span class="pos" id="fpsDevice">—</span>
+          <span class="lbl">fps on the device's panel<br>
+          <span id="fpsPage">—</span> fps drawn by this page</span>
+        </div>
+      </div>
+    </div>
+    <div class="logs">
+      <div class="bar">
+        <b>console</b><span id="logState">connecting…</span>
+        <span class="tip">click to type · root / nest</span>
+      </div>
+      <div id="term"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const NS = "http://www.w3.org/2000/svg";
+  const post = (path, body) =>
+    fetch(path, { method: "POST", body: body && JSON.stringify(body) }).catch(() => {});
+
+  /* Tick marks on the ring: 24 detents, one lights as the wheel passes it. */
+  const STEPS = 24;
+  const CX = 170, CY = 170;
+  const marks = [];
+  for (let i = 0; i < STEPS; i++) {
+    const a = (i / STEPS) * 2 * Math.PI - Math.PI / 2;
+    const r0 = 131, r1 = 139;
+    const g = document.createElementNS(NS, "line");
+    const lit = document.createElementNS(NS, "line");
+    const mk = (r0_, r1_, w) =>
+      `M${CX + r0_ * Math.cos(a)} ${CY + r0_ * Math.sin(a)}L${CX + r1_ * Math.cos(a)} ${CY + r1_ * Math.sin(a)}`;
+    g.setAttribute("d", mk(r0, r1, 2)); g.setAttribute("stroke", "#00000030");
+    g.setAttribute("stroke-width", 2);
+    lit.setAttribute("d", mk(r1 - 3, r1 + 3, 4)); lit.setAttribute("stroke", "#fff");
+    lit.setAttribute("stroke-width", 3); lit.setAttribute("class", "wheelmark");
+    lit.setAttribute("opacity", 0);
+    $("marks").append(g, lit);
+    marks.push(lit);
+  }
+
+  /* ---------- screen ---------- */
+  let gotFrame = false;
+  // The panel (480x640) shows its top square turned upright; anything else
+  // (QEMU's own "not initialized" text before the LCDIF runs) is shown as is.
+  // The gen 2's panel (320x320) is a smaller display: 1.75" across to the
+  // gen 3's 2.08", so its circle is that much smaller in the same face.
+  function placeScreen(b64) {
+    const hdr = atob(b64.slice(0, 32));       // PNG signature + IHDR
+    const u32 = (o) => ((hdr.charCodeAt(o) << 24) | (hdr.charCodeAt(o + 1) << 16) |
+                        (hdr.charCodeAt(o + 2) << 8) | hdr.charCodeAt(o + 3)) >>> 0;
+    const panel = u32(16) === 480 && u32(20) === 640;
+    const gen2 = u32(16) === 320 && u32(20) === 320;
+    const r = gen2 ? 94 : 112;                        // the display's radius
+    $("screenCircle").setAttribute("r", r);
+    for (const el of [$("screen"), $("screenPlaceholder")]) {
+      el.setAttribute("x", 170 - r);
+      el.setAttribute("y", 170 - r);
+      el.setAttribute("width", 2 * r);
+    }
+    $("screenPlaceholder").setAttribute("height", 2 * r);
+    const img = $("screen");
+    img.setAttribute("height", panel ? 299 : 2 * r);  // the display is 2r across
+    img.setAttribute("preserveAspectRatio", panel ? "none" : "xMidYMid meet");
+    if (panel) img.setAttribute("transform", "rotate(-90 170 170)");
+    else img.removeAttribute("transform");
+  }
+  // Frames the page has actually drawn, counted per second.
+  let painted = 0;
+  $("screen").addEventListener("load", () => { painted++; });
+  setInterval(() => { $("fpsPage").textContent = painted; painted = 0; }, 1000);
+  function openScreen() {
+    const es = new EventSource("/screen");
+    es.onmessage = (e) => {
+      if (!gotFrame) { gotFrame = true; $("screen").style.display = ""; }
+      placeScreen(e.data);
+      $("screen").setAttribute("href", "data:image/png;base64," + e.data);
+    };
+    es.addEventListener("fps", (e) => { $("fpsDevice").textContent = e.data; });
+    es.onerror = () => { es.close(); setTimeout(openScreen, 3000); };
+  }
+
+  /* ---------- console: the guest's serial, as a terminal ---------- */
+  const term = new Terminal({
+    fontSize: 12, fontFamily: "ui-monospace, Menlo, monospace", scrollback: 5000,
+    cursorBlink: true, theme: { background: "#1d1e20", foreground: "#d7d4cc" },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($("term"));
+  fit.fit();
+  new ResizeObserver(() => fit.fit()).observe($("term"));
+  // Keystrokes go out in order, batched while a request is in flight.
+  let keys = "", sending = false;
+  async function flushKeys() {
+    if (sending || !keys) return;
+    sending = true;
+    const out = keys; keys = "";
+    await fetch("/console/input", { method: "POST", body: out }).catch(() => {});
+    sending = false;
+    flushKeys();
+  }
+  term.onData((d) => { keys += d; flushKeys(); });
+  function openLogs() {
+    const es = new EventSource("/console/raw");
+    let got = false;
+    es.onopen = () => { $("logState").textContent = "live"; };
+    es.onmessage = (e) => {
+      if (!got) { got = true; term.reset(); }     // the backlog comes first
+      term.write(JSON.parse(e.data));
+    };
+    es.onerror = () => {
+      es.close();
+      $("logState").textContent = "waiting for the device…";
+      setTimeout(openLogs, 3000);
+    };
+  }
+
+  /* ---------- board lines ---------- */
+  const LABELS = {
+    button: "Button (high = pressed)",
+    poweroff: "Poweroff (high = cutting power)",
+    wifi_reset: "WiFi reset",
+    wifi_enable: "WiFi enable",
+    hall_enable: "Wheel hall power (low = on)",
+    vbatt_en: "Battery divider enable",
+    beeper_en: "Piezo enable (low = on)",
+  };
+  let pinMap = {};
+  const bars = {};
+  function buildPins() {
+    for (const fn of Object.keys(LABELS).filter((f) => f in pinMap)) {
+      const el = document.createElement("div");
+      el.className = "pin";
+      el.innerHTML = `<span class="name"></span><span class="gpio"></span><span class="bar"><i></i></span>`;
+      el.querySelector(".name").textContent = LABELS[fn];
+      el.querySelector(".gpio").textContent = pinMap[fn];
+      $("pins").append(el);
+      bars[fn] = el;
+    }
+  }
+  let last = { linked: false, pins: {} };
+  function render(state) {
+    last = state;
+    const on = state.linked;
+    $("state").textContent = on ? "running" : "QEMU not running";
+    $("state").classList.toggle("on", on);
+    $("device").classList.toggle("off", !on);
+    $("banner").hidden = on;
+    $("help").hidden = !on;
+    for (const [fn, el] of Object.entries(bars)) {
+      const v = state.pins[pinMap[fn]];
+      el.querySelector("i").style.width = (v === undefined ? 0 : v / 10) + "%";
+      el.querySelector(".gpio").textContent =
+        pinMap[fn] + " · " + (v === undefined ? "—" : (v >= 500 ? "high" : "low"));
+    }
+  }
+
+  /* ---------- the status LED ---------- */
+  setInterval(() => {
+    if (!last.linked) return;
+    $("led").classList.add("lit");
+    setTimeout(() => $("led").classList.remove("lit"), 40);
+  }, 1000);
+
+  /* ---------- the piezo ---------- */
+  // PWM1 as the board reports it: a tone starts at hz and stops at 0, each
+  // stamped with guest time, so a click lasts the 3 ms the firmware asked
+  // for even when both ends arrive together. Browsers only let a page play
+  // sound after a click on it, hence the toggle.
+  let audio = null, tone = null, soundOn = false;
+  try { soundOn = localStorage.getItem("sound") === "1"; } catch (e) {}
+  function soundShow() {
+    $("sound").textContent = soundOn ? "sound on" : "sound off";
+    $("sound").classList.toggle("on", soundOn);
+  }
+  function soundUnlock() {
+    if (!soundOn) return;
+    audio = audio || new AudioContext();
+    audio.resume();
+  }
+  $("sound").addEventListener("click", () => {
+    soundOn = !soundOn;
+    try { localStorage.setItem("sound", soundOn ? "1" : "0"); } catch (e) {}
+    soundUnlock();
+    soundShow();
+  });
+  document.addEventListener("pointerdown", soundUnlock);
+  function onTone(t) {
+    if (!soundOn || !audio || audio.state !== "running") { tone = null; return; }
+    const now = audio.currentTime;
+    if (tone) {
+      tone.osc.stop(Math.max(now, tone.start + (t.t - tone.t) / 1e6));
+      tone = null;
+    }
+    if (t.hz > 0) {
+      const osc = audio.createOscillator(), gain = audio.createGain();
+      osc.type = "square";
+      osc.frequency.value = t.hz;
+      gain.gain.value = 0.15;
+      osc.connect(gain).connect(audio.destination);
+      osc.start(now);
+      tone = { osc, start: now, t: t.t };
+    }
+  }
+  soundShow();
+
+  /* ---------- the wheel ---------- */
+  function wheelShow(pos) {
+    if (pos === null) return;
+    $("wheelPos").textContent = pos;
+    const step = ((pos % STEPS) + STEPS) % STEPS;
+    marks.forEach((m, i) => m.setAttribute("opacity", i === step ? 1 : 0));
+  }
+  // Detents queue up while a request is in flight, so fast turns keep
+  // every step (the model slews the magnet, so a multi-detent jump is fine).
+  let pending = 0, turnBusy = false;
+  async function turn(delta) {
+    pending += delta;
+    if (turnBusy) return;
+    turnBusy = true;
+    while (pending !== 0) {
+      const d = pending;
+      pending = 0;
+      try {
+        const r = await fetch("/wheel/turn", { method: "POST",
+          body: JSON.stringify({ delta: d }) });
+        const j = await r.json();
+        if (j.position !== null && j.position !== undefined) wheelShow(j.position);
+        $("wheelState").textContent = "";
+      } catch (e) {
+        $("wheelState").textContent = "wheel not reachable";
+      }
+    }
+    turnBusy = false;
+  }
+  function pollWheel() {
+    fetch("/wheel").then((r) => r.json()).then((j) => wheelShow(j.position)).catch(() => {});
+  }
+
+  const knob = $("knob");
+  let dragging = null;
+  // angle around the face center, in page coordinates
+  function angleAt(e) {
+    const svg = $("device");
+    const r = svg.getBoundingClientRect();
+    const x = (e.clientX - r.left) * 340 / r.width - CX;
+    const y = (e.clientY - r.top) * 340 / r.height - CY;
+    return Math.atan2(y, x);
+  }
+  const DETENT = 2 * Math.PI / STEPS;
+  let acc = 0;
+  knob.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("#button")) return;
+    dragging = angleAt(e);
+    acc = 0;
+    knob.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    $("device").focus({ preventScroll: true });   // keys follow the click
+  });
+  knob.addEventListener("pointermove", (e) => {
+    if (dragging === null) return;
+    const a = angleAt(e);
+    let d = a - dragging;
+    if (d > Math.PI) d -= 2 * Math.PI;
+    if (d < -Math.PI) d += 2 * Math.PI;
+    dragging = a;
+    acc += d;
+    while (Math.abs(acc) >= DETENT) {
+      const dir = acc > 0 ? 1 : -1;
+      acc -= dir * DETENT;
+      turn(dir);
+    }
+  });
+  const endDrag = () => { dragging = null; };
+  knob.addEventListener("pointerup", endDrag);
+  knob.addEventListener("pointercancel", endDrag);
+  // Mouse wheel / trackpad anywhere over the device turns the ring: a
+  // detent per 100 px of scroll (about one notch of a mouse wheel).
+  const SCROLL_PX = 100;
+  let scrollAcc = 0;
+  $("device").addEventListener("wheel", (e) => {
+    e.preventDefault();
+    scrollAcc += e.deltaMode === 0 ? e.deltaY : e.deltaY * SCROLL_PX;
+    const steps = Math.trunc(scrollAcc / SCROLL_PX);
+    if (steps) {
+      scrollAcc -= steps * SCROLL_PX;
+      turn(steps);
+    }
+  }, { passive: false });
+  // Keyboard, whichever part (ring or face) has focus: arrows turn the
+  // wheel, Enter/Space hold the button (handlers are below).
+  $("device").setAttribute("tabindex", 0);
+
+  /* ---------- the button (the face) ---------- */
+  const btn = $("button");
+  let held = false;
+  function press() { if (held) return; held = true; post("/button/press"); }
+  function release() { if (!held) return; held = false; post("/button/release"); }
+  btn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    $("device").focus({ preventScroll: true });   // keys follow the click
+    btn.setPointerCapture(e.pointerId);
+    press();
+  });
+  btn.addEventListener("pointerup", release);
+  btn.addEventListener("pointercancel", release);
+  $("device").addEventListener("keydown", (e) => {
+    if (e.key === "ArrowRight" || e.key === "ArrowUp") { e.preventDefault(); turn(1); }
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") { e.preventDefault(); turn(-1); }
+    if ((e.key === " " || e.key === "Enter") && !e.repeat) { e.preventDefault(); press(); }
+  });
+  $("device").addEventListener("keyup", (e) => {
+    if (e.key === " " || e.key === "Enter") { e.preventDefault(); release(); }
+  });
+  window.addEventListener("blur", release);
+
+  /* ---------- wire it up ---------- */
+  fetch("/config").then((r) => r.json()).then((cfg) => {
+    // which unit this is (run.sh: "Nest gen 3", "Nest gen 2")
+    if (cfg.name) {
+      document.title = $("title").textContent = cfg.name + " · QEMU";
+      $("device").setAttribute("aria-label", cfg.name);
+    }
+    pinMap = cfg.pins;
+    buildPins();
+    const ev = new EventSource("/events");
+    ev.onmessage = (e) => render(JSON.parse(e.data));
+    ev.addEventListener("tone", (e) => onTone(JSON.parse(e.data)));
+    ev.onerror = () => render({ linked: false, pins: last.pins });
+    openLogs();
+    openScreen();
+    pollWheel();
+    setInterval(pollWheel, 3000);
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,508 @@
+From d8c60ebbdd7354b5826222986150ea838fca6063 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 41/91] hw/timer: OMAP3 GP timers and the 32 kHz sync counter
+
+---
+ hw/timer/omap3_gptimer.c | 489 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 489 insertions(+)
+ create mode 100644 hw/timer/omap3_gptimer.c
+
+diff --git a/hw/timer/omap3_gptimer.c b/hw/timer/omap3_gptimer.c
+new file mode 100644
+index 0000000..de6bf60
+--- /dev/null
++++ b/hw/timer/omap3_gptimer.c
+@@ -0,0 +1,489 @@
++/*
++ * OMAP3 general-purpose timers (GPTIMER1..12) and the 32 kHz sync counter
++ *
++ * The GP timer is an up-counter: TCRR runs from TLDR to 0xffffffff, raises
++ * OVF_IT on the wrap and, with TCLR.AR, reloads TLDR; with TCLR.CE it also
++ * raises MAT_IT when it passes TMAR. Its input is the 32768 Hz clock or
++ * sys_clk (the PRCM's selection, on the "clksel" input), divided by
++ * 2^(PTV+1) when TCLR.PRE is set. Writes are never posted (TWPS reads 0).
++ * Running with a PWM trigger (TCLR.TRG), the PWM pin goes through one
++ * period per reload; the "pwm-hz" output reports that frequency rather
++ * than the edges (Linux's omap-pwm drives the piezo this way).
++ *
++ * The sync counter is a free-running 32768 Hz count (Linux's clocksource).
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/timer/omap3_gptimer.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define GPT_TIDR        0x00
++#define GPT_TIOCP_CFG   0x10
++#define GPT_TISTAT      0x14
++#define GPT_TISR        0x18
++#define GPT_TIER        0x1c
++#define GPT_TWER        0x20
++#define GPT_TCLR        0x24
++#define GPT_TCRR        0x28
++#define GPT_TLDR        0x2c
++#define GPT_TTGR        0x30
++#define GPT_TWPS        0x34
++#define GPT_TMAR        0x38
++#define GPT_TCAR1       0x3c
++#define GPT_TSICR       0x40
++#define GPT_TCAR2       0x44
++#define GPT_TPIR        0x48
++#define GPT_TNIR        0x4c
++#define GPT_TCVR        0x50
++#define GPT_TOCR        0x54
++#define GPT_TOWR        0x58
++
++#define TCLR_ST         (1 << 0)
++#define TCLR_AR         (1 << 1)
++#define TCLR_PTV_SHIFT  2
++#define TCLR_PRE        (1 << 5)
++#define TCLR_CE         (1 << 6)
++#define TCLR_TRG(v)     (((v) >> 10) & 3)
++
++#define TISR_MAT        (1 << 0)
++#define TISR_OVF        (1 << 1)
++#define TISR_TCAR       (1 << 2)
++
++static uint64_t gpt_rate(Omap3GpTimerState *s)
++{
++    uint64_t hz = s->clk_sys ? s->sys_clk_hz : 32768;
++
++    if (s->tclr & TCLR_PRE) {
++        hz >>= ((s->tclr >> TCLR_PTV_SHIFT) & 7) + 1;
++    }
++    return hz ? hz : 1;
++}
++
++static int64_t gpt_ticks_to_ns(Omap3GpTimerState *s, uint64_t ticks)
++{
++    return muldiv64(ticks, NANOSECONDS_PER_SECOND, gpt_rate(s));
++}
++
++/* The counter now, ignoring wraps: may exceed 32 bits. */
++static uint64_t gpt_raw(Omap3GpTimerState *s, int64_t now)
++{
++    if (!(s->tclr & TCLR_ST) || now <= s->base_ns) {
++        return s->counter_base;
++    }
++    return s->counter_base + muldiv64(now - s->base_ns, gpt_rate(s),
++                                      NANOSECONDS_PER_SECOND);
++}
++
++static uint32_t gpt_counter(Omap3GpTimerState *s, int64_t now)
++{
++    uint64_t c = gpt_raw(s, now);
++    uint64_t period;
++
++    if (c <= UINT32_MAX) {
++        return c;
++    }
++    if (!(s->tclr & TCLR_AR)) {
++        return 0;               /* one-shot: stopped at the wrap */
++    }
++    period = (1ull << 32) - s->tldr;
++    return s->tldr + (c - (1ull << 32)) % period;
++}
++
++/* Restart the count from its current value at `now`. */
++static void gpt_rebase(Omap3GpTimerState *s, int64_t now)
++{
++    s->counter_base = gpt_counter(s, now);
++    s->base_ns = now;
++}
++
++static void gpt_update_pwm(Omap3GpTimerState *s)
++{
++    int hz = 0;
++
++    if ((s->tclr & TCLR_ST) && (s->tclr & TCLR_AR) && TCLR_TRG(s->tclr)) {
++        hz = gpt_rate(s) / ((1ull << 32) - s->tldr);
++    }
++    if (hz != s->pwm_level) {
++        s->pwm_level = hz;
++        qemu_set_irq(s->pwm_hz, hz);
++    }
++}
++
++static void gpt_update_irq(Omap3GpTimerState *s)
++{
++    qemu_set_irq(s->irq, !!(s->tisr & s->tier));
++}
++
++static void gpt_schedule(Omap3GpTimerState *s)
++{
++    int64_t next;
++
++    s->overflow_ns = INT64_MAX;
++    s->match_ns = INT64_MAX;
++    if (!(s->tclr & TCLR_ST)) {
++        timer_del(s->timer);
++        return;
++    }
++    s->overflow_ns = s->base_ns +
++                     gpt_ticks_to_ns(s, (1ull << 32) - s->counter_base);
++    if ((s->tclr & TCLR_CE) && s->tmar >= s->counter_base) {
++        s->match_ns = s->base_ns + gpt_ticks_to_ns(s, s->tmar - s->counter_base);
++    }
++    next = MIN(s->overflow_ns, s->match_ns);
++    timer_mod(s->timer, next);
++}
++
++static void gpt_tick(void *opaque)
++{
++    Omap3GpTimerState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (now >= s->match_ns) {
++        s->tisr |= TISR_MAT;
++    }
++    if (now >= s->overflow_ns) {
++        s->tisr |= TISR_OVF;
++        if (s->tclr & TCLR_AR) {
++            gpt_rebase(s, now);
++        } else {
++            s->counter_base = 0;
++            s->base_ns = now;
++            s->tclr &= ~TCLR_ST;
++            gpt_update_pwm(s);
++        }
++    } else {
++        /* A match: carry on from here so it is not seen again. */
++        gpt_rebase(s, now);
++        if (s->counter_base == s->tmar) {
++            s->counter_base++;
++        }
++    }
++    gpt_schedule(s);
++    gpt_update_irq(s);
++}
++
++static uint64_t gpt_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3GpTimerState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    switch (addr) {
++    case GPT_TIDR:
++        return 0x13;
++    case GPT_TIOCP_CFG:
++        return s->tiocp_cfg;
++    case GPT_TISTAT:
++        return 1;                   /* RESETDONE */
++    case GPT_TISR:
++        return s->tisr;
++    case GPT_TIER:
++        return s->tier;
++    case GPT_TWER:
++        return s->twer;
++    case GPT_TCLR:
++        return s->tclr;
++    case GPT_TCRR:
++        return gpt_counter(s, now);
++    case GPT_TLDR:
++        return s->tldr;
++    case GPT_TTGR:
++        return 0xffffffff;
++    case GPT_TWPS:
++        return 0;                   /* no posted write pending */
++    case GPT_TMAR:
++        return s->tmar;
++    case GPT_TCAR1:
++    case GPT_TCAR2:
++        return 0;
++    case GPT_TSICR:
++        return s->tsicr;
++    case GPT_TPIR:
++        return s->tpir;
++    case GPT_TNIR:
++        return s->tnir;
++    case GPT_TCVR:
++        return s->tcvr;
++    case GPT_TOCR:
++        return s->tocr;
++    case GPT_TOWR:
++        return s->towr;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-gptimer: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void gpt_reset(DeviceState *dev)
++{
++    Omap3GpTimerState *s = OMAP3_GPTIMER(dev);
++
++    timer_del(s->timer);
++    s->tiocp_cfg = 0;
++    s->tisr = 0;
++    s->tier = 0;
++    s->twer = 0;
++    s->tclr = 0;
++    s->tldr = 0;
++    s->tmar = 0;
++    s->tsicr = 0;
++    s->tpir = 0;
++    s->tnir = 0;
++    s->tcvr = 0;
++    s->tocr = 0;
++    s->towr = 0;
++    s->counter_base = 0;
++    s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->overflow_ns = INT64_MAX;
++    s->match_ns = INT64_MAX;
++    gpt_update_irq(s);
++    gpt_update_pwm(s);
++}
++
++static void gpt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3GpTimerState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    switch (addr) {
++    case GPT_TIOCP_CFG:
++        if (val & 2) {              /* SOFTRESET */
++            gpt_reset(DEVICE(s));
++            return;
++        }
++        s->tiocp_cfg = val & 0x33d;
++        return;
++    case GPT_TISR:
++        s->tisr &= ~val;
++        gpt_update_irq(s);
++        return;
++    case GPT_TIER:
++        s->tier = val & 7;
++        gpt_update_irq(s);
++        return;
++    case GPT_TWER:
++        s->twer = val & 7;
++        return;
++    case GPT_TCLR:
++        gpt_rebase(s, now);
++        s->tclr = val & 0x7fff;
++        break;
++    case GPT_TCRR:
++        s->counter_base = val;
++        s->base_ns = now;
++        break;
++    case GPT_TLDR:
++        s->tldr = val;
++        break;
++    case GPT_TTGR:
++        s->counter_base = s->tldr;
++        s->base_ns = now;
++        break;
++    case GPT_TMAR:
++        gpt_rebase(s, now);
++        s->tmar = val;
++        break;
++    case GPT_TSICR:
++        if (val & 2) {              /* SFT: software reset of the functional part */
++            gpt_reset(DEVICE(s));
++            return;
++        }
++        s->tsicr = val & 4;
++        return;
++    case GPT_TPIR:
++        s->tpir = val;
++        return;
++    case GPT_TNIR:
++        s->tnir = val;
++        return;
++    case GPT_TCVR:
++        s->tcvr = val;
++        return;
++    case GPT_TOCR:
++        s->tocr = val & 0xffffff;
++        return;
++    case GPT_TOWR:
++        s->towr = val & 0xffffff;
++        return;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "omap3-gptimer: bad write at 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    gpt_schedule(s);
++    gpt_update_pwm(s);
++}
++
++static const MemoryRegionOps gpt_ops = {
++    .read = gpt_read,
++    .write = gpt_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 2,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static void gpt_set_clksel(void *opaque, int n, int level)
++{
++    Omap3GpTimerState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (s->clk_sys == !!level) {
++        return;
++    }
++    gpt_rebase(s, now);
++    s->clk_sys = level;
++    gpt_schedule(s);
++    gpt_update_pwm(s);
++}
++
++static void gpt_init(Object *obj)
++{
++    Omap3GpTimerState *s = OMAP3_GPTIMER(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &gpt_ops, s, "omap3-gptimer", 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_in_named(DEVICE(obj), gpt_set_clksel, OMAP3_GPTIMER_CLKSEL, 1);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->pwm_hz, OMAP3_GPTIMER_PWM_HZ, 1);
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpt_tick, s);
++}
++
++static const Property gpt_properties[] = {
++    DEFINE_PROP_UINT32("sys-clk-hz", Omap3GpTimerState, sys_clk_hz, 19200000),
++};
++
++static const VMStateDescription gpt_vmstate = {
++    .name = TYPE_OMAP3_GPTIMER,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(timer, Omap3GpTimerState),
++        VMSTATE_BOOL(clk_sys, Omap3GpTimerState),
++        VMSTATE_UINT32(tiocp_cfg, Omap3GpTimerState),
++        VMSTATE_UINT32(tisr, Omap3GpTimerState),
++        VMSTATE_UINT32(tier, Omap3GpTimerState),
++        VMSTATE_UINT32(twer, Omap3GpTimerState),
++        VMSTATE_UINT32(tclr, Omap3GpTimerState),
++        VMSTATE_UINT32(tldr, Omap3GpTimerState),
++        VMSTATE_UINT32(tmar, Omap3GpTimerState),
++        VMSTATE_UINT32(tsicr, Omap3GpTimerState),
++        VMSTATE_UINT32(tpir, Omap3GpTimerState),
++        VMSTATE_UINT32(tnir, Omap3GpTimerState),
++        VMSTATE_UINT32(tcvr, Omap3GpTimerState),
++        VMSTATE_UINT32(tocr, Omap3GpTimerState),
++        VMSTATE_UINT32(towr, Omap3GpTimerState),
++        VMSTATE_UINT32(counter_base, Omap3GpTimerState),
++        VMSTATE_INT64(base_ns, Omap3GpTimerState),
++        VMSTATE_INT64(overflow_ns, Omap3GpTimerState),
++        VMSTATE_INT64(match_ns, Omap3GpTimerState),
++        VMSTATE_INT32(pwm_level, Omap3GpTimerState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void gpt_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, gpt_reset);
++    device_class_set_props(dc, gpt_properties);
++    dc->vmsd = &gpt_vmstate;
++    dc->desc = "OMAP3 general-purpose timer";
++}
++
++/* 32 kHz sync counter */
++
++static uint64_t sync_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3SyncTimerState *s = opaque;
++
++    switch (addr) {
++    case 0x00:
++        return 0x01;                /* REVISION */
++    case 0x04:
++        return s->sysconfig;
++    case 0x10:                      /* CR */
++        return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 32768,
++                        NANOSECONDS_PER_SECOND);
++    }
++    qemu_log_mask(LOG_GUEST_ERROR,
++                  "omap3-synctimer: bad read at 0x%" HWADDR_PRIx "\n", addr);
++    return 0;
++}
++
++static void sync_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3SyncTimerState *s = opaque;
++
++    if (addr == 0x04) {
++        s->sysconfig = val & 0x18;
++        return;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR,
++                  "omap3-synctimer: bad write at 0x%" HWADDR_PRIx "\n", addr);
++}
++
++static const MemoryRegionOps sync_ops = {
++    .read = sync_read,
++    .write = sync_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 2,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static void sync_init(Object *obj)
++{
++    Omap3SyncTimerState *s = OMAP3_SYNCTIMER(obj);
++
++    memory_region_init_io(&s->iomem, obj, &sync_ops, s, "omap3-synctimer",
++                          0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++}
++
++static const VMStateDescription sync_vmstate = {
++    .name = TYPE_OMAP3_SYNCTIMER,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(sysconfig, Omap3SyncTimerState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void sync_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->vmsd = &sync_vmstate;
++    dc->desc = "OMAP3 32 kHz sync counter";
++}
++
++static const TypeInfo omap3_timer_types[] = {
++    {
++        .name = TYPE_OMAP3_GPTIMER,
++        .parent = TYPE_SYS_BUS_DEVICE,
++        .instance_size = sizeof(Omap3GpTimerState),
++        .instance_init = gpt_init,
++        .class_init = gpt_class_init,
++    }, {
++        .name = TYPE_OMAP3_SYNCTIMER,
++        .parent = TYPE_SYS_BUS_DEVICE,
++        .instance_size = sizeof(Omap3SyncTimerState),
++        .instance_init = sync_init,
++        .class_init = sync_class_init,
++    },
++};
++
++DEFINE_TYPES(omap3_timer_types)
+-- 
+2.55.0
+

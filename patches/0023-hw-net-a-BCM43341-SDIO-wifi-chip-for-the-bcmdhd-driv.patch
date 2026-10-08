@@ -1,0 +1,1576 @@
+From 8c0c18b330a634d129d941775325c93194c0feba Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 13:16:51 -0400
+Subject: [PATCH 23/36] hw/net: a BCM43341 SDIO wifi chip for the bcmdhd driver
+
+The flintstone's wifi module, seen from its SDIO functions, written from
+the public bcmdhd 1.141.66 source (the Nest's dhd.ko is 1.141.66.4):
+
+- F1: the backplane window, clock CSR (clocks are there as soon as they
+  are asked for), frame control and sleep CSR (KSO/DEVON).
+- the backplane the driver walks at attach: chipcommon (chip 43341 rev
+  B0, AI), d11, the SDIO device core, an ARM CM3 and 512 KiB of SOCRAM,
+  each with an AI wrapper, found through an EROM.
+- the firmware: the driver halts the ARM, writes the image and NVRAM into
+  SOCRAM and releases it. That release starts the model: it leaves an
+  sdpcm_shared_t where the NVRAM token was and posts FWREADY in the
+  to-host mailbox.
+- SDPCM on F2, CDC ioctls on the control channel, BDC events and data.
+  Enough ioctls/iovars for dhd_preinit_ioctls and wl_cfg80211; the rest
+  read as zero. Saying no to rxglom, ampdu_hostreorder, tlv and
+  wlfc_mode (and never sending a FIFO credit map) keeps every frame a
+  plain one: no tx glomming, no proptxstatus.
+- one open access point (ssid property, default "QEMU", channel 6) that
+  escan finds and "join"/WLC_SET_SSID associate with, then data to and
+  from a NIC: -nic user,model=bcm43341 is DHCP and the internet.
+
+The out-of-band interrupt is driven only once the driver routes it to
+the pad (CCCR SEPINT). bcmsdh requests the level-high IRQ before it can
+mask it, so a line already high at that point storms the CPU.
+
+trace=on logs every backplane register access, F1 register access and
+ioctl.
+---
+ hw/net/Kconfig            |    3 +
+ hw/net/bcm43341.c         | 1473 +++++++++++++++++++++++++++++++++++++
+ hw/net/meson.build        |    1 +
+ include/hw/net/bcm43341.h |   21 +
+ 4 files changed, 1498 insertions(+)
+ create mode 100644 hw/net/bcm43341.c
+ create mode 100644 include/hw/net/bcm43341.h
+
+diff --git a/hw/net/Kconfig b/hw/net/Kconfig
+index f9a1dfb..87e19af 100644
+--- a/hw/net/Kconfig
++++ b/hw/net/Kconfig
+@@ -59,6 +59,9 @@ config VMXNET3_PCI
+     default y if PCI_DEVICES
+     depends on PCI
+ 
++config BCM43341
++    bool
++
+ config SMC91C111
+     bool
+ 
+diff --git a/hw/net/bcm43341.c b/hw/net/bcm43341.c
+new file mode 100644
+index 0000000..75f5e0b
+--- /dev/null
++++ b/hw/net/bcm43341.c
+@@ -0,0 +1,1473 @@
++/*
++ * Broadcom BCM43341 SDIO WLAN chip, as the bcmdhd driver sees it.
++ *
++ * This is not a radio. It is the chip the Nest's dhd.ko (bcmdhd 1.141)
++ * talks to, from the outside in, written from the public bcmdhd source:
++ *
++ *   SDIO    function 1 is the backplane window (SBADDR low/mid/high, the
++ *           clock CSR, frame control, sleep CSR); function 2 carries SDPCM
++ *           frames. CCCR 0xf0-0xf2 are Broadcom's (card cap/ctl, SEPINT).
++ *
++ *   Chip    an AI backplane with an EROM the driver walks at attach:
++ *           chipcommon, d11, the SDIO device core, an ARM CM3 and 512 KiB
++ *           of SOCRAM, each with its AI wrapper. The driver halts the ARM,
++ *           writes the firmware and NVRAM into SOCRAM and releases the ARM.
++ *           That release is when this model "boots": it posts FWREADY in
++ *           the to-host mailbox, the way the real firmware does.
++ *
++ *   SDPCM   frames are [len, ~len][seq, chan, nextlen, doff, fc, window,
++ *           ver, rsvd][payload]. Channel 0 carries CDC ioctls, 1 events
++ *           (BDC + a bcm_event_t), 2 data (BDC + an Ethernet frame). The
++ *           host reads frames from F2 until it gets a zero frame tag.
++ *
++ *   wl      enough ioctls/iovars for dhd_preinit_ioctls and wl_cfg80211,
++ *           an escan that finds one open access point, a join to it, and a
++ *           data path to a QEMU NIC (-nic user,model=bcm43341) once joined.
++ *
++ * With trace=on every backplane register access and every ioctl is logged,
++ * so a driver that stalls shows where.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qemu/cutils.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qemu/units.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/sd/sd.h"
++#include "hw/net/bcm43341.h"
++#include "net/net.h"
++#include "system/reset.h"
++
++OBJECT_DECLARE_SIMPLE_TYPE(BCM43341State, BCM43341)
++
++/* -- Backplane ------------------------------------------------------------ */
++
++#define SI_ENUM_BASE            0x18000000
++#define SI_WRAP_BASE            0x18100000
++#define SI_CORE_SIZE            0x1000
++#define BCM_EROM_BASE           0x1810a000
++#define BCM_EROM_WORDS          64
++#define BCM_RAM_SIZE            (512 * KiB)
++/* Where the "firmware" leaves its sdpcm_shared_t, below the NVRAM. */
++#define BCM_SHARED_ADDR         0x70000
++
++#define BCM_CHIP_ID             43341
++#define BCM_CHIP_REV            2       /* B0, what the 43341b0 image is for */
++
++enum { CORE_CC, CORE_D11, CORE_SDIOD, CORE_ARM, CORE_SOCRAM, NUM_CORES };
++
++static const struct {
++    uint16_t id;
++    uint8_t rev;
++} bcm_cores[NUM_CORES] = {
++    [CORE_CC]     = { 0x800, 43 },
++    [CORE_D11]    = { 0x812, 24 },
++    [CORE_SDIOD]  = { 0x829, 14 },      /* >= 12: the driver enables KSO */
++    [CORE_ARM]    = { 0x82a, 7 },
++    [CORE_SOCRAM] = { 0x80e, 13 },      /* >= 8: sized through bankinfo */
++};
++
++/* AI wrapper */
++#define AI_IOCTRL               0x408
++#define AI_RESETCTRL            0x800
++#define AIRC_RESET              1
++#define SICF_CLOCK_EN           1
++
++/* chipcommon */
++#define CC_CHIPID               0x00
++#define CC_CAPABILITIES         0x04
++#define CC_EROMPTR              0xfc
++#define CC_PMUCAPABILITIES      0x604
++#define CC_CAP_PMU              0x10000000
++
++/* SOCRAM */
++#define SR_COREINFO             0x00
++#define SR_BANKIDX              0x10
++#define SR_BANKINFO             0x40
++#define SR_NBANKS               4       /* of 128 KiB: bankinfo size 15 */
++
++/* SDIO device core */
++#define SD_INTSTATUS            0x20
++#define SD_HOSTINTMASK          0x24
++#define SD_TOSBMAILBOX          0x40
++#define SD_TOHOSTMAILBOXDATA    0x4c
++#define I_HMB_FRAME_IND         (1 << 6)
++#define I_HMB_HOST_INT          (1 << 7)
++#define SMB_NAK                 (1 << 0)
++#define SMB_INT_ACK             (1 << 1)
++#define HMB_DATA_NAKHANDLED     0x01
++#define HMB_DATA_FWREADY        0x08
++#define SDPCM_PROT_VERSION      4
++
++/* -- SDIO function 1 registers -------------------------------------------- */
++
++#define F1_DEVICE_CTL           0x10009
++#define F1_SBADDRLOW            0x1000a
++#define F1_SBADDRMID            0x1000b
++#define F1_SBADDRHIGH           0x1000c
++#define F1_FRAMECTRL            0x1000d
++#define F1_CHIPCLKCSR           0x1000e
++#define F1_SLEEPCSR             0x1001f
++#define F1_REG_BASE             0x10000
++#define F1_REG_SIZE             0x20
++#define F1_SB_OFT_MASK          0x7fff
++
++#define SFC_RF_TERM             (1 << 0)
++#define SFC_WF_TERM             (1 << 1)
++
++#define CLKCSR_REQ              0x1f    /* force ALP/HT/ILP, ALP/HT request */
++#define CLKCSR_AVAIL            0xc0    /* ALP and HT available */
++#define SLEEPCSR_KSO            0x01
++#define SLEEPCSR_DEVON          0x02
++
++/* Broadcom's CCCR vendor space */
++#define CCCR_BRCM_CARDCAP       0xf0
++#define CCCR_BRCM_CARDCTL       0xf1
++#define CCCR_BRCM_SEPINT        0xf2
++#define SEPINT_MASK             0x01    /* route interrupts to the pad */
++#define SEPINT_OE               0x02    /* drive the pad */
++#define SEPINT_ACT_HI           0x04
++
++/* -- SDPCM / CDC / BDC ---------------------------------------------------- */
++
++#define SDPCM_HDRLEN            12
++#define SDPCM_CONTROL_CHANNEL   0
++#define SDPCM_EVENT_CHANNEL     1
++#define SDPCM_DATA_CHANNEL      2
++/* Frames the host may send past the last one it heard back about. */
++#define SDPCM_WINDOW            0x40
++
++#define CDC_HDRLEN              16
++#define CDCF_IOC_ERROR          0x01
++#define CDCF_IOC_SET            0x02
++#define BDC_HDRLEN              4
++#define BDC_PROTO_VER           2
++
++#define BCME_OK                 0
++#define BCME_NOTASSOCIATED      (-17)
++#define BCME_UNSUPPORTED        (-23)
++
++/* ioctls */
++#define WLC_GET_MAGIC           0
++#define WLC_GET_VERSION         1
++#define WLC_UP                  2
++#define WLC_DOWN                3
++#define WLC_GET_RATE            12
++#define WLC_GET_INFRA           19
++#define WLC_SET_INFRA           20
++#define WLC_GET_AUTH            21
++#define WLC_SET_AUTH            22
++#define WLC_GET_BSSID           23
++#define WLC_GET_SSID            25
++#define WLC_SET_SSID            26
++#define WLC_GET_CHANNEL         29
++#define WLC_GET_PHYTYPE         39
++#define WLC_SCAN                50
++#define WLC_SCAN_RESULTS        51
++#define WLC_DISASSOC            52
++#define WLC_GET_RATESET         71
++#define WLC_GET_BCNPRD          75
++#define WLC_GET_DTIMPRD         77
++#define WLC_GET_COUNTRY         83
++#define WLC_GET_PM              85
++#define WLC_SET_PM              86
++#define WLC_GET_CURR_RATESET    114
++#define WLC_GET_RSSI            127
++#define WLC_GET_WSEC            133
++#define WLC_SET_WSEC            134
++#define WLC_GET_BSS_INFO        136
++#define WLC_GET_BANDLIST        140
++#define WLC_GET_BAND            141
++#define WLC_GET_ASSOCLIST       159
++#define WLC_GET_UP              162
++#define WLC_GET_WPA_AUTH        164
++#define WLC_SET_WPA_AUTH        165
++#define WLC_GET_VALID_CHANNELS  217
++#define WLC_GET_VAR             262
++#define WLC_SET_VAR             263
++
++#define WLC_IOCTL_MAGIC         0x14e46c77
++#define WLC_IOCTL_VERSION       2
++#define WLC_BAND_AUTO           0
++#define WLC_BAND_2G             2
++#define WLC_PHY_TYPE_N          4
++
++/* events */
++#define WLC_E_SET_SSID          0
++#define WLC_E_LINK              16
++#define WLC_E_SCAN_COMPLETE     26
++#define WLC_E_ESCAN_RESULT      69
++#define WLC_E_STATUS_SUCCESS    0
++#define WLC_E_STATUS_NO_NETWORKS 3
++#define WLC_E_STATUS_PARTIAL    8
++#define WLC_EVENT_MSG_LINK      0x01
++#define WL_EVENTING_MASK_LEN    16
++#define BCM_EVENT_MSG_VERSION   2
++#define BCM_EVENT_LEN           (14 + 10 + 48)  /* eth + bcmeth + msg */
++#define ETHER_TYPE_BRCM         0x886c
++
++#define WL_BSS_INFO_VERSION     109
++#define WL_BSS_INFO_LEN         128     /* sizeof(wl_bss_info_t) */
++#define WL_BSS_FLAGS_RSSI_ONCHANNEL 0x04
++#define WL_SCAN_ACTION_ABORT    3
++#define WL_SCAN_PARAMS_FIXED_SIZE 64    /* up to channel_list */
++#define WL_CHANSPEC_BW_20       0x1000  /* 2G band is 0 */
++#define BCM_NUM_CHANNELS        11
++
++#define BCM_RXQ_MAX             256
++
++static const uint8_t bcm_rates[] = {
++    0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24,
++};
++
++struct BCM43341State {
++    DeviceState parent_obj;
++
++    NICState *nic;
++    NICConf conf;
++    qemu_irq host_wake;
++    qemu_irq card_int;
++    char *ssid;
++    uint8_t channel;
++    bool trace;
++
++    bool powered;
++
++    /* SDIO */
++    uint8_t f1[F1_REG_SIZE];
++    uint8_t cccr_brcm[3];
++
++    /* Backplane */
++    uint32_t erom[BCM_EROM_WORDS];
++    uint32_t regs[NUM_CORES][SI_CORE_SIZE / 4];
++    uint32_t wrap[NUM_CORES][SI_CORE_SIZE / 4];
++    uint8_t *ram;
++    bool ram_written;
++    uint32_t intstatus;
++    uint32_t hostintmask;
++    uint32_t tohost_mbdata;
++
++    /* SDPCM */
++    bool fw_running;
++    uint8_t rx_seq;             /* next sequence number to the host */
++    uint8_t host_seq_next;      /* next one expected from the host */
++    uint8_t window;             /* last tx window granted */
++    GQueue *rxq;
++    GByteArray *rx_cur;
++    uint32_t rx_pos;
++    GByteArray *rx_aborted;     /* for a NAK'd re-read */
++    GByteArray *txbuf;
++
++    /* wl */
++    uint8_t mac[6];
++    uint8_t bssid[6];
++    uint8_t eventmask[WL_EVENTING_MASK_LEN];
++    bool up;
++    bool associated;
++    bool join_ok;
++    uint32_t infra, auth, wsec, wpa_auth, pm;
++    uint16_t scan_sync_id;
++    bool scan_legacy;
++    QEMUTimer *scan_timer;
++    QEMUTimer *join_timer;
++};
++
++#define BCM_TRACE(s, fmt, ...)                                              \
++    do {                                                                    \
++        if ((s)->trace) {                                                   \
++            qemu_log("bcm43341: " fmt "\n", ## __VA_ARGS__);                \
++        }                                                                   \
++    } while (0)
++
++/* -- Interrupts ----------------------------------------------------------- */
++
++/*
++ * The SDIO core's pending host interrupts, driven out both ways: as the
++ * in-band SDIO interrupt, which the host only listens to if it claimed it,
++ * and on the out-of-band pad once the driver has routed it there (SEPINT,
++ * what the Nest's HW_OOB build does). The pad stays quiet until then: the
++ * driver requests its IRQ before it can mask it, so a line that is already
++ * high at that point would never be masked again.
++ */
++static void bcm_update_irq(BCM43341State *s)
++{
++    uint8_t sepint = s->cccr_brcm[CCCR_BRCM_SEPINT - CCCR_BRCM_CARDCAP];
++    bool level = s->powered && s->fw_running &&
++                 (s->intstatus & s->hostintmask);
++    bool oob = (sepint & (SEPINT_MASK | SEPINT_OE)) ==
++               (SEPINT_MASK | SEPINT_OE);
++
++    qemu_set_irq(s->host_wake, oob && level == !!(sepint & SEPINT_ACT_HI));
++    qemu_set_irq(s->card_int, level);
++}
++
++/* -- SDPCM frames to the host --------------------------------------------- */
++
++static void bcm_queue_frame(BCM43341State *s, uint8_t chan, uint8_t doff,
++                            const uint8_t *hdr, size_t hdrlen,
++                            const uint8_t *payload, size_t len)
++{
++    size_t total = MAX(SDPCM_HDRLEN + hdrlen + len, doff);
++    GByteArray *f = g_byte_array_sized_new(total);
++    uint8_t *p;
++
++    g_byte_array_set_size(f, total);
++    p = f->data;
++    memset(p, 0, total);
++    s->window = s->host_seq_next + SDPCM_WINDOW;
++    stw_le_p(p, total);
++    stw_le_p(p + 2, ~total);
++    p[4] = s->rx_seq++;
++    p[5] = chan;
++    p[7] = doff ? doff : SDPCM_HDRLEN;
++    p[9] = s->window;
++    if (hdrlen) {
++        memcpy(p + SDPCM_HDRLEN, hdr, hdrlen);
++    }
++    if (len) {
++        memcpy(p + SDPCM_HDRLEN + hdrlen, payload, len);
++    }
++    g_queue_push_tail(s->rxq, f);
++    s->intstatus |= I_HMB_FRAME_IND;
++    bcm_update_irq(s);
++}
++
++static void bcm_queue_bdc(BCM43341State *s, uint8_t chan,
++                          const uint8_t *payload, size_t len)
++{
++    static const uint8_t bdc[BDC_HDRLEN] = { BDC_PROTO_VER << 4, 0, 0, 0 };
++
++    bcm_queue_frame(s, chan, 0, bdc, sizeof(bdc), payload, len);
++}
++
++/*
++ * A frame whose data offset is its whole length: the host reads it, finds
++ * nothing to deliver, and keeps the window it carries. Longer than the
++ * host's 32-byte first read so it takes the ordinary two-read path.
++ */
++static void bcm_queue_window_update(BCM43341State *s)
++{
++    bcm_queue_frame(s, SDPCM_DATA_CHANNEL, 36, NULL, 0, NULL, 0);
++}
++
++static void bcm_send_event(BCM43341State *s, uint32_t type, uint32_t status,
++                           uint32_t reason, uint16_t flags,
++                           const uint8_t *addr, const void *data,
++                           size_t datalen)
++{
++    g_autofree uint8_t *ev = g_malloc0(BCM_EVENT_LEN + datalen);
++    uint8_t *eth = ev, *bcmeth = ev + 14, *msg = ev + 24;
++
++    if (type >= WL_EVENTING_MASK_LEN * 8 ||
++        !(s->eventmask[type / 8] & (1 << (type % 8)))) {
++        BCM_TRACE(s, "event %u masked", type);
++        return;
++    }
++    BCM_TRACE(s, "event %u status %u reason %u flags 0x%x", type, status,
++              reason, flags);
++
++    memcpy(eth, s->mac, 6);
++    memcpy(eth + 6, s->mac, 6);
++    stw_be_p(eth + 12, ETHER_TYPE_BRCM);
++
++    stw_be_p(bcmeth, 32769);                    /* vendor long subtype */
++    stw_be_p(bcmeth + 2, 8 + 48 + datalen);
++    bcmeth[4] = 0;
++    memcpy(bcmeth + 5, "\x00\x10\x18", 3);      /* Broadcom OUI */
++    stw_be_p(bcmeth + 8, 1);                    /* BCM event */
++
++    stw_be_p(msg, BCM_EVENT_MSG_VERSION);
++    stw_be_p(msg + 2, flags);
++    stl_be_p(msg + 4, type);
++    stl_be_p(msg + 8, status);
++    stl_be_p(msg + 12, reason);
++    stl_be_p(msg + 16, 0);                      /* auth type */
++    stl_be_p(msg + 20, datalen);
++    if (addr) {
++        memcpy(msg + 24, addr, 6);
++    }
++    pstrcpy((char *)msg + 30, 16, "wlan0");
++    /* ifidx and bsscfgidx stay 0: the primary interface */
++
++    if (datalen) {
++        memcpy(ev + BCM_EVENT_LEN, data, datalen);
++    }
++    bcm_queue_bdc(s, SDPCM_EVENT_CHANNEL, ev, BCM_EVENT_LEN + datalen);
++}
++
++/* -- The access point ------------------------------------------------------ */
++
++/* wl_bss_info_t (version 109, 128 bytes) followed by its IEs. */
++static size_t bcm_build_bss(BCM43341State *s, uint8_t *p)
++{
++    size_t ssid_len = MIN(strlen(s->ssid), 32);
++    uint8_t *ie = p + WL_BSS_INFO_LEN;
++    size_t ie_len;
++
++    memset(p, 0, WL_BSS_INFO_LEN);
++    ie[0] = 0;                                  /* SSID */
++    ie[1] = ssid_len;
++    memcpy(ie + 2, s->ssid, ssid_len);
++    ie_len = 2 + ssid_len;
++    ie[ie_len] = 1;                             /* supported rates */
++    ie[ie_len + 1] = sizeof(bcm_rates);
++    memcpy(ie + ie_len + 2, bcm_rates, sizeof(bcm_rates));
++    ie_len += 2 + sizeof(bcm_rates);
++    ie[ie_len] = 3;                             /* DS parameter set */
++    ie[ie_len + 1] = 1;
++    ie[ie_len + 2] = s->channel;
++    ie_len += 3;
++    ie[ie_len] = 5;                             /* TIM: DTIM period 1 */
++    ie[ie_len + 1] = 4;
++    ie[ie_len + 2] = 0;
++    ie[ie_len + 3] = 1;
++    ie[ie_len + 4] = 0;
++    ie[ie_len + 5] = 0;
++    ie_len += 6;
++
++    stl_le_p(p, WL_BSS_INFO_VERSION);
++    stl_le_p(p + 4, WL_BSS_INFO_LEN + ie_len);
++    memcpy(p + 8, s->bssid, 6);
++    stw_le_p(p + 14, 100);                      /* beacon period */
++    stw_le_p(p + 16, 0x0401);                   /* ESS, short slot */
++    p[18] = ssid_len;
++    memcpy(p + 19, s->ssid, ssid_len);
++    stl_le_p(p + 52, sizeof(bcm_rates));
++    memcpy(p + 56, bcm_rates, sizeof(bcm_rates));
++    stw_le_p(p + 72, WL_CHANSPEC_BW_20 | s->channel);
++    p[76] = 1;                                  /* DTIM period */
++    stw_le_p(p + 78, (uint16_t)-40);            /* RSSI */
++    p[80] = (uint8_t)-90;                       /* noise */
++    p[88] = s->channel;                         /* control channel */
++    p[96] = WL_BSS_FLAGS_RSSI_ONCHANNEL;
++    stw_le_p(p + 116, WL_BSS_INFO_LEN);         /* ie_offset */
++    stl_le_p(p + 120, ie_len);
++    stw_le_p(p + 124, 50);                      /* SNR */
++    return WL_BSS_INFO_LEN + ie_len;
++}
++
++#define BCM_BSS_MAX     (WL_BSS_INFO_LEN + 64)
++
++static void bcm_scan_done(void *opaque)
++{
++    BCM43341State *s = opaque;
++    uint8_t res[12 + BCM_BSS_MAX];
++    size_t len;
++
++    if (!s->fw_running) {
++        return;
++    }
++    if (s->scan_legacy) {
++        bcm_send_event(s, WLC_E_SCAN_COMPLETE, WLC_E_STATUS_SUCCESS, 0, 0,
++                       NULL, NULL, 0);
++        return;
++    }
++    /* wl_escan_result_t: buflen, version, sync_id, bss_count, bss_info */
++    len = bcm_build_bss(s, res + 12);
++    stl_le_p(res, 12 + len);
++    stl_le_p(res + 4, WL_BSS_INFO_VERSION);
++    stw_le_p(res + 8, s->scan_sync_id);
++    stw_le_p(res + 10, 1);
++    bcm_send_event(s, WLC_E_ESCAN_RESULT, WLC_E_STATUS_PARTIAL, 0, 0,
++                   NULL, res, 12 + len);
++
++    stl_le_p(res, 12);
++    stw_le_p(res + 10, 0);
++    bcm_send_event(s, WLC_E_ESCAN_RESULT, WLC_E_STATUS_SUCCESS, 0, 0,
++                   NULL, res, 12);
++}
++
++static void bcm_start_scan(BCM43341State *s, bool legacy, uint16_t sync_id)
++{
++    s->scan_legacy = legacy;
++    s->scan_sync_id = sync_id;
++    timer_mod(s->scan_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
++}
++
++static void bcm_join_done(void *opaque)
++{
++    BCM43341State *s = opaque;
++
++    if (!s->fw_running) {
++        return;
++    }
++    if (!s->join_ok) {
++        bcm_send_event(s, WLC_E_SET_SSID, WLC_E_STATUS_NO_NETWORKS, 0, 0,
++                       NULL, NULL, 0);
++        return;
++    }
++    s->associated = true;
++    bcm_send_event(s, WLC_E_LINK, WLC_E_STATUS_SUCCESS, 0,
++                   WLC_EVENT_MSG_LINK, s->bssid, NULL, 0);
++    bcm_send_event(s, WLC_E_SET_SSID, WLC_E_STATUS_SUCCESS, 0, 0,
++                   s->bssid, NULL, 0);
++    qemu_flush_queued_packets(qemu_get_queue(s->nic));
++}
++
++/* Both "join" and WLC_SET_SSID start with a wlc_ssid_t. */
++static void bcm_start_join(BCM43341State *s, const uint8_t *p, size_t len)
++{
++    uint32_t ssid_len = len >= 4 ? MIN(ldl_le_p(p), 32) : 0;
++
++    if (len < 4 + ssid_len) {
++        ssid_len = 0;
++    }
++    s->join_ok = ssid_len == strlen(s->ssid) &&
++                 !memcmp(p + 4, s->ssid, ssid_len);
++    BCM_TRACE(s, "join \"%.*s\" -> %s", (int)ssid_len, p + 4,
++              s->join_ok ? "ok" : "no network");
++    s->associated = false;
++    timer_mod(s->join_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
++}
++
++static void bcm_disassoc(BCM43341State *s)
++{
++    timer_del(s->join_timer);
++    if (s->associated) {
++        s->associated = false;
++        bcm_send_event(s, WLC_E_LINK, WLC_E_STATUS_SUCCESS, 0, 0,
++                       s->bssid, NULL, 0);
++    }
++}
++
++/* -- ioctls --------------------------------------------------------------- */
++
++static void put32(uint8_t *out, size_t olen, uint32_t v)
++{
++    if (olen >= 4) {
++        stl_le_p(out, v);
++    }
++}
++
++static void put_str(uint8_t *out, size_t olen, const char *str)
++{
++    if (olen) {
++        pstrcpy((char *)out, olen, str);
++    }
++}
++
++/* wl_country_t: abbrev[4], rev, ccode[4] */
++static void put_country(uint8_t *out, size_t olen)
++{
++    if (olen >= 12) {
++        memcpy(out, "US", 3);
++        stl_le_p(out + 4, 0);
++        memcpy(out + 8, "US", 3);
++    }
++}
++
++static int bcm_get_var(BCM43341State *s, const char *name,
++                       uint8_t *out, size_t olen)
++{
++    if (!strcmp(name, "cur_etheraddr")) {
++        if (olen >= 6) {
++            memcpy(out, s->mac, 6);
++        }
++    } else if (!strcmp(name, "cap")) {
++        put_str(out, olen, "sta wme 802.11d 802.11h rm");
++    } else if (!strcmp(name, "ver")) {
++        put_str(out, olen, "wl0: Apr 26 2018 17:18:22 version 6.30.190.36 "
++                "(r688656) FWID 01-ce56fd3e\n");
++    } else if (!strcmp(name, "clmver")) {
++        put_str(out, olen, "API: 12.2 Data: QEMU");
++    } else if (!strcmp(name, "event_msgs")) {
++        memcpy(out, s->eventmask, MIN(olen, sizeof(s->eventmask)));
++    } else if (!strcmp(name, "nmode")) {
++        put32(out, olen, 1);
++    } else if (!strcmp(name, "chanspecs")) {
++        if (olen >= 4 * (1 + BCM_NUM_CHANNELS)) {
++            put32(out, olen, BCM_NUM_CHANNELS);
++            for (int i = 0; i < BCM_NUM_CHANNELS; i++) {
++                stl_le_p(out + 4 + 4 * i, WL_CHANSPEC_BW_20 | (i + 1));
++            }
++        }
++    } else if (!strcmp(name, "country")) {
++        put_country(out, olen);
++    } else if (!strcmp(name, "wlfc_mode") || !strcmp(name, "tlv") ||
++               !strcmp(name, "bus:txglom_auto_control")) {
++        return BCME_UNSUPPORTED;
++    } else {
++        /*
++         * Everything else reads as zero: assoc_info (no assoc IEs),
++         * per_chan_info (no radar), mimo_bw_cap (20 MHz), and the plain
++         * knobs the driver reads back before it sets them.
++         */
++        BCM_TRACE(s, "get \"%s\" -> zero", name);
++    }
++    return BCME_OK;
++}
++
++static int bcm_set_var(BCM43341State *s, const char *name,
++                       const uint8_t *val, size_t vlen)
++{
++    if (!strcmp(name, "cur_etheraddr")) {
++        if (vlen >= 6) {
++            memcpy(s->mac, val, 6);
++        }
++    } else if (!strcmp(name, "event_msgs")) {
++        memcpy(s->eventmask, val, MIN(vlen, sizeof(s->eventmask)));
++    } else if (!strcmp(name, "escan")) {
++        /* wl_escan_params_t: version, action, sync_id, params */
++        if (vlen >= 8 && lduw_le_p(val + 4) == WL_SCAN_ACTION_ABORT) {
++            timer_del(s->scan_timer);
++        } else {
++            bcm_start_scan(s, false, vlen >= 8 ? lduw_le_p(val + 6) : 0);
++        }
++    } else if (!strcmp(name, "join")) {
++        bcm_start_join(s, val, vlen);
++    } else if (!strcmp(name, "bus:rxglom") ||
++               !strcmp(name, "ampdu_hostreorder") ||
++               !strcmp(name, "tlv") || !strcmp(name, "wlfc_mode")) {
++        /*
++         * Tx glomming, host rx reordering and proptxstatus all change the
++         * framing; saying no keeps every frame a plain one.
++         */
++        return BCME_UNSUPPORTED;
++    }
++    return BCME_OK;
++}
++
++static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
++                     const uint8_t *in, size_t inlen,
++                     uint8_t *out, size_t olen)
++{
++    uint32_t v = inlen >= 4 ? ldl_le_p(in) : 0;
++    size_t len;
++
++    switch (cmd) {
++    case WLC_GET_MAGIC:
++        put32(out, olen, WLC_IOCTL_MAGIC);
++        break;
++    case WLC_GET_VERSION:
++        put32(out, olen, WLC_IOCTL_VERSION);
++        break;
++    case WLC_UP:
++        s->up = true;
++        break;
++    case WLC_DOWN:
++        s->up = false;
++        s->associated = false;
++        timer_del(s->join_timer);
++        timer_del(s->scan_timer);
++        break;
++    case WLC_GET_UP:
++        put32(out, olen, s->up);
++        break;
++    case WLC_GET_RATE:
++        put32(out, olen, 108);                  /* 54 Mbps, 500 kbps units */
++        break;
++    case WLC_GET_INFRA:
++        put32(out, olen, s->infra);
++        break;
++    case WLC_SET_INFRA:
++        s->infra = v;
++        break;
++    case WLC_GET_AUTH:
++        put32(out, olen, s->auth);
++        break;
++    case WLC_SET_AUTH:
++        s->auth = v;
++        break;
++    case WLC_GET_WSEC:
++        put32(out, olen, s->wsec);
++        break;
++    case WLC_SET_WSEC:
++        s->wsec = v;
++        break;
++    case WLC_GET_WPA_AUTH:
++        put32(out, olen, s->wpa_auth);
++        break;
++    case WLC_SET_WPA_AUTH:
++        s->wpa_auth = v;
++        break;
++    case WLC_GET_PM:
++        put32(out, olen, s->pm);
++        break;
++    case WLC_SET_PM:
++        s->pm = v;
++        break;
++    case WLC_GET_BSSID:
++        if (!s->associated) {
++            return BCME_NOTASSOCIATED;
++        }
++        if (olen >= 6) {
++            memcpy(out, s->bssid, 6);
++        }
++        break;
++    case WLC_GET_SSID:
++        if (s->associated && olen >= 36) {
++            len = MIN(strlen(s->ssid), 32);
++            stl_le_p(out, len);
++            memcpy(out + 4, s->ssid, len);
++        }
++        break;
++    case WLC_SET_SSID:
++        bcm_start_join(s, in, inlen);
++        break;
++    case WLC_GET_CHANNEL:
++        if (olen >= 12) {                       /* channel_info_t */
++            stl_le_p(out, s->channel);
++            stl_le_p(out + 4, s->channel);
++        }
++        break;
++    case WLC_GET_PHYTYPE:
++        put32(out, olen, WLC_PHY_TYPE_N);
++        break;
++    case WLC_SCAN:
++        /* wl_scan_params_t; a lone channel of -1 is how scans are aborted */
++        if (inlen >= WL_SCAN_PARAMS_FIXED_SIZE + 2 &&
++            lduw_le_p(in + WL_SCAN_PARAMS_FIXED_SIZE) == 0xffff) {
++            timer_del(s->scan_timer);
++        } else {
++            bcm_start_scan(s, true, 0);
++        }
++        break;
++    case WLC_SCAN_RESULTS:
++        /* wl_scan_results_t: buflen, version, count, bss_info */
++        if (olen >= 12 + BCM_BSS_MAX) {
++            len = bcm_build_bss(s, out + 12);
++            stl_le_p(out, 12 + len);
++            stl_le_p(out + 4, WL_BSS_INFO_VERSION);
++            stl_le_p(out + 8, 1);
++        }
++        break;
++    case WLC_DISASSOC:
++        bcm_disassoc(s);
++        break;
++    case WLC_GET_RATESET:
++    case WLC_GET_CURR_RATESET:
++        if (olen >= 4 + sizeof(bcm_rates)) {    /* wl_rateset_t */
++            stl_le_p(out, sizeof(bcm_rates));
++            memcpy(out + 4, bcm_rates, sizeof(bcm_rates));
++        }
++        break;
++    case WLC_GET_BCNPRD:
++        put32(out, olen, 100);
++        break;
++    case WLC_GET_DTIMPRD:
++        put32(out, olen, 1);
++        break;
++    case WLC_GET_COUNTRY:
++        put_country(out, olen);
++        break;
++    case WLC_GET_RSSI:
++        put32(out, olen, (uint32_t)-40);        /* scb_val_t.val */
++        break;
++    case WLC_GET_BSS_INFO:
++        if (!s->associated) {
++            return BCME_NOTASSOCIATED;
++        }
++        if (olen >= 4 + BCM_BSS_MAX) {
++            put32(out, olen, olen);
++            bcm_build_bss(s, out + 4);
++        }
++        break;
++    case WLC_GET_BANDLIST:
++        if (olen >= 8) {
++            stl_le_p(out, 1);
++            stl_le_p(out + 4, WLC_BAND_2G);
++        }
++        break;
++    case WLC_GET_BAND:
++        put32(out, olen, WLC_BAND_AUTO);
++        break;
++    case WLC_GET_ASSOCLIST:
++        put32(out, olen, 0);
++        break;
++    case WLC_GET_VALID_CHANNELS:
++        if (olen >= 4 * (1 + BCM_NUM_CHANNELS)) {
++            stl_le_p(out, BCM_NUM_CHANNELS);
++            for (int i = 0; i < BCM_NUM_CHANNELS; i++) {
++                stl_le_p(out + 4 + 4 * i, i + 1);
++            }
++        }
++        break;
++    case WLC_GET_VAR:
++    case WLC_SET_VAR: {
++        size_t nlen = strnlen((const char *)in, inlen);
++        g_autofree char *name = g_strndup((const char *)in, nlen);
++        const uint8_t *val = in + MIN(nlen + 1, inlen);
++        size_t vlen = inlen - MIN(nlen + 1, inlen);
++        int ret;
++
++        /* "bsscfg:<name>\0<index><value>": only bsscfg 0 exists */
++        if (g_str_has_prefix(name, "bsscfg:")) {
++            if (vlen < 4 || ldl_le_p(val) != 0) {
++                return BCME_UNSUPPORTED;
++            }
++            memmove(name, name + 7, strlen(name + 7) + 1);
++            val += 4;
++            vlen -= 4;
++        }
++        if (cmd == WLC_GET_VAR) {
++            memset(out, 0, olen);
++            ret = bcm_get_var(s, name, out, olen);
++        } else {
++            ret = bcm_set_var(s, name, val, vlen);
++        }
++        BCM_TRACE(s, "%s \"%s\" (%zu bytes) -> %d",
++                  cmd == WLC_GET_VAR ? "get" : "set", name, vlen, ret);
++        return ret;
++    }
++    default:
++        BCM_TRACE(s, "ioctl %u (%s) not modelled -> ok", cmd,
++                  set ? "set" : "get");
++        break;
++    }
++    return BCME_OK;
++}
++
++/* A CDC request from the control channel; answered on it with one frame. */
++static void bcm_control(BCM43341State *s, const uint8_t *msg, size_t len)
++{
++    uint32_t cmd, ilen, flags;
++    g_autofree uint8_t *out = NULL;
++    uint8_t hdr[CDC_HDRLEN];
++    bool set;
++    int ret;
++
++    if (len < CDC_HDRLEN) {
++        return;
++    }
++    cmd = ldl_le_p(msg);
++    ilen = MIN(ldl_le_p(msg + 4), 16 * KiB);
++    flags = ldl_le_p(msg + 8);
++    set = flags & CDCF_IOC_SET;
++    out = g_malloc0(ilen);
++
++    ret = bcm_ioctl(s, cmd, set, msg + CDC_HDRLEN,
++                    MIN(ilen, len - CDC_HDRLEN), out, ilen);
++    if (cmd != WLC_GET_VAR && cmd != WLC_SET_VAR) {
++        BCM_TRACE(s, "ioctl %u %s len %u -> %d", cmd, set ? "set" : "get",
++                  ilen, ret);
++    }
++
++    stl_le_p(hdr, cmd);
++    stl_le_p(hdr + 4, ilen);
++    stl_le_p(hdr + 8, flags | (ret < 0 ? CDCF_IOC_ERROR : 0));
++    stl_le_p(hdr + 12, ret);
++    /* A set only needs its status back; a get carries the whole buffer. */
++    bcm_queue_frame(s, SDPCM_CONTROL_CHANNEL, 0, hdr, sizeof(hdr),
++                    out, set ? 0 : ilen);
++}
++
++/* A data frame from the host: BDC header, pad words, an Ethernet frame. */
++static void bcm_host_data(BCM43341State *s, const uint8_t *p, size_t len)
++{
++    size_t off;
++
++    if (len < BDC_HDRLEN) {
++        return;
++    }
++    off = BDC_HDRLEN + 4 * p[3];
++    if (len < off + 14 || !s->associated) {
++        return;
++    }
++    qemu_send_packet(qemu_get_queue(s->nic), p + off, len - off);
++}
++
++static void bcm_host_frame(BCM43341State *s, const uint8_t *f, size_t flen)
++{
++    uint8_t chan = f[5] & 0x0f;
++    uint8_t doff = f[7];
++
++    s->host_seq_next = f[4] + 1;
++    if (doff < SDPCM_HDRLEN || doff > flen) {
++        BCM_TRACE(s, "host frame with bad data offset %u (len %zu)", doff,
++                  flen);
++        return;
++    }
++    switch (chan) {
++    case SDPCM_CONTROL_CHANNEL:
++        bcm_control(s, f + doff, flen - doff);
++        break;
++    case SDPCM_DATA_CHANNEL:
++        bcm_host_data(s, f + doff, flen - doff);
++        break;
++    default:
++        BCM_TRACE(s, "host frame on channel %u dropped", chan);
++        break;
++    }
++    /* Keep the host's send window open even when nothing else comes back. */
++    if ((uint8_t)(s->window - s->host_seq_next) < SDPCM_WINDOW / 4) {
++        bcm_queue_window_update(s);
++    }
++}
++
++/* -- Function 2: the frame FIFOs ------------------------------------------- */
++
++static void bcm_f2_read(BCM43341State *s, uint8_t *buf, unsigned len)
++{
++    unsigned n;
++
++    memset(buf, 0, len);
++    if (!s->fw_running) {
++        return;
++    }
++    if (!s->rx_cur) {
++        s->rx_cur = g_queue_pop_head(s->rxq);
++        s->rx_pos = 0;
++        if (!s->rx_cur) {
++            return;                 /* a zero frame tag: nothing pending */
++        }
++    }
++    /*
++     * The host reads a frame as a header chunk and then the rest, rounded
++     * up to its alignment: a frame is done once a read has reached its
++     * end, and whatever lies past the end reads as padding.
++     */
++    n = MIN(len, s->rx_cur->len - s->rx_pos);
++    memcpy(buf, s->rx_cur->data + s->rx_pos, n);
++    s->rx_pos += len;
++    if (s->rx_pos >= s->rx_cur->len) {
++        g_byte_array_unref(s->rx_cur);
++        s->rx_cur = NULL;
++        if (g_queue_get_length(s->rxq) < BCM_RXQ_MAX / 2) {
++            qemu_flush_queued_packets(qemu_get_queue(s->nic));
++        }
++    }
++}
++
++static void bcm_f2_write(BCM43341State *s, const uint8_t *buf, unsigned len)
++{
++    uint16_t flen;
++
++    if (!s->fw_running) {
++        return;
++    }
++    /*
++     * Linux may split one frame over a block-mode and a byte-mode CMD53,
++     * and pads the last one: a transfer that opens without a valid frame
++     * tag is the padding of the frame before it.
++     */
++    if (!s->txbuf->len) {
++        if (len < 4 || (uint16_t)(lduw_le_p(buf) ^ lduw_le_p(buf + 2)) !=
++                       0xffff || lduw_le_p(buf) < SDPCM_HDRLEN) {
++            return;
++        }
++    }
++    g_byte_array_append(s->txbuf, buf, len);
++    flen = lduw_le_p(s->txbuf->data);
++    if (s->txbuf->len >= flen) {
++        g_autoptr(GByteArray) f = s->txbuf;
++
++        s->txbuf = g_byte_array_new();
++        bcm_host_frame(s, f->data, flen);
++    }
++}
++
++/* -- Backplane access ----------------------------------------------------- */
++
++static void bcm_arm_start(BCM43341State *s)
++{
++    uint32_t token = ldl_le_p(s->ram + BCM_RAM_SIZE - 4);
++    const char *ver;
++
++    if (!s->ram_written) {
++        BCM_TRACE(s, "ARM released without firmware");
++        return;
++    }
++    ver = memmem(s->ram, BCM_RAM_SIZE, "Version: ", 9);
++    qemu_log("bcm43341: firmware started (%.36s), nvram %u bytes\n",
++             ver ? ver + 9 : "unknown version",
++             (token & 0xffff) == (~token >> 16) ? 4 * (token & 0xffff) : 0);
++
++    /* sdpcm_shared_t v1, no console; its address replaces the NVRAM token */
++    memset(s->ram + BCM_SHARED_ADDR, 0, 32);
++    stl_le_p(s->ram + BCM_SHARED_ADDR, 1);
++    stl_le_p(s->ram + BCM_RAM_SIZE - 4, BCM_SHARED_ADDR);
++
++    s->fw_running = true;
++    s->rx_seq = 0;
++    s->tohost_mbdata = HMB_DATA_FWREADY | (SDPCM_PROT_VERSION << 16);
++    s->intstatus |= I_HMB_HOST_INT;
++    bcm_update_irq(s);
++}
++
++static void bcm_arm_stop(BCM43341State *s)
++{
++    s->fw_running = false;
++    timer_del(s->scan_timer);
++    timer_del(s->join_timer);
++    s->associated = false;
++    s->up = false;
++    while (!g_queue_is_empty(s->rxq)) {
++        g_byte_array_unref(g_queue_pop_head(s->rxq));
++    }
++    g_clear_pointer(&s->rx_cur, g_byte_array_unref);
++    g_clear_pointer(&s->rx_aborted, g_byte_array_unref);
++    g_byte_array_set_size(s->txbuf, 0);
++    bcm_update_irq(s);
++}
++
++#define BCM_CORES_SIZE          (NUM_CORES * SI_CORE_SIZE)
++
++static int bcm_core_at(uint32_t addr, bool *wrap)
++{
++    if (addr >= SI_ENUM_BASE && addr < SI_ENUM_BASE + BCM_CORES_SIZE) {
++        *wrap = false;
++        return (addr - SI_ENUM_BASE) / SI_CORE_SIZE;
++    }
++    if (addr >= SI_WRAP_BASE && addr < SI_WRAP_BASE + BCM_CORES_SIZE) {
++        *wrap = true;
++        return (addr - SI_WRAP_BASE) / SI_CORE_SIZE;
++    }
++    return -1;
++}
++
++static uint32_t bcm_bp_read32(BCM43341State *s, uint32_t addr)
++{
++    uint32_t off = addr & (SI_CORE_SIZE - 1);
++    bool wrap;
++    int core;
++
++    if (addr >= BCM_EROM_BASE && addr < BCM_EROM_BASE + sizeof(s->erom)) {
++        return s->erom[(addr - BCM_EROM_BASE) / 4];
++    }
++    core = bcm_core_at(addr, &wrap);
++    if (core < 0) {
++        qemu_log_mask(LOG_UNIMP, "bcm43341: read of unmapped 0x%08x\n", addr);
++        return 0;
++    }
++    if (wrap) {
++        return s->wrap[core][off / 4];
++    }
++    switch (core) {
++    case CORE_CC:
++        switch (off) {
++        case CC_CHIPID:
++            return BCM_CHIP_ID | BCM_CHIP_REV << 16 | NUM_CORES << 24 |
++                   1u << 28;                    /* SOCI_AI */
++        case CC_CAPABILITIES:
++            return CC_CAP_PMU;
++        case CC_EROMPTR:
++            return BCM_EROM_BASE;
++        case CC_PMUCAPABILITIES:
++            return 17;                          /* PMU rev */
++        }
++        break;
++    case CORE_SOCRAM:
++        switch (off) {
++        case SR_COREINFO:
++            return SR_NBANKS << 4;
++        case SR_BANKINFO:
++            return BCM_RAM_SIZE / SR_NBANKS / 8192 - 1;
++        }
++        break;
++    case CORE_SDIOD:
++        switch (off) {
++        case SD_INTSTATUS:
++            return s->intstatus;
++        case SD_HOSTINTMASK:
++            return s->hostintmask;
++        case SD_TOHOSTMAILBOXDATA:
++            return s->tohost_mbdata;
++        }
++        break;
++    }
++    return s->regs[core][off / 4];
++}
++
++static void bcm_bp_write32(BCM43341State *s, uint32_t addr, uint32_t val,
++                           uint32_t mask)
++{
++    uint32_t off = addr & (SI_CORE_SIZE - 1);
++    uint32_t *reg;
++    bool wrap;
++    int core = bcm_core_at(addr, &wrap);
++
++    if (core < 0) {
++        qemu_log_mask(LOG_UNIMP, "bcm43341: write of 0x%08x to unmapped "
++                      "0x%08x\n", val, addr);
++        return;
++    }
++    reg = wrap ? &s->wrap[core][off / 4] : &s->regs[core][off / 4];
++
++    if (wrap && core == CORE_ARM && off == AI_RESETCTRL) {
++        bool was_reset = *reg & AIRC_RESET;
++        bool reset = val & AIRC_RESET;
++
++        *reg = val & AIRC_RESET;
++        if (reset && !was_reset) {
++            bcm_arm_stop(s);
++        } else if (!reset && was_reset) {
++            bcm_arm_start(s);
++        }
++        return;
++    }
++    if (!wrap && core == CORE_SDIOD) {
++        switch (off) {
++        case SD_INTSTATUS:
++            s->intstatus &= ~(val & mask);
++            bcm_update_irq(s);
++            return;
++        case SD_HOSTINTMASK:
++            s->hostintmask = (s->hostintmask & ~mask) | (val & mask);
++            bcm_update_irq(s);
++            return;
++        case SD_TOSBMAILBOX:
++            if (val & SMB_NAK) {
++                /* The host dropped a frame mid-read: offer it again. */
++                if (s->rx_aborted) {
++                    g_queue_push_head(s->rxq, s->rx_aborted);
++                    s->rx_aborted = NULL;
++                    s->intstatus |= I_HMB_FRAME_IND;
++                }
++                s->tohost_mbdata |= HMB_DATA_NAKHANDLED;
++                s->intstatus |= I_HMB_HOST_INT;
++            }
++            if (val & SMB_INT_ACK) {
++                s->tohost_mbdata = 0;
++            }
++            bcm_update_irq(s);
++            break;
++        }
++    }
++    *reg = (*reg & ~mask) | (val & mask);
++}
++
++static void bcm_bp_rw(BCM43341State *s, uint32_t addr, uint8_t *buf,
++                      unsigned len, bool write)
++{
++    while (len) {
++        uint32_t base = addr & ~3;
++        unsigned sh = addr & 3, n = MIN(4 - sh, len);
++        uint32_t v = 0, mask = 0;
++
++        if (addr < BCM_RAM_SIZE) {
++            n = MIN(len, BCM_RAM_SIZE - addr);
++            if (write) {
++                memcpy(s->ram + addr, buf, n);
++                s->ram_written = true;
++            } else {
++                memcpy(buf, s->ram + addr, n);
++            }
++        } else if (write) {
++            for (unsigned i = 0; i < n; i++) {
++                v |= (uint32_t)buf[i] << (8 * (sh + i));
++                mask |= 0xffu << (8 * (sh + i));
++            }
++            BCM_TRACE(s, "bp wr 0x%08x = 0x%08x/0x%08x", base, v, mask);
++            bcm_bp_write32(s, base, v, mask);
++        } else {
++            v = bcm_bp_read32(s, base);
++            BCM_TRACE(s, "bp rd 0x%08x = 0x%08x", base, v);
++            for (unsigned i = 0; i < n; i++) {
++                buf[i] = v >> (8 * (sh + i));
++            }
++        }
++        addr += n;
++        buf += n;
++        len -= n;
++    }
++}
++
++/* -- Function 1 ----------------------------------------------------------- */
++
++static uint32_t bcm_f1_window(BCM43341State *s)
++{
++    return (s->f1[F1_SBADDRLOW - F1_REG_BASE] & 0x80) << 8 |
++           s->f1[F1_SBADDRMID - F1_REG_BASE] << 16 |
++           s->f1[F1_SBADDRHIGH - F1_REG_BASE] << 24;
++}
++
++static uint8_t bcm_f1_reg(BCM43341State *s, uint32_t addr, uint8_t val,
++                          bool write)
++{
++    unsigned r = addr - F1_REG_BASE;
++
++    if (r >= F1_REG_SIZE) {
++        return 0;
++    }
++    if (write) {
++        BCM_TRACE(s, "f1 wr 0x%05x = 0x%02x", addr, val);
++        switch (addr) {
++        case F1_FRAMECTRL:
++            if (val & SFC_RF_TERM && s->rx_cur) {
++                g_clear_pointer(&s->rx_aborted, g_byte_array_unref);
++                s->rx_aborted = s->rx_cur;
++                s->rx_cur = NULL;
++            }
++            if (val & SFC_WF_TERM) {
++                g_byte_array_set_size(s->txbuf, 0);
++            }
++            return val;
++        case F1_CHIPCLKCSR:
++            val &= ~CLKCSR_AVAIL;
++            break;
++        case F1_SLEEPCSR:
++            val &= SLEEPCSR_KSO;
++            break;
++        }
++        s->f1[r] = val;
++        return val;
++    }
++    val = s->f1[r];
++    switch (addr) {
++    case F1_CHIPCLKCSR:
++        /* Clocks come up the moment anything asks for them. */
++        if (val & CLKCSR_REQ) {
++            val |= CLKCSR_AVAIL;
++        }
++        break;
++    case F1_SLEEPCSR:
++        if (val & SLEEPCSR_KSO) {
++            val |= SLEEPCSR_DEVON;
++        }
++        break;
++    }
++    BCM_TRACE(s, "f1 rd 0x%05x = 0x%02x", addr, val);
++    return val;
++}
++
++/* -- SDIOFunction --------------------------------------------------------- */
++
++static uint8_t bcm_sdio_rw(DeviceState *dev, unsigned fn, uint32_t addr,
++                           uint8_t val, bool write)
++{
++    BCM43341State *s = BCM43341(dev);
++
++    if (!s->powered) {
++        return 0;
++    }
++    switch (fn) {
++    case 0:
++        if (addr >= CCCR_BRCM_CARDCAP && addr <= CCCR_BRCM_SEPINT) {
++            if (write) {
++                BCM_TRACE(s, "cccr wr 0x%02x = 0x%02x", addr, val);
++                s->cccr_brcm[addr - CCCR_BRCM_CARDCAP] = val;
++                bcm_update_irq(s);
++            }
++            return s->cccr_brcm[addr - CCCR_BRCM_CARDCAP];
++        }
++        return 0;
++    case 1:
++        if (addr >= F1_REG_BASE) {
++            return bcm_f1_reg(s, addr, val, write);
++        }
++        bcm_bp_rw(s, bcm_f1_window(s) | (addr & F1_SB_OFT_MASK), &val, 1,
++                  write);
++        return val;
++    default:
++        return 0;
++    }
++}
++
++static void bcm_sdio_read_block(DeviceState *dev, unsigned fn, uint32_t addr,
++                                uint8_t *buf, unsigned len, bool incr)
++{
++    BCM43341State *s = BCM43341(dev);
++
++    if (!s->powered) {
++        memset(buf, 0, len);
++        return;
++    }
++    if (fn == 2) {
++        bcm_f2_read(s, buf, len);
++    } else if (fn == 1 && addr >= F1_REG_BASE) {
++        for (unsigned i = 0; i < len; i++) {
++            buf[i] = bcm_f1_reg(s, incr ? addr + i : addr, 0, false);
++        }
++    } else if (fn == 1) {
++        bcm_bp_rw(s, bcm_f1_window(s) | (addr & F1_SB_OFT_MASK), buf, len,
++                  false);
++    } else {
++        memset(buf, 0, len);
++    }
++}
++
++static void bcm_sdio_write_block(DeviceState *dev, unsigned fn, uint32_t addr,
++                                 const uint8_t *buf, unsigned len, bool incr)
++{
++    BCM43341State *s = BCM43341(dev);
++
++    if (!s->powered) {
++        return;
++    }
++    if (fn == 2) {
++        bcm_f2_write(s, buf, len);
++    } else if (fn == 1 && addr >= F1_REG_BASE) {
++        for (unsigned i = 0; i < len; i++) {
++            bcm_f1_reg(s, incr ? addr + i : addr, buf[i], true);
++        }
++    } else if (fn == 1) {
++        bcm_bp_rw(s, bcm_f1_window(s) | (addr & F1_SB_OFT_MASK),
++                  (uint8_t *)buf, len, true);
++    }
++}
++
++/* -- NIC ------------------------------------------------------------------ */
++
++static bool bcm_net_can_receive(NetClientState *nc)
++{
++    BCM43341State *s = qemu_get_nic_opaque(nc);
++
++    return s->fw_running && s->associated &&
++           g_queue_get_length(s->rxq) < BCM_RXQ_MAX;
++}
++
++static ssize_t bcm_net_receive(NetClientState *nc, const uint8_t *buf,
++                               size_t size)
++{
++    BCM43341State *s = qemu_get_nic_opaque(nc);
++
++    if (s->fw_running && s->associated && size >= 14 && size <= 1536) {
++        bcm_queue_bdc(s, SDPCM_DATA_CHANNEL, buf, size);
++    }
++    return size;
++}
++
++static NetClientInfo bcm_net_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = bcm_net_can_receive,
++    .receive = bcm_net_receive,
++};
++
++/* -- Device --------------------------------------------------------------- */
++
++/*
++ * The EROM, as ai_scan() parses it: per core a component descriptor pair,
++ * its register space as the first slave address descriptor of port 0, and
++ * one slave wrapper; then END.
++ */
++static void bcm_build_erom(BCM43341State *s)
++{
++    unsigned n = 0;
++
++    for (int i = 0; i < NUM_CORES; i++) {
++        /* CIA: Broadcom, core id; CIB: rev, 1 slave wrapper, 1 slave port */
++        s->erom[n++] = 0x4bfu << 20 | bcm_cores[i].id << 8 | 1;
++        s->erom[n++] = (uint32_t)bcm_cores[i].rev << 24 | 1 << 19 |
++                       1 << 9 | 1;
++        /* ASD: slave, port 0, 4 KiB */
++        s->erom[n++] = (SI_ENUM_BASE + i * SI_CORE_SIZE) | 0x5;
++        /* ASD: slave wrapper, port 0, 4 KiB */
++        s->erom[n++] = (SI_WRAP_BASE + i * SI_CORE_SIZE) | 0x80 | 0x5;
++    }
++    s->erom[n++] = 0xf;                         /* END */
++    assert(n <= BCM_EROM_WORDS);
++}
++
++static void bcm_chip_reset(BCM43341State *s)
++{
++    bcm_arm_stop(s);
++    memset(s->f1, 0, sizeof(s->f1));
++    memset(s->cccr_brcm, 0, sizeof(s->cccr_brcm));
++    /* The host assumes the window starts on the enumeration space. */
++    s->f1[F1_SBADDRHIGH - F1_REG_BASE] = SI_ENUM_BASE >> 24;
++    s->f1[F1_SLEEPCSR - F1_REG_BASE] = SLEEPCSR_KSO;
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->wrap, 0, sizeof(s->wrap));
++    for (int i = 0; i < NUM_CORES; i++) {
++        s->wrap[i][AI_IOCTRL / 4] = SICF_CLOCK_EN;
++    }
++    memset(s->ram, 0, BCM_RAM_SIZE);
++    s->ram_written = false;
++    s->intstatus = 0;
++    s->hostintmask = 0;
++    s->tohost_mbdata = 0;
++    s->host_seq_next = 0;
++    s->window = 0;
++    memcpy(s->mac, s->conf.macaddr.a, 6);
++    memset(s->eventmask, 0, sizeof(s->eventmask));
++    s->infra = 1;
++    s->auth = s->wsec = s->wpa_auth = s->pm = 0;
++    bcm_update_irq(s);
++}
++
++static void bcm_power(void *opaque, int n, int level)
++{
++    BCM43341State *s = opaque;
++
++    if (s->powered && !level) {
++        bcm_chip_reset(s);
++    }
++    s->powered = level;
++    bcm_update_irq(s);
++}
++
++static void bcm_system_reset(void *opaque)
++{
++    bcm_chip_reset(opaque);
++}
++
++static void bcm43341_realize(DeviceState *dev, Error **errp)
++{
++    BCM43341State *s = BCM43341(dev);
++
++    s->ram = g_malloc0(BCM_RAM_SIZE);
++    s->rxq = g_queue_new();
++    s->txbuf = g_byte_array_new();
++    s->scan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bcm_scan_done, s);
++    s->join_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bcm_join_done, s);
++    bcm_build_erom(s);
++
++    /* The AP's BSSID: locally administered, stable across boots. */
++    memcpy(s->bssid, "\x02\x43\x34\x10\x00\x01", 6);
++    qemu_macaddr_default_if_unset(&s->conf.macaddr);
++    s->nic = qemu_new_nic(&bcm_net_info, &s->conf, TYPE_BCM43341, dev->id,
++                          &dev->mem_reentrancy_guard, s);
++
++    qdev_init_gpio_in_named(dev, bcm_power, "power", 1);
++    qdev_init_gpio_out_named(dev, &s->host_wake, "host-wake", 1);
++    qdev_init_gpio_out_named(dev, &s->card_int, "card-int", 1);
++
++    /* Unconnected, WL_REG_ON is high. */
++    s->powered = true;
++    bcm_chip_reset(s);
++    /* The chip hangs off no bus, so qdev reset never reaches it. */
++    qemu_register_reset(bcm_system_reset, s);
++}
++
++static const Property bcm43341_props[] = {
++    DEFINE_PROP_STRING("ssid", BCM43341State, ssid),
++    DEFINE_PROP_UINT8("channel", BCM43341State, channel, 6),
++    DEFINE_PROP_BOOL("trace", BCM43341State, trace, false),
++    DEFINE_NIC_PROPERTIES(BCM43341State, conf),
++};
++
++static void bcm43341_instance_init(Object *obj)
++{
++    BCM43341State *s = BCM43341(obj);
++
++    s->ssid = g_strdup("QEMU");
++}
++
++static void bcm43341_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    SDIOFunctionClass *fc = SDIO_FUNCTION_CLASS(oc);
++
++    dc->desc = "Broadcom BCM43341 SDIO wifi chip";
++    dc->realize = bcm43341_realize;
++    device_class_set_props(dc, bcm43341_props);
++    /* Plugged next to an sdio-card by the machine, not on a bus. */
++    dc->user_creatable = false;
++
++    fc->rw = bcm_sdio_rw;
++    fc->read_block = bcm_sdio_read_block;
++    fc->write_block = bcm_sdio_write_block;
++}
++
++static const TypeInfo bcm43341_types[] = {
++    {
++        .name           = TYPE_BCM43341,
++        .parent         = TYPE_DEVICE,
++        .instance_size  = sizeof(BCM43341State),
++        .instance_init  = bcm43341_instance_init,
++        .class_init     = bcm43341_class_init,
++        .interfaces     = (const InterfaceInfo[]) {
++            { TYPE_SDIO_FUNCTION },
++            { }
++        },
++    },
++};
++
++DEFINE_TYPES(bcm43341_types)
+diff --git a/hw/net/meson.build b/hw/net/meson.build
+index 3102587..a8b280d 100644
+--- a/hw/net/meson.build
++++ b/hw/net/meson.build
+@@ -18,6 +18,7 @@ system_ss.add(when: 'CONFIG_VMXNET3_PCI', if_true: files('net_tx_pkt.c', 'net_rx
+ system_ss.add(when: 'CONFIG_VMXNET3_PCI', if_true: files('vmxnet3.c'))
+ 
+ system_ss.add(when: 'CONFIG_SMC91C111', if_true: files('smc91c111.c'))
++system_ss.add(when: 'CONFIG_BCM43341', if_true: files('bcm43341.c'))
+ system_ss.add(when: 'CONFIG_LAN9118', if_true: files('lan9118.c'))
+ system_ss.add(when: 'CONFIG_LAN9118_PHY', if_true: files('lan9118_phy.c'))
+ system_ss.add(when: 'CONFIG_NE2000_ISA', if_true: files('ne2000-isa.c'))
+diff --git a/include/hw/net/bcm43341.h b/include/hw/net/bcm43341.h
+new file mode 100644
+index 0000000..36bab98
+--- /dev/null
++++ b/include/hw/net/bcm43341.h
+@@ -0,0 +1,21 @@
++/*
++ * Broadcom BCM43341 SDIO wifi chip, as the bcmdhd driver sees it.
++ * See hw/net/bcm43341.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_NET_BCM43341_H
++#define HW_NET_BCM43341_H
++
++#include "qom/object.h"
++
++#define TYPE_BCM43341 "bcm43341"
++
++/*
++ * GPIO lines:
++ *   in  "power"      WL_REG_ON; low holds the chip in reset
++ *   out "host-wake"  the out-of-band interrupt (active high)
++ *   out "card-int"   the in-band SDIO interrupt, to the sdio-card
++ */
++
++#endif /* HW_NET_BCM43341_H */
+-- 
+2.55.0
+

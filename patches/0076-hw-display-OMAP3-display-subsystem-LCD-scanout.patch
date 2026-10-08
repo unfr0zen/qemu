@@ -1,0 +1,431 @@
+From bae9615d065e6c3b3928670b2b1c263628739238 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 76/91] hw/display: OMAP3 display subsystem, LCD scanout
+
+---
+ hw/display/omap3_dss.c | 412 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 412 insertions(+)
+ create mode 100644 hw/display/omap3_dss.c
+
+diff --git a/hw/display/omap3_dss.c b/hw/display/omap3_dss.c
+new file mode 100644
+index 0000000..a0ae250
+--- /dev/null
++++ b/hw/display/omap3_dss.c
+@@ -0,0 +1,412 @@
++/*
++ * OMAP3 display subsystem (DSS, DISPC, RFBI, VENC, DSI), parallel LCD out
++ *
++ * The display controller's LCD output with its graphics pipeline: while
++ * DISPC_CONTROL.LCDENABLE is set the panel refreshes at 60 Hz, each frame
++ * applying the shadowed registers (GOLCD clears) and raising VSYNC; turning
++ * the output off completes with FRAMEDONE. The graphics layer is scanned out
++ * from GFX_BA0 (GFX_SIZE, GFX_PIXEL_INC and GFX_ROW_INC as the hardware
++ * walks memory) onto the QEMU console, in RGB16, the unpacked and packed
++ * RGB24 and the 32-bit formats; the video pipelines, RFBI and VENC are
++ * register files. DSI is there for its probe: resets complete, its PLL
++ * locks and its power states follow their commands.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/display/omap3_dss.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "system/address-spaces.h"
++#include "ui/surface.h"
++
++#define DSS_SYSCONFIG           0x010
++#define DSS_SYSSTATUS           0x014
++#define DSS_IRQSTATUS           0x018
++
++#define DISPC_BASE              0x400
++#define DISPC_SYSCONFIG         0x010
++#define DISPC_SYSSTATUS         0x014
++#define DISPC_IRQSTATUS         0x018
++#define DISPC_IRQENABLE         0x01c
++#define DISPC_CONTROL           0x040
++#define DISPC_SIZE_LCD          0x07c
++#define DISPC_GFX_BA0           0x080
++#define DISPC_GFX_SIZE          0x08c
++#define DISPC_GFX_ATTRIBUTES    0x0a0
++#define DISPC_GFX_FIFO_SIZE     0x0a8
++#define DISPC_GFX_ROW_INC       0x0ac
++#define DISPC_GFX_PIXEL_INC     0x0b0
++
++#define CONTROL_LCDENABLE       (1 << 0)
++#define CONTROL_DIGITALENABLE   (1 << 1)
++#define CONTROL_GOLCD           (1 << 5)
++#define CONTROL_GODIGITAL       (1 << 6)
++
++#define IRQ_FRAMEDONE           (1 << 0)
++#define IRQ_VSYNC               (1 << 1)
++
++#define GFX_ENABLE              (1 << 0)
++#define GFX_FORMAT(a)           (((a) >> 1) & 0xf)
++
++#define DSI_SYSSTATUS           0x014
++#define DSI_COMPLEXIO_CFG1      0x048
++#define DSI_CLK_CTRL            0x054
++#define DSI_PLL_STATUS          0x304
++#define DSI_PLL_GO              0x308
++
++#define FRAME_NS                (NANOSECONDS_PER_SECOND / 60)
++#define MAX_DIM                 2048
++
++static void dss_update_irq(Omap3DssState *s)
++{
++    qemu_set_irq(s->irq, !!(s->dispc_irqstatus &
++                            s->dispc[DISPC_IRQENABLE / 4]));
++}
++
++static void dss_raise(Omap3DssState *s, uint32_t bits)
++{
++    s->dispc_irqstatus |= bits;
++    dss_update_irq(s);
++}
++
++static void dss_vsync(void *opaque)
++{
++    Omap3DssState *s = opaque;
++    uint32_t *control = &s->dispc[DISPC_CONTROL / 4];
++
++    if (!(*control & (CONTROL_LCDENABLE | CONTROL_DIGITALENABLE))) {
++        return;
++    }
++    *control &= ~(CONTROL_GOLCD | CONTROL_GODIGITAL);
++    dss_raise(s, IRQ_VSYNC);
++    timer_mod(s->vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + FRAME_NS);
++}
++
++/* One pixel of the graphics layer as x8r8g8b8. */
++static uint32_t dss_pixel(const uint8_t *p, int format)
++{
++    uint32_t v;
++
++    switch (format) {
++    case 0x4:                   /* RGB12 (xRGB4444) */
++        v = lduw_le_p(p);
++        return ((v >> 8) & 0xf) * 0x110000 | ((v >> 4) & 0xf) * 0x1100 |
++               (v & 0xf) * 0x11;
++    case 0x5:                   /* ARGB16 (ARGB4444) */
++        v = lduw_le_p(p);
++        return ((v >> 8) & 0xf) * 0x110000 | ((v >> 4) & 0xf) * 0x1100 |
++               (v & 0xf) * 0x11;
++    case 0x6:                   /* RGB16 (565) */
++        v = lduw_le_p(p);
++        return ((v >> 11) & 0x1f) << 19 | ((v >> 5) & 0x3f) << 10 |
++               (v & 0x1f) << 3;
++    case 0x9:                   /* RGB24 packed */
++        return p[2] << 16 | p[1] << 8 | p[0];
++    case 0xd:                   /* RGBA32 */
++        return ldl_le_p(p) >> 8;
++    default:                    /* 0x8 RGB24 unpacked, 0xc ARGB32, 0xe RGBx */
++        return ldl_le_p(p) & 0xffffff;
++    }
++}
++
++static int dss_bytes_per_pixel(int format)
++{
++    switch (format) {
++    case 0x4:
++    case 0x5:
++    case 0x6:
++        return 2;
++    case 0x9:
++        return 3;
++    case 0x8:
++    case 0xc:
++    case 0xd:
++    case 0xe:
++        return 4;
++    default:
++        return 0;               /* palette formats: not modelled */
++    }
++}
++
++static void dss_update_display(void *opaque)
++{
++    Omap3DssState *s = opaque;
++    uint32_t attr = s->dispc[DISPC_GFX_ATTRIBUTES / 4];
++    uint32_t size = s->dispc[DISPC_SIZE_LCD / 4];
++    uint32_t gsize = s->dispc[DISPC_GFX_SIZE / 4];
++    int width = (size & 0x7ff) + 1, height = ((size >> 16) & 0x7ff) + 1;
++    int gw = (gsize & 0x7ff) + 1, gh = ((gsize >> 16) & 0x7ff) + 1;
++    int format = GFX_FORMAT(attr), bpp = dss_bytes_per_pixel(format);
++    int32_t pixel_inc = s->dispc[DISPC_GFX_PIXEL_INC / 4];
++    int32_t row_inc = s->dispc[DISPC_GFX_ROW_INC / 4];
++    hwaddr addr = s->dispc[DISPC_GFX_BA0 / 4];
++    g_autofree uint8_t *line = NULL;
++    DisplaySurface *surface;
++    uint32_t *dst;
++
++    if (!(s->dispc[DISPC_CONTROL / 4] & CONTROL_LCDENABLE) ||
++        width > MAX_DIM || height > MAX_DIM) {
++        return;
++    }
++    qemu_console_resize(s->con, width, height);
++    surface = qemu_console_surface(s->con);
++    dst = surface_data(surface);
++    memset(dst, 0, (size_t)surface_stride(surface) * height);
++
++    if ((attr & GFX_ENABLE) && bpp && addr) {
++        /* PIXEL_INC/ROW_INC: 1 means contiguous; signed 16-bit / 32-bit */
++        int step = bpp + (int16_t)pixel_inc - 1;
++        size_t span = (size_t)(gw - 1) * step + bpp;
++
++        line = g_malloc(span);
++        for (int y = 0; y < MIN(gh, height); y++) {
++            uint32_t *row = (uint32_t *)((uint8_t *)dst +
++                                         y * surface_stride(surface));
++
++            address_space_read(&address_space_memory, addr,
++                               MEMTXATTRS_UNSPECIFIED, line, span);
++            for (int x = 0; x < MIN(gw, width); x++) {
++                row[x] = dss_pixel(line + x * step, format);
++            }
++            addr += span + row_inc - 1;
++        }
++    }
++    dpy_gfx_update(s->con, 0, 0, width, height);
++}
++
++static void dss_invalidate(void *opaque)
++{
++}
++
++static const GraphicHwOps dss_gfx_ops = {
++    .invalidate = dss_invalidate,
++    .gfx_update = dss_update_display,
++};
++
++static uint64_t dss_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3DssState *s = opaque;
++    hwaddr reg = addr & (OMAP3_DSS_BLOCK - 1);
++
++    switch (addr / OMAP3_DSS_BLOCK) {
++    case 0:                     /* DSS */
++        switch (reg) {
++        case 0x000:
++            return 0x20;        /* REVISION */
++        case DSS_SYSSTATUS:
++            return 1;           /* RESETDONE */
++        case DSS_IRQSTATUS:
++            return !!(s->dispc_irqstatus & s->dispc[DISPC_IRQENABLE / 4]);
++        }
++        return s->dss[reg / 4];
++    case 1:                     /* DISPC */
++        switch (reg) {
++        case 0x000:
++            return 0x30;        /* REVISION */
++        case DISPC_SYSSTATUS:
++            return 1;           /* RESETDONE */
++        case DISPC_IRQSTATUS:
++            return s->dispc_irqstatus;
++        case DISPC_GFX_FIFO_SIZE:
++            return 0x400;       /* 1024-byte graphics FIFO */
++        }
++        return s->dispc[reg / 4];
++    case 2:                     /* RFBI */
++        return reg == 0x014 ? 1 : s->rfbi[reg / 4];
++    default:                    /* VENC */
++        return s->venc[reg / 4];
++    }
++}
++
++static void dss_reset(DeviceState *dev)
++{
++    Omap3DssState *s = OMAP3_DSS(dev);
++
++    timer_del(s->vsync);
++    memset(s->dss, 0, sizeof(s->dss));
++    memset(s->dispc, 0, sizeof(s->dispc));
++    memset(s->rfbi, 0, sizeof(s->rfbi));
++    memset(s->venc, 0, sizeof(s->venc));
++    memset(s->dsi, 0, sizeof(s->dsi));
++    s->dispc[DISPC_GFX_PIXEL_INC / 4] = 1;
++    s->dispc[DISPC_GFX_ROW_INC / 4] = 1;
++    s->dispc_irqstatus = 0;
++    dss_update_irq(s);
++}
++
++static void dss_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3DssState *s = opaque;
++    hwaddr reg = addr & (OMAP3_DSS_BLOCK - 1);
++    uint32_t old;
++
++    switch (addr / OMAP3_DSS_BLOCK) {
++    case 0:
++        if (reg == DSS_SYSCONFIG && (val & 2)) {    /* SOFTRESET: all of DSS */
++            dss_reset(DEVICE(s));
++            return;
++        }
++        s->dss[reg / 4] = val;
++        return;
++    case 1:
++        switch (reg) {
++        case DISPC_SYSCONFIG:
++            if (val & 2) {
++                memset(s->dispc, 0, sizeof(s->dispc));
++                s->dispc[DISPC_GFX_PIXEL_INC / 4] = 1;
++                s->dispc[DISPC_GFX_ROW_INC / 4] = 1;
++                s->dispc_irqstatus = 0;
++                timer_del(s->vsync);
++                dss_update_irq(s);
++                return;
++            }
++            break;
++        case DISPC_IRQSTATUS:
++            s->dispc_irqstatus &= ~val;
++            dss_update_irq(s);
++            return;
++        case DISPC_IRQENABLE:
++            s->dispc[reg / 4] = val;
++            dss_update_irq(s);
++            return;
++        case DISPC_CONTROL:
++            old = s->dispc[reg / 4];
++            s->dispc[reg / 4] = val;
++            if ((val & (CONTROL_LCDENABLE | CONTROL_DIGITALENABLE)) &&
++                !timer_pending(s->vsync)) {
++                timer_mod(s->vsync,
++                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + FRAME_NS);
++            }
++            if ((old & CONTROL_LCDENABLE) && !(val & CONTROL_LCDENABLE)) {
++                dss_raise(s, IRQ_FRAMEDONE);    /* the last frame went out */
++            }
++            return;
++        }
++        s->dispc[reg / 4] = val;
++        return;
++    case 2:
++        s->rfbi[reg / 4] = val;
++        return;
++    default:
++        s->venc[reg / 4] = val;
++        return;
++    }
++}
++
++static const MemoryRegionOps dss_ops = {
++    .read = dss_read,
++    .write = dss_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static uint64_t dsi_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3DssState *s = opaque;
++    uint32_t v = s->dsi[addr / 4];
++
++    switch (addr) {
++    case 0x000:
++        return 0x10;            /* REVISION */
++    case DSI_SYSSTATUS:
++        return 1;               /* RESETDONE */
++    case DSI_COMPLEXIO_CFG1:
++        /* RESET_DONE; PWR_STATUS (26:25) follows PWR_CMD (28:27) */
++        return (v & ~(3 << 25)) | (1 << 29) | (((v >> 27) & 3) << 25);
++    case DSI_CLK_CTRL:
++        /* PLL_PWR_STATUS (29:28) follows PLL_PWR_CMD (31:30) */
++        return (v & ~(3 << 28)) | (((v >> 30) & 3) << 28);
++    case DSI_PLL_STATUS:
++        return 0x3;             /* reset done, locked */
++    case DSI_PLL_GO:
++        return 0;               /* applied */
++    }
++    return v;
++}
++
++static void dsi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3DssState *s = opaque;
++
++    s->dsi[addr / 4] = val;
++}
++
++static const MemoryRegionOps dsi_ops = {
++    .read = dsi_read,
++    .write = dsi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void dss_realize(DeviceState *dev, Error **errp)
++{
++    Omap3DssState *s = OMAP3_DSS(dev);
++
++    s->con = graphic_console_init(dev, 0, &dss_gfx_ops, s);
++}
++
++static void dss_init(Object *obj)
++{
++    Omap3DssState *s = OMAP3_DSS(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &dss_ops, s, "omap3-dss",
++                          4 * OMAP3_DSS_BLOCK);
++    memory_region_init_io(&s->dsi_iomem, obj, &dsi_ops, s, "omap3-dsi",
++                          OMAP3_DSS_BLOCK);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_mmio(sbd, &s->dsi_iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    s->vsync = timer_new_ns(QEMU_CLOCK_VIRTUAL, dss_vsync, s);
++}
++
++static const VMStateDescription dss_vmstate = {
++    .name = TYPE_OMAP3_DSS,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(vsync, Omap3DssState),
++        VMSTATE_UINT32_ARRAY(dss, Omap3DssState, OMAP3_DSS_BLOCK / 4),
++        VMSTATE_UINT32_ARRAY(dispc, Omap3DssState, OMAP3_DSS_BLOCK / 4),
++        VMSTATE_UINT32_ARRAY(rfbi, Omap3DssState, OMAP3_DSS_BLOCK / 4),
++        VMSTATE_UINT32_ARRAY(venc, Omap3DssState, OMAP3_DSS_BLOCK / 4),
++        VMSTATE_UINT32_ARRAY(dsi, Omap3DssState, OMAP3_DSS_BLOCK / 4),
++        VMSTATE_UINT32(dispc_irqstatus, Omap3DssState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void dss_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = dss_realize;
++    device_class_set_legacy_reset(dc, dss_reset);
++    dc->vmsd = &dss_vmstate;
++    dc->desc = "OMAP3 display subsystem";
++}
++
++static const TypeInfo dss_info = {
++    .name = TYPE_OMAP3_DSS,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3DssState),
++    .instance_init = dss_init,
++    .class_init = dss_class_init,
++};
++
++static void dss_register_types(void)
++{
++    type_register_static(&dss_info);
++}
++
++type_init(dss_register_types)
+-- 
+2.55.0
+

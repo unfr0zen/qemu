@@ -1,0 +1,365 @@
+From 95d267f1fd36dbd929db5f512ed165a25619ff7f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 18:04:44 -0400
+Subject: [PATCH 32/36] hw/misc: em35x-ncp, the flintstone's EM357 radio as a
+ chardev
+
+The Display-3.4 carries an EM357 802.15.4 NCP on ECSPI3 (fdt@4
+spidev_em35x), chip select on GPIO4_IO30, nRESET on GPIO2_IO00, nWAKE on
+GPIO2_IO05 and nHOST_INT into GPIO2_IO04 (em35x-gpios). Model the SPI
+slave and those lines, and put the other end on a chardev: MOSI bytes and
+line levels out, queued MISO bytes and nHOST_INT in, two bytes a message.
+With nothing queued the slave clocks 0xff, and with no model attached
+the radio reads as absent, as before.
+---
+ hw/arm/Kconfig              |   1 +
+ hw/arm/flintstone.c         |  29 +++++
+ hw/misc/Kconfig             |   4 +
+ hw/misc/em35x_ncp.c         | 219 ++++++++++++++++++++++++++++++++++++
+ hw/misc/meson.build         |   1 +
+ include/hw/misc/em35x_ncp.h |  18 +++
+ 6 files changed, 272 insertions(+)
+ create mode 100644 hw/misc/em35x_ncp.c
+ create mode 100644 include/hw/misc/em35x_ncp.h
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 70d54b0..8f7b631 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -205,6 +205,7 @@ config FLINTSTONE
+     select FSL_IMX6SX
+     select BCM43341
+     select LM3695
++    select EM35X_NCP
+ 
+ config STELLARIS
+     bool
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index bece530..3bca755 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -23,8 +23,10 @@
+ #include "hw/arm/flintstone_board.h"
+ #include "hw/i2c/i2c.h"
+ #include "hw/arm/fsl-imx6sx.h"
++#include "hw/misc/em35x_ncp.h"
+ #include "hw/net/bcm43341.h"
+ #include "hw/sd/sd.h"
++#include "hw/ssi/ssi.h"
+ #include "net/net.h"
+ #include "hw/arm/machines-qom.h"
+ #include "hw/core/irq.h"
+@@ -330,6 +332,32 @@ static void flintstone_init_wifi(DeviceState *soc, DeviceState *board)
+                                 qdev_get_gpio_in(gpio5, 15));
+ }
+ 
++/*
++ * The EM357 radio (fdt@4 "spidev_em35x" and "em35x-gpios"): on ECSPI3 with
++ * its chip select on GPIO4_IO30, nRESET on GPIO2_IO00, nWAKE on
++ * GPIO2_IO05, and nHOST_INT into GPIO2_IO04.
++ */
++static void flintstone_init_ncp(DeviceState *soc)
++{
++    DeviceState *spi3 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                              "spi3"));
++    DeviceState *gpio2 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio2"));
++    DeviceState *gpio4 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio4"));
++    DeviceState *ncp = qdev_new(TYPE_EM35X_NCP);
++
++    qdev_realize_and_unref(ncp, qdev_get_child_bus(spi3, "spi"), &error_fatal);
++    qdev_connect_gpio_out(gpio4, 30,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NSSEL, 0));
++    qdev_connect_gpio_out(gpio2, 0,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NRESET, 0));
++    qdev_connect_gpio_out(gpio2, 5,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NWAKE, 0));
++    qdev_connect_gpio_out_named(ncp, EM35X_NCP_NHOST_INT, 0,
++                                qdev_get_gpio_in(gpio2, 4));
++}
++
+ static void flintstone_init(MachineState *machine)
+ {
+     DeviceState *soc;
+@@ -402,6 +430,7 @@ static void flintstone_init(MachineState *machine)
+                           qdev_get_gpio_in(board,
+                                            FLINTSTONE_BOARD_IN_POWEROFF));
+     flintstone_init_wifi(soc, board);
++    flintstone_init_ncp(soc);
+     /* The panel backlight driver, i2c2 0x63 (the DT's lm3695@63). */
+     i2c_slave_create_simple(FSL_IMX6SX(soc)->i2c[1].bus, "lm3695", 0x63);
+     qdev_connect_gpio_out(gpio7, 2, qdev_get_gpio_in(hall_split, 0));
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index f4d4924..8c30b4c 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -263,3 +263,7 @@ config XLNX_VERSAL_TRNG
+     bool
+ 
+ source macio/Kconfig
++
++config EM35X_NCP
++    bool
++    depends on SSI
+diff --git a/hw/misc/em35x_ncp.c b/hw/misc/em35x_ncp.c
+new file mode 100644
+index 0000000..3cbc48e
+--- /dev/null
++++ b/hw/misc/em35x_ncp.c
+@@ -0,0 +1,219 @@
++/*
++ * Silicon Labs EM35x network co-processor, as a chardev.
++ *
++ * The Nest Display-3.4 carries an EM357 (802.15.4 / Thread radio) on
++ * ECSPI3, with its chip select on a GPIO and three more lines: nRESET and
++ * nWAKE from the SoC, nHOST_INT back to it. This device is the SPI slave
++ * and the other end of those lines; the chip's behaviour lives outside
++ * QEMU (qemu/ui/em35x.py), on a chardev:
++ *
++ *   QEMU -> model, two bytes each:
++ *     'd' byte   a byte the SoC clocked out while the chip was selected
++ *     's' level  nSSEL (0 = selected)
++ *     'r' level  nRESET (0 = held in reset)
++ *     'w' level  nWAKE (0 = wake request)
++ *   model -> QEMU, two bytes each:
++ *     'd' byte   queue a byte for the chip to clock back
++ *     'i' level  nHOST_INT (0 = the chip wants the host)
++ *     'f' 0      drop what's queued (the chip reset)
++ *
++ * Each byte the SoC clocks in while selected takes the next queued byte,
++ * or 0xff when none is: the EM35x SPI protocol's "nothing yet", which the
++ * host keeps clocking through until the chip's answer starts. With no
++ * model attached the chip reads as absent: 0xff, nHOST_INT high.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "chardev/char-fe.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/misc/em35x_ncp.h"
++#include "hw/ssi/ssi.h"
++#include "qemu/fifo8.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define EM35X_NCP_MISO_DEPTH    4096
++
++OBJECT_DECLARE_SIMPLE_TYPE(EM35xNcpState, EM35X_NCP)
++
++struct EM35xNcpState {
++    SSIPeripheral parent_obj;
++
++    CharFrontend chr;
++    qemu_irq nhost_int;
++    Fifo8 miso;
++    bool nssel, nreset, nwake;
++    uint8_t msg[2];             /* a message from the model, in progress */
++    int msg_len;
++};
++
++static void em35x_send(EM35xNcpState *s, char kind, uint8_t val)
++{
++    uint8_t msg[2] = { kind, val };
++
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_write_all(&s->chr, msg, sizeof(msg));
++    }
++}
++
++static uint32_t em35x_transfer(SSIPeripheral *dev, uint32_t val)
++{
++    EM35xNcpState *s = EM35X_NCP(dev);
++
++    /* The bus is shared by chip selects this device doesn't see. */
++    if (s->nssel) {
++        return 0xff;
++    }
++    em35x_send(s, 'd', val);
++    return fifo8_is_empty(&s->miso) ? 0xff : fifo8_pop(&s->miso);
++}
++
++static void em35x_line(void *opaque, char kind, bool *line, int level)
++{
++    EM35xNcpState *s = opaque;
++
++    if (*line != !!level) {
++        *line = !!level;
++        em35x_send(s, kind, *line);
++    }
++}
++
++static void em35x_nssel(void *opaque, int n, int level)
++{
++    EM35xNcpState *s = opaque;
++
++    em35x_line(s, 's', &s->nssel, level);
++}
++
++static void em35x_nreset(void *opaque, int n, int level)
++{
++    EM35xNcpState *s = opaque;
++
++    em35x_line(s, 'r', &s->nreset, level);
++}
++
++static void em35x_nwake(void *opaque, int n, int level)
++{
++    EM35xNcpState *s = opaque;
++
++    em35x_line(s, 'w', &s->nwake, level);
++}
++
++static void em35x_message(EM35xNcpState *s, uint8_t kind, uint8_t val)
++{
++    switch (kind) {
++    case 'd':
++        if (!fifo8_is_full(&s->miso)) {
++            fifo8_push(&s->miso, val);
++        }
++        break;
++    case 'i':
++        qemu_set_irq(s->nhost_int, val != 0);
++        break;
++    case 'f':
++        fifo8_reset(&s->miso);
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "em35x-ncp: bad message 0x%02x\n",
++                      kind);
++    }
++}
++
++static int em35x_chr_can_read(void *opaque)
++{
++    return 256;
++}
++
++static void em35x_chr_read(void *opaque, const uint8_t *buf, int size)
++{
++    EM35xNcpState *s = opaque;
++
++    for (int i = 0; i < size; i++) {
++        s->msg[s->msg_len++] = buf[i];
++        if (s->msg_len == sizeof(s->msg)) {
++            s->msg_len = 0;
++            em35x_message(s, s->msg[0], s->msg[1]);
++        }
++    }
++}
++
++static void em35x_chr_event(void *opaque, QEMUChrEvent event)
++{
++    EM35xNcpState *s = opaque;
++
++    switch (event) {
++    case CHR_EVENT_OPENED:
++        /* A new model: tell it where the lines stand. */
++        s->msg_len = 0;
++        em35x_send(s, 's', s->nssel);
++        em35x_send(s, 'r', s->nreset);
++        em35x_send(s, 'w', s->nwake);
++        break;
++    case CHR_EVENT_CLOSED:
++        /* The chip is gone with it. */
++        fifo8_reset(&s->miso);
++        qemu_set_irq(s->nhost_int, 1);
++        break;
++    default:
++        break;
++    }
++}
++
++static void em35x_realize(SSIPeripheral *dev, Error **errp)
++{
++    EM35xNcpState *s = EM35X_NCP(dev);
++
++    fifo8_create(&s->miso, EM35X_NCP_MISO_DEPTH);
++    qdev_init_gpio_in_named(DEVICE(dev), em35x_nssel, EM35X_NCP_NSSEL, 1);
++    qdev_init_gpio_in_named(DEVICE(dev), em35x_nreset, EM35X_NCP_NRESET, 1);
++    qdev_init_gpio_in_named(DEVICE(dev), em35x_nwake, EM35X_NCP_NWAKE, 1);
++    qdev_init_gpio_out_named(DEVICE(dev), &s->nhost_int, EM35X_NCP_NHOST_INT,
++                             1);
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_set_handlers(&s->chr, em35x_chr_can_read, em35x_chr_read,
++                                 em35x_chr_event, NULL, s, NULL, true);
++    }
++}
++
++static void em35x_reset(DeviceState *dev)
++{
++    EM35xNcpState *s = EM35X_NCP(dev);
++
++    fifo8_reset(&s->miso);
++    s->nssel = s->nreset = s->nwake = true;
++    qemu_set_irq(s->nhost_int, 1);
++}
++
++static const Property em35x_properties[] = {
++    DEFINE_PROP_CHR("chardev", EM35xNcpState, chr),
++};
++
++static void em35x_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(oc);
++
++    k->realize = em35x_realize;
++    k->transfer_raw = em35x_transfer;
++    device_class_set_legacy_reset(dc, em35x_reset);
++    device_class_set_props(dc, em35x_properties);
++    dc->desc = "Silicon Labs EM35x NCP (SPI and lines via chardev)";
++}
++
++static const TypeInfo em35x_info = {
++    .name = TYPE_EM35X_NCP,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(EM35xNcpState),
++    .class_init = em35x_class_init,
++};
++
++static void em35x_register_types(void)
++{
++    type_register_static(&em35x_info);
++}
++
++type_init(em35x_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 06bd282..c40767c 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -169,3 +169,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ 
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
++system_ss.add(when: 'CONFIG_EM35X_NCP', if_true: files('em35x_ncp.c'))
+diff --git a/include/hw/misc/em35x_ncp.h b/include/hw/misc/em35x_ncp.h
+new file mode 100644
+index 0000000..755e7f4
+--- /dev/null
++++ b/include/hw/misc/em35x_ncp.h
+@@ -0,0 +1,18 @@
++/*
++ * Silicon Labs EM35x network co-processor, as a chardev (SPI and its lines).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_EM35X_NCP_H
++#define HW_MISC_EM35X_NCP_H
++
++#define TYPE_EM35X_NCP "em35x-ncp"
++
++/* Named GPIO inputs (driven by the host SoC) and output (to it). */
++#define EM35X_NCP_NSSEL     "nssel"
++#define EM35X_NCP_NRESET    "nreset"
++#define EM35X_NCP_NWAKE     "nwake"
++#define EM35X_NCP_NHOST_INT "nhost-int"
++
++#endif
+-- 
+2.55.0
+

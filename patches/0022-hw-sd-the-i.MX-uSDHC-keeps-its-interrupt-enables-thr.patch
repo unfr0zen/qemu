@@ -1,0 +1,51 @@
+From 5bab5b1898273b0dbfda2e24faa109f8875d7549 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 13:16:51 -0400
+Subject: [PATCH 22/36] hw/sd: the i.MX uSDHC keeps its interrupt enables
+ through a reset-all
+
+The vendor kernels give every uSDHC MMC_CAP_HW_RESET, and each rescan
+runs esdhc_hw_reset() - a software reset for all - right before
+sdio_reset()'s CMD52, without writing the interrupt enables back (the
+other reset paths do, through esdhc_reset()). With the enables cleared
+that CMD52 never completes: "mmc1: Timeout waiting for hardware
+interrupt" and ten seconds lost before the card enumerates. On the
+flintstone that delay made dhd probe after /etc/init.d/wlan had looked
+for wlan0, which nlclient reports as a wifi fault.
+---
+ hw/sd/sdhci.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/hw/sd/sdhci.c b/hw/sd/sdhci.c
+index c52b4b4..7da01e5 100644
+--- a/hw/sd/sdhci.c
++++ b/hw/sd/sdhci.c
+@@ -1167,6 +1167,25 @@ static inline void sdhci_reset_write(SDHCIState *s, uint8_t value)
+ {
+     switch (value) {
+     case SDHC_RESET_ALL:
++        if (object_dynamic_cast(OBJECT(s), TYPE_IMX_USDHC)) {
++            /*
++             * The i.MX uSDHC keeps its interrupt enables through a
++             * software reset for all: the vendor kernels give every uSDHC
++             * MMC_CAP_HW_RESET, whose esdhc_hw_reset() resets all and
++             * sends the first command of a rescan without rewriting them.
++             */
++            uint16_t norintstsen = s->norintstsen;
++            uint16_t norintsigen = s->norintsigen;
++            uint16_t errintstsen = s->errintstsen;
++            uint16_t errintsigen = s->errintsigen;
++
++            sdhci_reset(s);
++            s->norintstsen = norintstsen;
++            s->norintsigen = norintsigen;
++            s->errintstsen = errintstsen;
++            s->errintsigen = errintsigen;
++            break;
++        }
+         sdhci_reset(s);
+         break;
+     case SDHC_RESET_CMD:
+-- 
+2.55.0
+

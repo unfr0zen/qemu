@@ -1,0 +1,1146 @@
+From 8d64adba397d715ad38a67dc816bb6ab7c6f6c3d Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 82/91] hw/net: a TI WL1271 SDIO wifi chip for the wl12xx
+ driver, with an access point
+
+---
+ hw/net/wl1271.c | 1126 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 1126 insertions(+)
+ create mode 100644 hw/net/wl1271.c
+
+diff --git a/hw/net/wl1271.c b/hw/net/wl1271.c
+new file mode 100644
+index 0000000..697f2ae
+--- /dev/null
++++ b/hw/net/wl1271.c
+@@ -0,0 +1,1126 @@
++/*
++ * TI WL1271 SDIO wifi chip, as the wl12xx driver sees it.
++ *
++ * This is not a radio. It is the chip the Nest gen 2's wl12xx.ko (TI
++ * OpenLink ol_R5.SP4.01) talks to, from the outside in, written from the
++ * public wl12xx source:
++ *
++ *   SDIO      function 2 carries everything. Its 128 KiB address space is
++ *             four windows onto the chip (memory, registers, and two more)
++ *             that the driver places through the partition registers at
++ *             0x1ffc0; function 0's 0x1fffc is the ELP (sleep) control.
++ *
++ *   Boot      the driver reads CHIP_ID_B and the top (OCP) registers,
++ *             uploads the firmware and the NVS into chip memory and
++ *             releases the CPU through ECPU_CONTROL. That release is when
++ *             this model "boots": it raises INIT_COMPLETE and points
++ *             SCR_PAD0/1 at its command and event mailboxes, the way the
++ *             real firmware does. The uploaded code is never run.
++ *
++ *   Commands  the driver writes a command into the command mailbox and
++ *             triggers INTR_TRIG_CMD; the model answers with a status (and
++ *             the data of an INTERROGATE) and CMD_COMPLETE. Events go to
++ *             two event mailboxes (EVENT_A/B), acked by INTR_TRIG_EVENT_ACK.
++ *
++ *   Data      the firmware status block (interrupt cause, RX descriptors,
++ *             TX accounting) is read at FW_STATUS_ADDR, its first word
++ *             through the clear-on-read interrupt register. Frames move
++ *             through WL1271_SLV_MEM_DATA: TX as descriptor + 802.11 frame
++ *             aggregates, RX as descriptor + 802.11 frame batches; TX
++ *             results land in a ring the memory map points at.
++ *
++ *   The air   one open access point (ssid property, default "QEMU",
++ *             channel 6) that answers the 802.11 frames mac80211 sends:
++ *             probe requests, authentication, association. Data frames go
++ *             to and from the NIC (-nic ...,model=wl1271) as Ethernet.
++ *
++ * The wl12xx driver does its own MAC (mac80211 builds and parses the
++ * frames), so the access point is the part a fullmac model would hide.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/sd/sd.h"
++#include "hw/net/wl1271.h"
++#include "net/net.h"
++#include "system/reset.h"
++
++OBJECT_DECLARE_SIMPLE_TYPE(WL1271State, WL1271)
++
++/* SDIO address space (function 2) */
++#define HW_PARTITION_REGISTERS_ADDR 0x1ffc0     /* 7 words, below */
++#define HW_ACCESS_ELP_CTRL_REG_ADDR 0x1fffc     /* function 0 */
++#define PART_REGS                   7
++
++#define ELPCTRL_WAKE_UP             0x1
++#define ELPCTRL_WLAN_READY          0x2
++
++/* Chip addresses */
++#define WL_MEM_SIZE                 0x80000
++#define REGISTERS_BASE              0x300000
++#define WL_REGS_SIZE                0x20000     /* registers and DRPW */
++
++#define ACX_REG_SLV_SOFT_RESET      (REGISTERS_BASE + 0x0000)
++#define WL1271_SLV_MEM_DATA         (REGISTERS_BASE + 0x0018)
++#define ACX_REG_INTERRUPT_TRIG      (REGISTERS_BASE + 0x0474)
++#define ACX_REG_INTERRUPT_MASK      (REGISTERS_BASE + 0x04dc)
++#define ACX_REG_HINT_MASK_SET       (REGISTERS_BASE + 0x04e0)
++#define ACX_REG_HINT_MASK_CLR       (REGISTERS_BASE + 0x04e4)
++#define ACX_REG_INTERRUPT_NO_CLEAR  (REGISTERS_BASE + 0x04e8)
++#define ACX_REG_INTERRUPT_ACK       (REGISTERS_BASE + 0x04f0)
++#define ACX_REG_INTERRUPT_CLEAR     (REGISTERS_BASE + 0x04f8)
++#define ACX_REG_ECPU_CONTROL        (REGISTERS_BASE + 0x0804)
++#define OCP_POR_CTR                 (REGISTERS_BASE + 0x09b4)
++#define OCP_DATA_WRITE              (REGISTERS_BASE + 0x09b8)
++#define OCP_DATA_READ               (REGISTERS_BASE + 0x09bc)
++#define OCP_CMD                     (REGISTERS_BASE + 0x09c0)
++#define CHIP_ID_B                   (REGISTERS_BASE + 0x5674)
++#define SCR_PAD0                    (REGISTERS_BASE + 0x5608)  /* cmd mbox */
++#define SCR_PAD1                    (REGISTERS_BASE + 0x560c)  /* event mbox */
++
++#define CHIP_ID_1271_PG20           0x04030111
++
++#define OCP_CMD_WRITE               0x1
++#define OCP_CMD_READ                0x2
++#define OCP_READY                   (1 << 18)
++#define OCP_STATUS_OK               0x10000
++
++/* Interrupt causes */
++#define INTR_INIT_COMPLETE          (1 << 1)
++#define INTR_EVENT_A                (1 << 2)
++#define INTR_EVENT_B                (1 << 3)
++#define INTR_CMD_COMPLETE           (1 << 4)
++#define INTR_DATA                   (1 << 6)
++
++#define INTR_TRIG_CMD               (1 << 0)
++#define INTR_TRIG_EVENT_ACK         (1 << 1)
++
++/*
++ * Where the firmware keeps things, all inside the working partition's
++ * memory window (0x40000, 0x14fc0 long). The firmware status block's tail
++ * sits where that partition's last window starts (0x40404).
++ */
++#define FW_STATUS_MEM               0x40404
++#define CMD_BOX                     0x41000
++#define CMD_BOX_SIZE                0x1000
++#define EVENT_BOX                   0x42000
++#define EVENT_MBOX_SIZE             64
++#define TX_RESULT                   0x42100     /* wl1271_tx_hw_res_if */
++#define PACKET_POOL                 0x50000
++
++#define WL_TX_BLOCKS                64
++#define WL_RX_BATCH_MAX             8192
++#define WL_RXQ_MAX                  64
++
++/* Commands */
++#define CMD_INTERROGATE             1
++#define CMD_SCAN                    7
++#define CMD_STOP_SCAN               8
++#define CMD_START_PERIODIC_SCAN     29
++#define CMD_STOP_PERIODIC_SCAN      30
++#define CMD_REMAIN_ON_CHANNEL       32
++#define CMD_REMOVE_PEER             38
++#define CMD_ROLE_ENABLE             39
++#define CMD_ROLE_START              41
++#define CMD_ROLE_STOP               42
++#define CMD_STATUS_SUCCESS          1
++
++#define ACX_MEM_MAP                 0x0004
++
++#define ROLE_STA                    0
++#define ROLE_DEVICE                 3
++#define MAX_ROLES                   6
++
++/* Events */
++#define SCAN_COMPLETE_EVENT_ID              (1u << 10)
++#define ROLE_STOP_COMPLETE_EVENT_ID         (1u << 15)
++#define PEER_REMOVE_COMPLETE_EVENT_ID       (1u << 27)
++#define PERIODIC_SCAN_REPORT_EVENT_ID       (1u << 29)
++#define REMAIN_ON_CHANNEL_COMPLETE_EVENT_ID (1u << 31)
++
++/* TX descriptor attributes */
++#define TX_HW_ATTR_TX_DUMMY_REQ     (1 << 13)
++
++/* Rates, as the driver's CONF_HW_RXTX_RATE_* */
++#define RATE_54                     9
++#define RATE_1                      21
++
++/* 802.11 */
++#define FC_ASSOC_REQ                0x00
++#define FC_ASSOC_RESP               0x10
++#define FC_REASSOC_REQ              0x20
++#define FC_REASSOC_RESP             0x30
++#define FC_PROBE_REQ                0x40
++#define FC_PROBE_RESP               0x50
++#define FC_BEACON                   0x80
++#define FC_DISASSOC                 0xa0
++#define FC_AUTH                     0xb0
++#define FC_DEAUTH                   0xc0
++#define FC_DATA                     0x08
++#define FC1_TODS                    0x01
++#define FC1_FROMDS                  0x02
++#define FC1_PROTECTED               0x40
++
++struct WL1271State {
++    DeviceState parent_obj;
++
++    NICConf conf;
++    NICState *nic;
++    char *ssid;
++    uint8_t channel;
++    bool trace;
++
++    qemu_irq irq;
++    bool powered;
++
++    uint8_t *mem;
++    uint32_t *regs;
++    uint32_t part[PART_REGS];
++    uint16_t top[0x1000];
++    uint32_t ocp_data;
++    uint8_t elp;
++    bool elp_asleep;
++    bool wake_irq;              /* ELP wake-up: the line until fw status */
++
++    bool running;
++    uint32_t intr;
++    uint32_t intr_mask;
++
++    /* events: two mailboxes, A and B */
++    uint32_t ev_pending;
++    bool ev_busy[2];
++    uint32_t ev_reported;       /* EVENT_A/B as the host last read them */
++
++    /* firmware status */
++    uint8_t fw_rx_counter;
++    uint32_t rx_descs[8];
++    uint32_t released_blks;
++    uint8_t released_pkts[4];
++    uint32_t tx_res_counter;
++
++    /* TX: what the host has written of an aggregate so far */
++    GByteArray *txbuf;
++
++    /* RX: frames waiting, and the batch the host is reading */
++    GQueue *rxq;
++    GByteArray *rxbuf;
++    unsigned rx_pos;
++
++    /* roles and the association */
++    uint8_t role_type[MAX_ROLES];
++    uint8_t mac[6];
++    bool joined;
++    uint8_t sta_hlid;
++    bool associated;
++    uint8_t sta[6];
++    uint8_t bssid[6];
++    uint16_t seq;
++
++    QEMUTimer *scan_timer;
++    int scan_kind;              /* 0 none, 1 one-shot, 2 periodic */
++    bool scan_found;
++    uint8_t scan_addr[6];
++};
++
++static void wl_trace(WL1271State *s, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
++static void wl_trace(WL1271State *s, const char *fmt, ...)
++{
++    va_list ap;
++
++    if (!s->trace) {
++        return;
++    }
++    va_start(ap, fmt);
++    fprintf(stderr, "wl1271: ");
++    vfprintf(stderr, fmt, ap);
++    fprintf(stderr, "\n");
++    va_end(ap);
++}
++
++static void wl_update_irq(WL1271State *s)
++{
++    qemu_set_irq(s->irq, s->powered &&
++                 ((s->intr & ~s->intr_mask) || s->wake_irq));
++}
++
++/* -- Firmware status ------------------------------------------------------ */
++
++/*
++ * The status block past its first word (the interrupt register), as
++ * struct wl12xx_fw_status lays it out from offset 4.
++ */
++static void wl_sync_status(WL1271State *s)
++{
++    uint8_t *p = s->mem + FW_STATUS_MEM;
++
++    memset(p, 0, 80);
++    p[0] = s->fw_rx_counter;
++    p[3] = s->tx_res_counter;
++    for (int i = 0; i < 8; i++) {
++        stl_le_p(p + 4 + 4 * i, s->rx_descs[i]);
++    }
++    stl_le_p(p + 36, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >> 10);
++    stl_le_p(p + 48, s->released_blks);
++    stl_le_p(p + 52, WL_TX_BLOCKS);
++    memcpy(p + 56, s->released_pkts, 4);
++}
++
++/* -- Events --------------------------------------------------------------- */
++
++static void wl_event_flush(WL1271State *s)
++{
++    for (int mb = 0; mb < 2 && s->ev_pending; mb++) {
++        uint8_t *m = s->mem + EVENT_BOX + mb * EVENT_MBOX_SIZE;
++
++        if (s->ev_busy[mb]) {
++            continue;
++        }
++        memset(m, 0, EVENT_MBOX_SIZE);
++        stl_le_p(m, s->ev_pending);
++        wl_trace(s, "event %c 0x%08x", 'A' + mb, s->ev_pending);
++        s->ev_pending = 0;
++        s->ev_busy[mb] = true;
++        s->intr |= mb ? INTR_EVENT_B : INTR_EVENT_A;
++    }
++    wl_update_irq(s);
++}
++
++static void wl_post_event(WL1271State *s, uint32_t ev)
++{
++    s->ev_pending |= ev;
++    wl_event_flush(s);
++}
++
++/*
++ * The host handles EVENT_A, then EVENT_B, of what it last read, acking
++ * each; an ack frees the mailbox it handled and clears its vector, so a
++ * later wait for the same event does not see this one.
++ */
++static void wl_event_ack(WL1271State *s)
++{
++    wl_trace(s, "event ack (busy %d%d reported 0x%x)", s->ev_busy[0],
++             s->ev_busy[1], s->ev_reported);
++    for (int mb = 0; mb < 2; mb++) {
++        uint32_t bit = mb ? INTR_EVENT_B : INTR_EVENT_A;
++
++        if (s->ev_busy[mb] && (s->ev_reported & bit)) {
++            s->ev_reported &= ~bit;
++            s->ev_busy[mb] = false;
++            stl_le_p(s->mem + EVENT_BOX + mb * EVENT_MBOX_SIZE, 0);
++            wl_event_flush(s);
++            return;
++        }
++    }
++    for (int mb = 0; mb < 2; mb++) {
++        if (s->ev_busy[mb]) {
++            s->ev_busy[mb] = false;
++            stl_le_p(s->mem + EVENT_BOX + mb * EVENT_MBOX_SIZE, 0);
++            break;
++        }
++    }
++    wl_event_flush(s);
++}
++
++/* -- RX ------------------------------------------------------------------- */
++
++/* Post the next batch once the host has read the last one. */
++static void wl_rx_kick(WL1271State *s)
++{
++    unsigned n = 0;
++
++    if (s->rx_pos < s->rxbuf->len) {
++        return;
++    }
++    g_byte_array_set_size(s->rxbuf, 0);
++    s->rx_pos = 0;
++    while (n < 8 && !g_queue_is_empty(s->rxq)) {
++        GByteArray *f = g_queue_peek_head(s->rxq);
++
++        if (s->rxbuf->len + f->len > WL_RX_BATCH_MAX) {
++            break;
++        }
++        g_queue_pop_head(s->rxq);
++        g_byte_array_append(s->rxbuf, f->data, f->len);
++        /* buffer size, in bytes, in bits 8..19 as size << 6 */
++        s->rx_descs[s->fw_rx_counter & 7] = (f->len << 6) & 0xfff00;
++        s->fw_rx_counter++;
++        g_byte_array_unref(f);
++        n++;
++    }
++    if (n) {
++        s->intr |= INTR_DATA;
++        wl_sync_status(s);
++        wl_update_irq(s);
++    }
++    if (s->nic && g_queue_get_length(s->rxq) < WL_RXQ_MAX) {
++        qemu_flush_queued_packets(qemu_get_queue(s->nic));
++    }
++}
++
++/* One 802.11 frame to the host, behind its wl1271_rx_descriptor. */
++static void wl_rx_frame(WL1271State *s, const uint8_t *frame, unsigned len,
++                        uint8_t rate)
++{
++    unsigned total = ROUND_UP(16 + len, 4);
++    GByteArray *f;
++    uint8_t d[16] = { 0 };
++
++    if (!s->running || g_queue_get_length(s->rxq) >= WL_RXQ_MAX) {
++        return;
++    }
++    stw_le_p(d, total >> 2);
++    d[2] = 0;                           /* status: success */
++    d[3] = 0;                           /* band: 2.4 GHz, no encryption */
++    d[4] = rate;
++    d[5] = s->channel;
++    d[6] = (uint8_t)-40;                /* rssi */
++    d[7] = 40;                          /* snr */
++    stl_le_p(d + 8, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL));
++    d[12] = 0;                          /* packet class */
++    d[13] = s->sta_hlid;
++    d[14] = total - 16 - len;           /* pad */
++
++    f = g_byte_array_sized_new(total);
++    g_byte_array_append(f, d, 16);
++    g_byte_array_append(f, frame, len);
++    g_byte_array_set_size(f, total);
++    memset(f->data + 16 + len, 0, total - 16 - len);
++    g_queue_push_tail(s->rxq, f);
++    wl_rx_kick(s);
++}
++
++static void wl_rx_read(WL1271State *s, uint8_t *buf, unsigned len)
++{
++    unsigned n = MIN(len, s->rxbuf->len - s->rx_pos);
++
++    memcpy(buf, s->rxbuf->data + s->rx_pos, n);
++    memset(buf + n, 0, len - n);
++    s->rx_pos += n;
++    wl_rx_kick(s);
++}
++
++/* -- The access point ----------------------------------------------------- */
++
++static const uint8_t wl_bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++
++static unsigned wl_hdr(WL1271State *s, uint8_t *f, uint8_t fc0, uint8_t fc1,
++                       const uint8_t *a1, const uint8_t *a3)
++{
++    f[0] = fc0;
++    f[1] = fc1;
++    stw_le_p(f + 2, 0);
++    memcpy(f + 4, a1, 6);
++    memcpy(f + 10, s->bssid, 6);
++    memcpy(f + 16, a3, 6);
++    stw_le_p(f + 22, (s->seq++ & 0xfff) << 4);
++    return 24;
++}
++
++static unsigned wl_rates_ies(uint8_t *p)
++{
++    static const uint8_t rates[] = {
++        1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24,
++        50, 4, 0x30, 0x48, 0x60, 0x6c,
++    };
++
++    memcpy(p, rates, sizeof(rates));
++    return sizeof(rates);
++}
++
++/* A beacon or a probe response from the access point. */
++static void wl_send_bss(WL1271State *s, const uint8_t *da, bool beacon)
++{
++    uint8_t f[256];
++    unsigned n = wl_hdr(s, f, beacon ? FC_BEACON : FC_PROBE_RESP, 0, da,
++                        s->bssid);
++    size_t ssid_len = MIN(strlen(s->ssid), 32);
++
++    stq_le_p(f + n, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL));
++    stw_le_p(f + n + 8, 100);                   /* beacon interval, TU */
++    stw_le_p(f + n + 10, 0x0401);               /* ESS, short slot */
++    n += 12;
++    f[n++] = 0;                                 /* SSID */
++    f[n++] = ssid_len;
++    memcpy(f + n, s->ssid, ssid_len);
++    n += ssid_len;
++    n += wl_rates_ies(f + n);
++    f[n++] = 3;                                 /* DS parameter set */
++    f[n++] = 1;
++    f[n++] = s->channel;
++    if (beacon) {
++        f[n++] = 5;                             /* TIM: DTIM 1, nothing */
++        f[n++] = 4;
++        f[n++] = 0;
++        f[n++] = 1;
++        f[n++] = 0;
++        f[n++] = 0;
++    }
++    wl_rx_frame(s, f, n, RATE_1);
++}
++
++static bool wl_ssid_matches(WL1271State *s, const uint8_t *ies, int len)
++{
++    while (len >= 2 && 2 + ies[1] <= len) {
++        if (ies[0] == 0) {
++            return ies[1] == 0 || (ies[1] == strlen(s->ssid) &&
++                                   !memcmp(ies + 2, s->ssid, ies[1]));
++        }
++        len -= 2 + ies[1];
++        ies += 2 + ies[1];
++    }
++    return true;
++}
++
++static void wl_ap_mgmt(WL1271State *s, const uint8_t *f, unsigned len)
++{
++    const uint8_t *sa = f + 10;
++    uint8_t r[128];
++    unsigned n;
++
++    switch (f[0] & 0xf0) {
++    case FC_PROBE_REQ:
++        if (wl_ssid_matches(s, f + 24, len - 24)) {
++            wl_send_bss(s, sa, false);
++        }
++        break;
++    case FC_AUTH:
++        if (memcmp(f + 4, s->bssid, 6) || len < 30) {
++            break;
++        }
++        wl_trace(s, "auth from " MAC_FMT, MAC_ARG(sa));
++        n = wl_hdr(s, r, FC_AUTH, 0, sa, s->bssid);
++        stw_le_p(r + n, 0);                     /* open system */
++        stw_le_p(r + n + 2, lduw_le_p(f + 26) + 1);
++        stw_le_p(r + n + 4, 0);                 /* success */
++        wl_rx_frame(s, r, n + 6, RATE_1);
++        break;
++    case FC_ASSOC_REQ:
++    case FC_REASSOC_REQ:
++        if (memcmp(f + 4, s->bssid, 6)) {
++            break;
++        }
++        wl_trace(s, "assoc from " MAC_FMT, MAC_ARG(sa));
++        n = wl_hdr(s, r, (f[0] & 0xf0) == FC_ASSOC_REQ ? FC_ASSOC_RESP
++                                                        : FC_REASSOC_RESP,
++                   0, sa, s->bssid);
++        stw_le_p(r + n, 0x0401);
++        stw_le_p(r + n + 2, 0);                 /* success */
++        stw_le_p(r + n + 4, 0xc001);            /* AID 1 */
++        n += 6;
++        n += wl_rates_ies(r + n);
++        memcpy(s->sta, sa, 6);
++        s->associated = true;
++        wl_rx_frame(s, r, n, RATE_1);
++        wl_send_bss(s, wl_bcast, true);
++        break;
++    case FC_DEAUTH:
++    case FC_DISASSOC:
++        wl_trace(s, "%s from " MAC_FMT,
++                 (f[0] & 0xf0) == FC_DEAUTH ? "deauth" : "disassoc",
++                 MAC_ARG(sa));
++        s->associated = false;
++        break;
++    }
++}
++
++/* A to-DS data frame: its LLC/SNAP payload goes out as Ethernet. */
++static void wl_ap_data(WL1271State *s, const uint8_t *f, unsigned len)
++{
++    unsigned hdr = (f[0] & 0x80) ? 26 : 24;     /* QoS control */
++    uint8_t eth[1600];
++    unsigned plen;
++
++    if (!s->associated || !(f[1] & FC1_TODS) || (f[1] & FC1_PROTECTED) ||
++        (f[0] & 0x40) || len < hdr + 8) {       /* null function */
++        return;
++    }
++    if (memcmp(f + hdr, "\xaa\xaa\x03\x00\x00\x00", 6) &&
++        memcmp(f + hdr, "\xaa\xaa\x03\x00\x00\xf8", 6)) {
++        return;
++    }
++    plen = len - hdr - 8;
++    if (14 + plen > sizeof(eth)) {
++        return;
++    }
++    memcpy(eth, f + 16, 6);                     /* DA */
++    memcpy(eth + 6, f + 10, 6);                 /* SA */
++    memcpy(eth + 12, f + hdr + 6, 2);           /* ethertype */
++    memcpy(eth + 14, f + hdr + 8, plen);
++    if (s->nic) {
++        qemu_send_packet(qemu_get_queue(s->nic), eth, 14 + plen);
++    }
++}
++
++static void wl_ap_frame(WL1271State *s, const uint8_t *f, unsigned len)
++{
++    if (len < 24) {
++        return;
++    }
++    switch (f[0] & 0x0c) {
++    case 0x00:
++        wl_ap_mgmt(s, f, len);
++        break;
++    case FC_DATA:
++        wl_ap_data(s, f, len);
++        break;
++    }
++}
++
++/* -- TX ------------------------------------------------------------------- */
++
++static int wl_tid_to_ac(uint8_t tid)
++{
++    static const uint8_t ac[8] = { 0, 1, 1, 0, 2, 2, 3, 3 };
++
++    return ac[tid & 7];
++}
++
++/*
++ * Aggregates of [wl1271_tx_hw_descr][802.11 frame], each padded to a
++ * word: each frame goes on the air, its result into the result ring. The
++ * host writes an aggregate in as many SDIO transfers as it takes (whole
++ * blocks, then the rest), so a frame is taken once all of it is in.
++ */
++static void wl_tx(WL1271State *s, const uint8_t *data, unsigned len)
++{
++    const uint8_t *buf;
++    unsigned off = 0, n = 0;
++
++    g_byte_array_append(s->txbuf, data, len);
++    buf = s->txbuf->data;
++    len = s->txbuf->len;
++    while (off + 16 <= len) {
++        const uint8_t *d = buf + off;
++        unsigned total = lduw_le_p(d) * 4;
++        uint16_t attr = lduw_le_p(d + 10);
++        unsigned pad = (attr >> 10) & 3;
++        uint8_t *res;
++
++        if (total < 16 + pad) {
++            off = len;                          /* not a descriptor: drop */
++            break;
++        }
++        if (off + total > len) {
++            break;                              /* the rest is to come */
++        }
++        if (!(attr & TX_HW_ATTR_TX_DUMMY_REQ)) {
++            wl_ap_frame(s, d + 16, total - 16 - pad);
++        }
++        res = s->mem + TX_RESULT + 8 + (s->tx_res_counter & 15) * 16;
++        memset(res, 0, 16);
++        res[0] = d[12];                         /* id */
++        res[1] = 0;                             /* TX_SUCCESS */
++        res[14] = RATE_54;
++        s->tx_res_counter++;
++        s->released_blks += d[3];               /* total_mem_blocks */
++        s->released_pkts[wl_tid_to_ac(d[13])]++;
++        off += total;
++        n++;
++    }
++    g_byte_array_remove_range(s->txbuf, 0, off);
++    if (n) {
++        stl_le_p(s->mem + TX_RESULT, s->tx_res_counter);
++        s->intr |= INTR_DATA;
++        wl_sync_status(s);
++        wl_update_irq(s);
++    }
++}
++
++/* -- Commands ------------------------------------------------------------- */
++
++static void wl_scan_done(void *opaque)
++{
++    WL1271State *s = opaque;
++    int kind = s->scan_kind;
++
++    s->scan_kind = 0;
++    if (kind == 1) {
++        if (s->scan_found) {
++            wl_send_bss(s, s->scan_addr, false);
++        }
++        wl_post_event(s, SCAN_COMPLETE_EVENT_ID);
++    } else if (kind == 2) {
++        wl_send_bss(s, s->scan_addr, false);
++        wl_post_event(s, PERIODIC_SCAN_REPORT_EVENT_ID);
++    }
++}
++
++static void wl_interrogate(WL1271State *s, uint8_t *c)
++{
++    uint16_t id = lduw_le_p(c + 4);
++    unsigned len = MIN(lduw_le_p(c + 6), CMD_BOX_SIZE - 8);
++
++    memset(c + 8, 0, len);
++    if (id == ACX_MEM_MAP && len >= 80) {
++        stl_le_p(c + 40, TX_RESULT);            /* tx_result */
++        stl_le_p(c + 44, TX_RESULT + 8);        /* tx_result_queue_start */
++        stl_le_p(c + 56, PACKET_POOL);          /* packet_memory_pool */
++        stl_le_p(c + 60, PACKET_POOL + 0x8000);
++        stl_le_p(c + 80, WL_TX_BLOCKS);         /* num_tx_mem_blocks */
++        stl_le_p(c + 84, WL_TX_BLOCKS);         /* num_rx_mem_blocks */
++    }
++}
++
++static void wl_command(WL1271State *s)
++{
++    uint8_t *c = s->mem + CMD_BOX;
++    uint16_t id = lduw_le_p(c);
++    uint8_t role = c[4];
++
++    wl_trace(s, "cmd %u", id);
++    switch (id) {
++    case CMD_INTERROGATE:
++        wl_interrogate(s, c);
++        break;
++    case CMD_SCAN:
++        /* basic_scan_params at 4, 24 channel entries of 20 at 52 */
++        s->scan_found = false;
++        for (unsigned i = 0; i < MIN(c[7], 24); i++) {
++            if (c[52 + 20 * i + 16] == s->channel && c[48] == 0) {
++                s->scan_found = true;
++            }
++        }
++        memcpy(s->scan_addr, c + 52 + 24 * 20, 6);
++        wl_trace(s, "scan: %u channels, band %u, found %d", c[7], c[48],
++                 s->scan_found);
++        s->scan_kind = 1;
++        timer_mod(s->scan_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 30);
++        break;
++    case CMD_START_PERIODIC_SCAN:
++        memcpy(s->scan_addr, s->mac, 6);
++        s->scan_kind = 2;
++        timer_mod(s->scan_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 30);
++        break;
++    case CMD_STOP_SCAN:
++    case CMD_STOP_PERIODIC_SCAN:
++        s->scan_kind = 0;
++        timer_del(s->scan_timer);
++        break;
++    case CMD_ROLE_ENABLE:
++        if (role < MAX_ROLES) {
++            s->role_type[role] = c[5];
++            if (c[5] == ROLE_STA) {
++                memcpy(s->mac, c + 6, 6);
++            }
++        }
++        break;
++    case CMD_ROLE_START:
++        if (role < MAX_ROLES && s->role_type[role] == ROLE_STA) {
++            s->joined = true;
++            s->sta_hlid = c[14];
++            wl_trace(s, "join " MAC_FMT, MAC_ARG(c + 8));
++            if (!memcmp(c + 8, s->bssid, 6)) {
++                wl_send_bss(s, wl_bcast, true);
++            }
++        }
++        break;
++    case CMD_ROLE_STOP:
++        if (role < MAX_ROLES && s->role_type[role] == ROLE_STA) {
++            s->joined = false;
++            s->associated = false;
++        }
++        wl_post_event(s, ROLE_STOP_COMPLETE_EVENT_ID);
++        break;
++    case CMD_REMAIN_ON_CHANNEL:
++        wl_post_event(s, REMAIN_ON_CHANNEL_COMPLETE_EVENT_ID);
++        break;
++    case CMD_REMOVE_PEER:
++        wl_post_event(s, PEER_REMOVE_COMPLETE_EVENT_ID);
++        break;
++    }
++    stw_le_p(c + 2, CMD_STATUS_SUCCESS);
++    s->intr |= INTR_CMD_COMPLETE;
++    wl_update_irq(s);
++}
++
++/* The CPU released: what the firmware would have set up by now. */
++static void wl_fw_start(WL1271State *s)
++{
++    uint8_t *sd = s->mem + CMD_BOX;
++    /* what the unit's own WL1271 reports with wl127x-fw-4-sr.bin */
++    static const char version[] = "Rev 4.0.0.0.4";
++
++    s->running = true;
++    s->regs[(SCR_PAD0 - REGISTERS_BASE) / 4] = CMD_BOX;
++    s->regs[(SCR_PAD1 - REGISTERS_BASE) / 4] = EVENT_BOX;
++    /* wl1271_static_data: mac, padding, fw_version[20], hw_version */
++    memset(sd, 0, 64);
++    memcpy(sd, s->conf.macaddr.a, 6);
++    memcpy(sd + 8, version, sizeof(version));
++    stl_le_p(sd + 28, CHIP_ID_1271_PG20);
++    wl_sync_status(s);
++    s->intr |= INTR_INIT_COMPLETE;
++    wl_update_irq(s);
++}
++
++/* -- Registers ------------------------------------------------------------ */
++
++static bool wl_is_reg(uint32_t a)
++{
++    return a >= REGISTERS_BASE && a < REGISTERS_BASE + WL_REGS_SIZE;
++}
++
++static uint32_t wl_reg_read(WL1271State *s, uint32_t a)
++{
++    uint32_t v;
++
++    switch (a) {
++    case ACX_REG_SLV_SOFT_RESET:
++        return 0;                               /* self-clearing */
++    case ACX_REG_INTERRUPT_NO_CLEAR:
++        return s->intr;
++    case ACX_REG_INTERRUPT_CLEAR:
++        /* the first word of the firmware status block */
++        v = s->intr;
++        wl_trace(s, "status 0x%x (mask 0x%x)", v, s->intr_mask);
++        s->ev_reported = v & (INTR_EVENT_A | INTR_EVENT_B);
++        s->intr &= s->intr_mask;
++        s->wake_irq = false;
++        wl_sync_status(s);
++        wl_update_irq(s);
++        return v;
++    case ACX_REG_INTERRUPT_MASK:
++        return s->intr_mask;
++    case CHIP_ID_B:
++        return CHIP_ID_1271_PG20;
++    case OCP_DATA_READ:
++        return s->ocp_data;
++    }
++    return s->regs[(a - REGISTERS_BASE) / 4];
++}
++
++static void wl_reg_write(WL1271State *s, uint32_t a, uint32_t v)
++{
++    unsigned top;
++
++    switch (a) {
++    case ACX_REG_INTERRUPT_TRIG:
++        if (v & INTR_TRIG_CMD) {
++            wl_command(s);
++        }
++        if (v & INTR_TRIG_EVENT_ACK) {
++            wl_event_ack(s);
++        }
++        return;
++    case ACX_REG_INTERRUPT_MASK:
++        s->intr_mask = v;
++        wl_update_irq(s);
++        return;
++    case ACX_REG_HINT_MASK_SET:
++        s->intr_mask |= v;
++        wl_update_irq(s);
++        return;
++    case ACX_REG_HINT_MASK_CLR:
++        s->intr_mask &= ~v;
++        wl_update_irq(s);
++        return;
++    case ACX_REG_INTERRUPT_ACK:
++        s->intr &= ~v;
++        wl_update_irq(s);
++        return;
++    case ACX_REG_ECPU_CONTROL:
++        s->regs[(a - REGISTERS_BASE) / 4] = v;
++        if (!s->running) {
++            wl_fw_start(s);
++        }
++        return;
++    case OCP_CMD:
++        /* OCP_POR_CTR holds the top register's address / 2 + 0x30000 */
++        top = (s->regs[(OCP_POR_CTR - REGISTERS_BASE) / 4] - 0x30000) &
++              (ARRAY_SIZE(s->top) - 1);
++        if (v == OCP_CMD_WRITE) {
++            s->top[top] = s->regs[(OCP_DATA_WRITE - REGISTERS_BASE) / 4];
++        } else if (v == OCP_CMD_READ) {
++            s->ocp_data = s->top[top] | OCP_READY | OCP_STATUS_OK;
++        }
++        return;
++    }
++    s->regs[(a - REGISTERS_BASE) / 4] = v;
++}
++
++/* -- The SDIO address space ----------------------------------------------- */
++
++static uint32_t wl_translate(WL1271State *s, uint32_t phys)
++{
++    for (int w = 0; w < 3; w++) {
++        uint32_t size = s->part[2 * w];
++
++        if (phys < size) {
++            return s->part[2 * w + 1] + phys;
++        }
++        phys -= size;
++    }
++    return s->part[6] + phys;
++}
++
++static void wl_access(WL1271State *s, uint32_t phys, uint8_t *buf,
++                      unsigned len, bool write, bool incr)
++{
++    if (phys >= HW_PARTITION_REGISTERS_ADDR) {
++        for (unsigned i = 0; i + 4 <= len; i += 4) {
++            unsigned idx = ((incr ? phys + i : phys) -
++                            HW_PARTITION_REGISTERS_ADDR) / 4;
++
++            if (idx >= PART_REGS) {
++                continue;
++            }
++            if (write) {
++                s->part[idx] = ldl_le_p(buf + i);
++            } else {
++                stl_le_p(buf + i, s->part[idx]);
++            }
++        }
++        return;
++    }
++    if (wl_translate(s, phys) == WL1271_SLV_MEM_DATA) {
++        if (write) {
++            wl_tx(s, buf, len);
++        } else {
++            wl_rx_read(s, buf, len);
++        }
++        return;
++    }
++    for (unsigned i = 0; i < len; i += 4) {
++        uint32_t a = wl_translate(s, incr ? phys + i : phys);
++        unsigned n = MIN(4, len - i);
++        uint8_t w[4] = { 0 };
++
++        if (wl_is_reg(a)) {
++            if (write) {
++                memcpy(w, buf + i, n);
++                wl_reg_write(s, a & ~3, ldl_le_p(w));
++            } else {
++                stl_le_p(w, wl_reg_read(s, a & ~3));
++                memcpy(buf + i, w, n);
++            }
++        } else if (a < WL_MEM_SIZE) {
++            n = MIN(n, WL_MEM_SIZE - a);
++            if (write) {
++                memcpy(s->mem + a, buf + i, n);
++            } else {
++                memcpy(buf + i, s->mem + a, n);
++            }
++        } else if (!write) {
++            memset(buf + i, 0, n);
++        }
++    }
++}
++
++static uint8_t wl_sdio_rw(DeviceState *dev, unsigned fn, uint32_t addr,
++                          uint8_t val, bool write)
++{
++    WL1271State *s = WL1271(dev);
++
++    if (fn == 0) {
++        if (addr != HW_ACCESS_ELP_CTRL_REG_ADDR) {
++            return 0;
++        }
++        if (!write) {
++            return (s->elp_asleep ? 0 : ELPCTRL_WLAN_READY) |
++                   (s->elp & ELPCTRL_WAKE_UP);
++        }
++        s->elp = val;
++        if (val & ELPCTRL_WAKE_UP) {
++            /* coming out of ELP, the chip says so on its interrupt line */
++            if (s->elp_asleep) {
++                wl_trace(s, "elp wake");
++                s->elp_asleep = false;
++                s->wake_irq = true;
++                wl_update_irq(s);
++            }
++        } else if (!s->elp_asleep) {
++            wl_trace(s, "elp sleep");
++            s->elp_asleep = true;
++        }
++        return val;
++    }
++    wl_access(s, addr, &val, 1, write, true);
++    return val;
++}
++
++static void wl_sdio_read_block(DeviceState *dev, unsigned fn, uint32_t addr,
++                               uint8_t *buf, unsigned len, bool incr)
++{
++    if (fn == 2) {
++        wl_access(WL1271(dev), addr, buf, len, false, incr);
++    } else {
++        memset(buf, 0, len);
++    }
++}
++
++static void wl_sdio_write_block(DeviceState *dev, unsigned fn, uint32_t addr,
++                                const uint8_t *buf, unsigned len, bool incr)
++{
++    if (fn == 2) {
++        wl_access(WL1271(dev), addr, (uint8_t *)buf, len, true, incr);
++    }
++}
++
++/* -- NIC ------------------------------------------------------------------ */
++
++static bool wl_net_can_receive(NetClientState *nc)
++{
++    WL1271State *s = qemu_get_nic_opaque(nc);
++
++    return s->running && s->associated &&
++           g_queue_get_length(s->rxq) < WL_RXQ_MAX;
++}
++
++/* An Ethernet frame for the station: a from-DS data frame. */
++static ssize_t wl_net_receive(NetClientState *nc, const uint8_t *buf,
++                              size_t size)
++{
++    WL1271State *s = qemu_get_nic_opaque(nc);
++    uint8_t f[1600];
++    unsigned n;
++
++    if (!s->running || !s->associated || size < 14 ||
++        size - 14 + 32 > sizeof(f) ||
++        (!(buf[0] & 1) && memcmp(buf, s->sta, 6))) {
++        return size;
++    }
++    n = wl_hdr(s, f, FC_DATA, FC1_FROMDS, buf, buf + 6);
++    memcpy(f + n, "\xaa\xaa\x03\x00\x00\x00", 6);
++    memcpy(f + n + 6, buf + 12, 2);
++    memcpy(f + n + 8, buf + 14, size - 14);
++    wl_rx_frame(s, f, n + 8 + size - 14, RATE_54);
++    return size;
++}
++
++static NetClientInfo wl_net_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = wl_net_can_receive,
++    .receive = wl_net_receive,
++};
++
++/* -- Device --------------------------------------------------------------- */
++
++static void wl_chip_reset(WL1271State *s)
++{
++    timer_del(s->scan_timer);
++    s->scan_kind = 0;
++    memset(s->mem, 0, WL_MEM_SIZE);
++    memset(s->regs, 0, WL_REGS_SIZE);
++    memset(s->part, 0, sizeof(s->part));
++    memset(s->top, 0, sizeof(s->top));
++    s->ocp_data = 0;
++    s->elp = 0;
++    s->elp_asleep = false;
++    s->wake_irq = false;
++    s->running = false;
++    s->intr = 0;
++    s->intr_mask = 0xffffffff;
++    s->ev_pending = 0;
++    s->ev_busy[0] = s->ev_busy[1] = false;
++    s->ev_reported = 0;
++    s->fw_rx_counter = 0;
++    memset(s->rx_descs, 0, sizeof(s->rx_descs));
++    s->released_blks = 0;
++    memset(s->released_pkts, 0, sizeof(s->released_pkts));
++    s->tx_res_counter = 0;
++    g_byte_array_set_size(s->txbuf, 0);
++    g_queue_clear_full(s->rxq, (GDestroyNotify)g_byte_array_unref);
++    g_byte_array_set_size(s->rxbuf, 0);
++    s->rx_pos = 0;
++    memset(s->role_type, 0xff, sizeof(s->role_type));
++    s->joined = false;
++    s->associated = false;
++    s->sta_hlid = 0;
++    wl_update_irq(s);
++}
++
++static void wl_power(void *opaque, int n, int level)
++{
++    WL1271State *s = opaque;
++
++    if (s->powered && !level) {
++        wl_chip_reset(s);
++    }
++    s->powered = level;
++    wl_update_irq(s);
++}
++
++static void wl_system_reset(void *opaque)
++{
++    wl_chip_reset(opaque);
++}
++
++static void wl1271_realize(DeviceState *dev, Error **errp)
++{
++    WL1271State *s = WL1271(dev);
++
++    s->mem = g_malloc0(WL_MEM_SIZE);
++    s->regs = g_malloc0(WL_REGS_SIZE);
++    s->txbuf = g_byte_array_new();
++    s->rxq = g_queue_new();
++    s->rxbuf = g_byte_array_new();
++    s->scan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, wl_scan_done, s);
++
++    /* The AP's BSSID: locally administered, stable across boots. */
++    memcpy(s->bssid, "\x02\x12\x71\x10\x00\x01", 6);
++    qemu_macaddr_default_if_unset(&s->conf.macaddr);
++    s->nic = qemu_new_nic(&wl_net_info, &s->conf, TYPE_WL1271, dev->id,
++                          &dev->mem_reentrancy_guard, s);
++
++    qdev_init_gpio_in_named(dev, wl_power, "power", 1);
++    qdev_init_gpio_out_named(dev, &s->irq, "irq", 1);
++
++    /* Unconnected, WLAN_EN is high. */
++    s->powered = true;
++    wl_chip_reset(s);
++    /* The chip hangs off no bus, so qdev reset never reaches it. */
++    qemu_register_reset(wl_system_reset, s);
++}
++
++static const Property wl1271_props[] = {
++    DEFINE_PROP_STRING("ssid", WL1271State, ssid),
++    DEFINE_PROP_UINT8("channel", WL1271State, channel, 6),
++    DEFINE_PROP_BOOL("trace", WL1271State, trace, false),
++    DEFINE_NIC_PROPERTIES(WL1271State, conf),
++};
++
++static void wl1271_instance_init(Object *obj)
++{
++    WL1271State *s = WL1271(obj);
++
++    s->ssid = g_strdup("QEMU");
++}
++
++static void wl1271_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    SDIOFunctionClass *fc = SDIO_FUNCTION_CLASS(oc);
++
++    dc->desc = "TI WL1271 SDIO wifi chip";
++    dc->realize = wl1271_realize;
++    device_class_set_props(dc, wl1271_props);
++    /* Plugged next to an sdio-card by the machine, not on a bus. */
++    dc->user_creatable = false;
++
++    fc->rw = wl_sdio_rw;
++    fc->read_block = wl_sdio_read_block;
++    fc->write_block = wl_sdio_write_block;
++}
++
++static const TypeInfo wl1271_types[] = {
++    {
++        .name           = TYPE_WL1271,
++        .parent         = TYPE_DEVICE,
++        .instance_size  = sizeof(WL1271State),
++        .instance_init  = wl1271_instance_init,
++        .class_init     = wl1271_class_init,
++        .interfaces     = (const InterfaceInfo[]) {
++            { TYPE_SDIO_FUNCTION },
++            { }
++        },
++    },
++};
++
++DEFINE_TYPES(wl1271_types)
+-- 
+2.55.0
+
