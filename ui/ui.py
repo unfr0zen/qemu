@@ -507,6 +507,8 @@ def make_handler(board, log, screen, qmp, pins, name):
                                json.dumps({"position": pos}).encode())
             elif self.path == "/events":
                 self.events()
+            elif self.path == "/stream":
+                self.stream()
             elif self.path == "/screen":
                 self.screen_stream()
             elif self.path == "/logs":
@@ -566,6 +568,49 @@ def make_handler(board, log, screen, qmp, pins, name):
                 self.send_body(204, "text/plain", b"")
             else:
                 self.send_body(404, "text/plain", b"not found\n")
+
+        def stream(self):
+            """Board, display and console share one browser connection."""
+            self.start_events()
+            states = board.subscribe()
+            frames, frame = screen.subscribe()
+            chunks, chunk = log.subscribe_raw() if log else (None, "")
+            try:
+                state = board.snapshot()
+                heartbeat = time.monotonic()
+                while True:
+                    while not states.empty():
+                        item = states.get_nowait()
+                        if "tone" in item:
+                            self.wfile.write(("event: tone\ndata: " +
+                                              json.dumps(item["tone"]) + "\n\n").encode())
+                        else:
+                            state = item
+                    if state is not None:
+                        self.wfile.write(f"data: {json.dumps(state)}\n\n".encode())
+                        state = None
+                    if frame:
+                        self.wfile.write(f"event: frame\ndata: {frame}\n\n".encode())
+                    if chunks is not None:
+                        while not chunks.empty():
+                            chunk += chunks.get_nowait()
+                    if chunk:
+                        self.wfile.write(f"event: console\ndata: {json.dumps(chunk)}\n\n".encode())
+                        chunk = ""
+                    if time.monotonic() - heartbeat >= 15:
+                        self.wfile.write(b": keep-alive\n\n")
+                        heartbeat = time.monotonic()
+                    self.wfile.flush()
+                    frame, fps = frames.get(timeout=0.02)
+                    if fps is not None:
+                        self.wfile.write(f"event: fps\ndata: {fps}\n\n".encode())
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                board.unsubscribe(states)
+                screen.unsubscribe(frames)
+                if chunks is not None:
+                    log.unsubscribe_raw(chunks)
 
         def events(self):
             self.start_events()

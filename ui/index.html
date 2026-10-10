@@ -320,15 +320,13 @@
   let painted = 0;
   $("screen").addEventListener("load", () => { painted++; });
   setInterval(() => { $("fpsPage").textContent = painted; painted = 0; }, 1000);
-  function openScreen() {
-    const es = new EventSource("/screen");
-    es.onmessage = (e) => {
+  function openScreen(es) {
+    es.addEventListener("frame", (e) => {
       if (!gotFrame) { gotFrame = true; $("screen").style.display = ""; }
       placeScreen(e.data);
       $("screen").setAttribute("href", "data:image/png;base64," + e.data);
-    };
+    });
     es.addEventListener("fps", (e) => { $("fpsDevice").textContent = e.data; });
-    es.onerror = () => { es.close(); setTimeout(openScreen, 3000); };
   }
 
   /* ---------- console: the guest's serial, as a terminal ---------- */
@@ -352,19 +350,16 @@
     flushKeys();
   }
   term.onData((d) => { keys += d; flushKeys(); });
-  function openLogs() {
-    const es = new EventSource("/console/raw");
+  function openLogs(es) {
     let got = false;
-    es.onopen = () => { $("logState").textContent = "live"; };
-    es.onmessage = (e) => {
+    es.addEventListener("open", () => { got = false; $("logState").textContent = "live"; });
+    es.addEventListener("console", (e) => {
       if (!got) { got = true; term.reset(); }     // the backlog comes first
       term.write(JSON.parse(e.data));
-    };
-    es.onerror = () => {
-      es.close();
+    });
+    es.addEventListener("error", () => {
       $("logState").textContent = "waiting for the device…";
-      setTimeout(openLogs, 3000);
-    };
+    });
   }
 
   /* ---------- board lines ---------- */
@@ -575,12 +570,13 @@
     }
     pinMap = cfg.pins;
     buildPins();
-    const ev = new EventSource("/events");
+    // One stream per tab leaves HTTP connections available for wheel input.
+    const ev = new EventSource("/stream");
     ev.onmessage = (e) => render(JSON.parse(e.data));
     ev.addEventListener("tone", (e) => onTone(JSON.parse(e.data)));
     ev.onerror = () => render({ linked: false, pins: last.pins });
-    openLogs();
-    openScreen();
+    openLogs(ev);
+    openScreen(ev);
     pollWheel();
     setInterval(pollWheel, 3000);
   });
