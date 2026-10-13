@@ -41,6 +41,7 @@ import sys
 import termios
 import threading
 import time
+import urllib.parse
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -187,6 +188,8 @@ class ConsoleLog:
         self.lines = []
         self.listeners = []
         self.raw = ""
+        self.total = 0          # characters ever received: raw ends here
+        self.arrived = threading.Condition(self.lock)
         self.raw_listeners = []
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.sock = None
@@ -211,6 +214,22 @@ class ConsoleLog:
     def unsubscribe(self, q):
         with self.lock:
             self.listeners.remove(q)
+
+    def read(self, since=None, wait=0.0):
+        """
+        The console text after offset `since` (characters since this
+        process started), waiting up to `wait` s for some to arrive. No
+        `since`, or one from before a restart, reads the whole replay
+        buffer. Returns (start, end, text); start > since means the text
+        in between has already scrolled out of the buffer.
+        """
+        with self.arrived:
+            if since is None or since > self.total:
+                since = self.total - len(self.raw)
+            self.arrived.wait_for(lambda: self.total > since, wait)
+            first = self.total - len(self.raw)
+            start = max(since, first)
+            return start, self.total, self.raw[start - first:]
 
     def send(self, text):
         data = text.encode() if isinstance(text, str) else text
@@ -259,6 +278,8 @@ class ConsoleLog:
             return
         with self.lock:
             self.raw = (self.raw + text)[-self.KEEP_RAW:]
+            self.total += len(text)
+            self.arrived.notify_all()
             for q in self.raw_listeners:
                 q.put(text)
 
@@ -350,6 +371,12 @@ class Screen:
     def unsubscribe(self, q):
         with self.lock:
             self.listeners.remove(q)
+
+    def latest(self):
+        """The newest frame as PNG bytes, or None before the first."""
+        with self.lock:
+            frame = self.frame
+        return base64.b64decode(frame) if frame else None
 
     def grab(self):
         r = self.qmp.execute("screendump",
@@ -511,6 +538,19 @@ def make_handler(board, log, screen, qmp, pins, name):
                 self.stream()
             elif self.path == "/screen":
                 self.screen_stream()
+            elif self.path == "/screen.png":
+                png = screen.latest()
+                if png:
+                    self.send_body(200, "image/png", png)
+                else:
+                    self.send_body(503, "text/plain", b"no frame yet\n")
+            elif self.path == "/state":
+                state = board.snapshot()
+                state.update(wiring=pins, name=name,
+                             wheel=qmp.wheel_position() if qmp else None)
+                self.send_body(200, "application/json", json.dumps(state).encode())
+            elif self.path.startswith("/console/read"):
+                self.console_read()
             elif self.path == "/logs":
                 self.logs()
             elif self.path == "/console/raw":
@@ -566,6 +606,22 @@ def make_handler(board, log, screen, qmp, pins, name):
                 n = int(self.headers.get("Content-Length") or 0)
                 log.send(self.rfile.read(n).decode(errors="replace"))
                 self.send_body(204, "text/plain", b"")
+            elif self.path == "/qmp":
+                # {"execute": ..., "arguments": {...}}, passed to QEMU as is.
+                if not qmp:
+                    self.send_body(503, "text/plain", b"no QMP\n")
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    want = json.loads(self.rfile.read(n) or b"{}")
+                except ValueError:
+                    want = None
+                if not isinstance(want, dict) or \
+                        not isinstance(want.get("execute"), str):
+                    self.send_body(400, "text/plain", b"bad command\n")
+                    return
+                r = qmp.execute(want["execute"], want.get("arguments"))
+                self.send_body(200, "application/json", json.dumps(r).encode())
             else:
                 self.send_body(404, "text/plain", b"not found\n")
 
@@ -682,6 +738,24 @@ def make_handler(board, log, screen, qmp, pins, name):
                 return
             with open(path, "rb") as f:
                 self.send_body(200, "font/ttf", f.read())
+
+        def console_read(self):
+            """The console from an offset: JSON {start, end, text}.
+            ?since=N reads on from N (end of the last read), waiting up
+            to ?wait=S seconds for something new."""
+            if not log:
+                self.send_body(503, "text/plain", b"no console\n")
+                return
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                since = int(q["since"][0]) if "since" in q else None
+                wait = min(max(float(q.get("wait", ["0"])[0]), 0.0), 30.0)
+            except ValueError:
+                self.send_body(400, "text/plain", b"bad since or wait\n")
+                return
+            start, end, text = log.read(since, wait)
+            body = json.dumps({"start": start, "end": end, "text": text})
+            self.send_body(200, "application/json", body.encode())
 
         def console_raw(self):
             """The console as the terminal sees it: JSON text chunks, SSE."""

@@ -10,7 +10,9 @@ QEMU machines for two Nest Learning Thermostats that boot each unit's
 
 Both boot to `login:` and run the Nest UI, with the display, ring, button,
 piezo, backplate, WiFi and Thread radio modelled. `--ui` serves the unit as
-a web page.
+a web page, and an MCP server (`ui/mcp_server.py`, registered in
+`.mcp.json`) lets an agent see the screen, record it, press, turn, and use
+the console and filesystem ([docs/qemu.md](docs/qemu.md#driving-it-from-an-agent-mcp)).
 
 Not affiliated with Google or Nest. The stock firmware is theirs, and none
 of it ships in this repo: you supply your own image (below).
@@ -116,7 +118,7 @@ Docker backend or forbidden UI listener fails before provisioning.
 | `qemu-src/` | the QEMU clone `setup.sh` makes and patches (git-ignored) |
 | `run.sh`, `setup.sh` | boot, build |
 | `provision.py`, `skip-setup.py`, `j49_env.py` | the pre-boot, and its helpers |
-| `ui/` | the web page, and the backplate MCU and Thread radio played on the host |
+| `ui/` | the web page, its MCP server for agents, and the backplate MCU and Thread radio played on the host |
 | `docker/` | the build image (its tag is the Dockerfile's hash: editing it means a new image) |
 | `.qemu/` | NAND working copies and per-run scratch (git-ignored) |
 
