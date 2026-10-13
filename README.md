@@ -10,7 +10,9 @@ QEMU machines for two Nest Learning Thermostats that boot each unit's
 
 Both boot to `login:` and run the Nest UI, with the display, ring, button,
 piezo, backplate, WiFi and Thread radio modelled. `--ui` serves the unit as
-a web page.
+a web page, and an MCP server lets an agent see the screen, record it,
+press, turn, and use the console and filesystem
+([below](#driving-it-from-an-agent-mcp)).
 
 Not affiliated with Google or Nest. The stock firmware is theirs, and none
 of it ships in this repo: you supply your own image (below).
@@ -97,6 +99,62 @@ Native builds are now preferred when both native and Docker builds exist.
 `QEMU_BUILD_DIR=build-docker` selects Docker explicitly; an unavailable
 Docker backend or forbidden UI listener fails before provisioning.
 
+## Driving it from an agent (MCP)
+
+`ui/mcp_server.py` is an MCP server (stdio, standard library only) that
+gives an agent the unit: screenshots and recordings, the button and ring,
+input sequences, the console, files in and out, and QMP. The tools are
+listed in [docs/qemu.md](docs/qemu.md#driving-it-from-an-agent-mcp).
+
+1. Start the unit with the page, and with ssh for fast file transfer
+   (without it files go over the console, about 60 KB/s):
+
+   ```sh
+   ./run.sh --ui --ssh 2222
+   ```
+
+2. Register the server with your agent.
+
+   **Claude Code** in this repo: nothing to do, `.mcp.json` declares it
+   as `nest`. Approve it when `claude` asks (or under `/mcp`).
+   Elsewhere, or for every project:
+
+   ```sh
+   claude mcp add --scope user nest -- python3 /path/to/nest-qemu/ui/mcp_server.py
+   ```
+
+   **Any other MCP client** (Claude Desktop, Cursor, ...): a stdio server,
+   with an absolute path since these do not start in the repo:
+
+   ```json
+   {
+     "mcpServers": {
+       "nest": {
+         "command": "python3",
+         "args": ["/path/to/nest-qemu/ui/mcp_server.py"]
+       }
+     }
+   }
+   ```
+
+   **Codex** (`~/.codex/config.toml`):
+
+   ```toml
+   [mcp_servers.nest]
+   command = "python3"
+   args = ["/path/to/nest-qemu/ui/mcp_server.py"]
+   ```
+
+3. Ask the agent to call `status`: it names the unit's page and any other
+   units running.
+
+The server finds the unit on its own: the newest `run.sh --ui` running on
+the host, whatever port it got, and the next one when that one stops. To
+pin one, pass `--url http://127.0.0.1:PORT` in `args` or set
+`NEST_UI_URL`. A unit has to be started from a checkout that includes the
+server (its `ui.py` serves the endpoints the server uses). Recordings need
+`ffmpeg` on `PATH` (without it the frames are kept as PNGs).
+
 ## Docs
 
 - [docs/qemu.md](docs/qemu.md): the gen 3, with options, NAND state, the
@@ -116,7 +174,7 @@ Docker backend or forbidden UI listener fails before provisioning.
 | `qemu-src/` | the QEMU clone `setup.sh` makes and patches (git-ignored) |
 | `run.sh`, `setup.sh` | boot, build |
 | `provision.py`, `skip-setup.py`, `j49_env.py` | the pre-boot, and its helpers |
-| `ui/` | the web page, and the backplate MCU and Thread radio played on the host |
+| `ui/` | the web page, its MCP server for agents, and the backplate MCU and Thread radio played on the host |
 | `docker/` | the build image (its tag is the Dockerfile's hash: editing it means a new image) |
 | `.qemu/` | NAND working copies and per-run scratch (git-ignored) |
 

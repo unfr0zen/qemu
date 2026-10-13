@@ -171,6 +171,52 @@ across a restart of the script. Its docstring lists the commands and
 replies; `--debug` logs the stream. Without `--ui` no chip is attached and
 the firmware sees the radio as absent.
 
+### Driving it from an agent (MCP)
+
+`ui/mcp_server.py` is an MCP server (stdio, standard library only) over
+the page's HTTP API, so an agent can use the unit the way a person at the
+page does. `.mcp.json` registers it for Claude Code as `nest` (other agents:
+[README](../README.md#driving-it-from-an-agent-mcp)). It talks to the newest
+unit running on the host, found from `ps` (each `ui.py` has its `--port`
+on its command line), and looks again when that unit stops answering;
+`--url` or `NEST_UI_URL` pins one.
+
+| Tool | What |
+| --- | --- |
+| `status` | QEMU up or not, the board lines, the wheel, the console's last lines |
+| `screenshot` | the screen now, upright as the glass shows it (480×480 on the gen 3); `settle_ms` waits for an animation to end |
+| `capture_frames` | up to 32 screenshots at an interval, in one result |
+| `record_start`, `record_stop` | every frame the unit shows, to an MP4 (`.qemu/recordings/` by default, ffmpeg; PNG frames without it), with a few frames back as images |
+| `press_button`, `turn_wheel` | the glass (held for `hold_ms`), the ring (by detents) |
+| `input_sequence` | presses, holds, turns, waits, console keystrokes and screenshots in order, optionally recorded |
+| `console_exec` | one shell command line: its output and exit status. Logs in as `root` / `nest` when the console is at `login:`; Ctrl-C on timeout |
+| `console_send`, `console_read`, `console_wait` | raw keystrokes (interactive programs, U-Boot), output after a cursor, waiting for a regex |
+| `pull_file`, `push_file` | files out of and into the guest: over ssh when the unit runs with `--ssh PORT` (about 3 MB/s), else over the console, md5-checked (about 60 KB/s in, 130 KB/s out). An upload lands as `PATH.mcp-part` and is moved into place |
+| `qmp` | any QMP command: `system_reset`, `stop`/`cont`, `human-monitor-command` |
+
+`console_exec` sends `echo <start>; command eval '<line>'; echo <end>$?`
+with markers the shell computes, so neither the echo of the line nor a
+redirect failing on a read-only root confuses where the output starts and
+ends. Files go in 2 KiB batches, each read by its own `head` with echo
+off: the tty's input buffer holds 4 KiB and asks for XOFF, which QEMU's
+serial does not heed. The root filesystem is read-only until
+`mount -o remount,rw /`.
+
+The ssh port is the one QEMU forwards to the guest's 22 (`info usernet`),
+so nothing needs configuring. The guest's sshd offers only `ssh-rsa` host
+keys (re-enabled for these connections) and has no `sftp-server`, so a
+file goes as `cat` over a plain session rather than `scp`. The password
+comes from `SSH_ASKPASS`, no `sshpass` needed. `via: console` forces the
+console; `auto` falls back to it when ssh fails. Over the console a file
+is base64 (`openssl base64` on the gen 3, whose busybox has none), or
+`od`/`printf` without either.
+
+The API the server uses, beside what the page uses: `GET /screen.png`
+(the newest frame), `GET /state` (lines, wiring, wheel),
+`GET /console/read?since=N&wait=S` (the console text after offset `N`,
+waiting up to `S` s for some; a `start` past `N` means the text in between
+has left the replay buffer) and `POST /qmp`.
+
 ## WiFi and network
 
 A BCM43341 sits behind an SDIO card on usdhc2. The stock `dhd.ko`

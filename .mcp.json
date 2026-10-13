@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nest": {
+      "command": "python3",
+      "args": ["ui/mcp_server.py"]
+    }
+  }
+}
