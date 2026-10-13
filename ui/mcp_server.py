@@ -14,6 +14,9 @@ PATH, and kept as PNG frames when it is not):
 
     mcp_server.py [--url http://127.0.0.1:8075]
 
+Without --url (or NEST_UI_URL) it talks to the newest unit running on
+this host, and looks again when that one goes.
+
 .mcp.json at the repo root registers it for Claude Code.
 """
 import argparse
@@ -45,7 +48,8 @@ REPO = os.path.dirname(HERE)
 RECORDINGS = os.path.join(REPO, ".qemu", "recordings")
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
-base_url = "http://127.0.0.1:8075"
+base_url = None             # --url / NEST_UI_URL; None finds the unit
+found_url = None            # the unit found, until it stops answering
 
 
 class ToolError(Exception):
@@ -54,21 +58,67 @@ class ToolError(Exception):
 
 # ---------------------------------------------------------------- HTTP
 
+def running_units():
+    """The pages of the units running on this host, newest first. run.sh
+    --ui gives each ui.py the first free port from 8075 (or --ui-port),
+    so the port is read off its command line."""
+    try:
+        ps = subprocess.run(["ps", "-ax", "-o", "etime=,args="], capture_output=True,
+                            text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    units = []
+    for line in ps.splitlines():
+        etime, _, args = line.strip().partition(" ")
+        if not re.search(r"/ui\.py(\s|$)", args):
+            continue
+        m = re.search(r"--port[= ](\d+)", args)
+        # etime is [[dd-]hh:]mm:ss
+        days, _, hms = etime.rpartition("-")
+        age = int(days or 0) * 86400
+        for part in hms.split(":"):
+            age = age * 60 + int(part) if part.isdigit() else age
+        units.append((age, f"http://127.0.0.1:{m.group(1) if m else 8075}"))
+    return [url for _, url in sorted(units)]
+
+
+def unit_url(fresh=False):
+    """The page to talk to: the one given, else the newest unit running."""
+    global found_url
+    if base_url:
+        return base_url
+    if fresh or not found_url:
+        units = running_units()
+        found_url = units[0] if units else None
+    if not found_url:
+        raise ToolError("no unit running: start one with ./run.sh --ui "
+                        "(or pass --url / set NEST_UI_URL)")
+    return found_url
+
+
 def request(method, path, body=None, timeout=10):
     """One request to ui.py: returns (status, content-type, bytes)."""
     data = None
     if body is not None:
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
-    req = urllib.request.Request(base_url + path, data=data, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.headers.get("Content-Type", ""), r.read()
-    except urllib.error.HTTPError as e:
-        msg = e.read().decode(errors="replace").strip()
-        raise ToolError(f"{method} {path}: HTTP {e.code} {msg}") from None
-    except (urllib.error.URLError, OSError) as e:
-        raise ToolError(f"no UI at {base_url} ({e}): start the unit with "
-                        "./run.sh --ui, or pass --url / set NEST_UI_URL") from None
+    for fresh in (False, True):
+        url = unit_url(fresh)
+        req = urllib.request.Request(url + path, data=data, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.headers.get("Content-Type", ""), r.read()
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode(errors="replace").strip()
+            if e.code == 404:
+                msg += (f" (the unit at {url} runs a ui.py older than this "
+                        "server: restart it)")
+            raise ToolError(f"{method} {path}: HTTP {e.code} {msg}") from None
+        except (urllib.error.URLError, OSError) as e:
+            # Never reached a page: the unit found may have gone and
+            # another come up, so look again (only when none was given).
+            if base_url or fresh:
+                raise ToolError(f"no UI at {url} ({e}): start the unit with "
+                                "./run.sh --ui, or pass --url / set NEST_UI_URL") from None
 
 
 def get_json(path, timeout=10):
@@ -183,7 +233,7 @@ class Recorder:
         self.thread.start()
 
     def run(self):
-        u = urllib.parse.urlsplit(base_url)
+        u = urllib.parse.urlsplit(unit_url())
         try:
             self.conn = http.client.HTTPConnection(u.hostname, u.port or 80,
                                                    timeout=30)
@@ -586,7 +636,7 @@ def ssh(port, command, stdin=b"", timeout_s=600):
         os.chmod(path, 0o700)
         askpass.append(path)
     env = dict(os.environ, SSH_ASKPASS=askpass[0], SSH_ASKPASS_REQUIRE="force")
-    host = urllib.parse.urlsplit(base_url).hostname
+    host = urllib.parse.urlsplit(unit_url()).hostname
     try:
         r = subprocess.run(["ssh", "-p", str(port), *SSH_OPTS, f"{USER}@{host}", command],
                            input=stdin, capture_output=True, env=env, timeout=timeout_s)
@@ -647,6 +697,8 @@ def t_status(a):
     state = get_json("/state")
     named = {fn: state["pins"].get(line) for fn, line in state["wiring"].items()}
     out = {"qemu_running": state.get("linked"), "unit": state.get("name"),
+           "page": unit_url(),
+           "other_units": [u for u in running_units() if u != unit_url()],
            "wheel_position": state.get("wheel"),
            "lines (0..1000, >=500 is high)": named}
     try:
@@ -985,9 +1037,11 @@ def handle(msg):
 def main():
     global base_url
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--url", default=os.environ.get("NEST_UI_URL", base_url),
-                    help="ui.py's address (run.sh --ui prints it)")
-    base_url = ap.parse_args().url.rstrip("/")
+    ap.add_argument("--url", default=os.environ.get("NEST_UI_URL"),
+                    help="ui.py's address (run.sh --ui prints it); by default "
+                         "the newest unit running here")
+    url = ap.parse_args().url
+    base_url = url.rstrip("/") if url else None
     for line in sys.stdin:
         line = line.strip()
         if not line:
