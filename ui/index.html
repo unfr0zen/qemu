@@ -55,6 +55,7 @@
   .hint { position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%); width: max-content; max-width: 92%;
           font-size: 12px; color: var(--on-bg-muted); text-align: center; padding: 4px 10px; border-radius: 8px;
           background: rgba(40, 39, 37, .55); backdrop-filter: blur(4px); }
+  .hint.covers:has(#banner[hidden]) { visibility: hidden; }
   kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--line); border-bottom-width: 2px;
         border-radius: 4px; padding: 0 4px; background: var(--panel); color: var(--ink); }
 
@@ -62,12 +63,12 @@
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
   .panel h2 { font-size: 12px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase;
               letter-spacing: .06em; }
-  .pins { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px 24px; }
-  .pin { display: grid; grid-template-columns: minmax(0, 1fr) auto; font-size: 12px; align-items: baseline; gap: 3px 10px; }
-  .pin .name { color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  .pins { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px 20px; }
+  .pin { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; }
+  .pin .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #e2dfd8; }
+  .pin .dot.lit { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+  .pin .name { flex: 1; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
   .pin .gpio { color: var(--muted); font: 11px ui-monospace, Menlo, monospace; white-space: nowrap; }
-  .pin .bar { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: #e2dfd8; overflow: hidden; }
-  .pin .bar i { display: block; height: 100%; width: 0; background: var(--accent); }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .wheel-row { display: flex; align-items: center; gap: 14px; margin-top: 10px; }
   .wheel-row .pos { font: 22px ui-monospace, Menlo, monospace; color: var(--ink); min-width: 70px; text-align: right; }
@@ -231,6 +232,13 @@
   </section>
 
   <section class="side">
+    <div class="logs">
+      <div class="bar">
+        <b>console</b><span id="logState">connecting…</span>
+        <span class="tip">click to type · root / nest</span>
+      </div>
+      <div id="term"></div>
+    </div>
     <div class="panel">
       <h2>Board lines</h2>
       <div class="pins" id="pins"></div>
@@ -240,25 +248,18 @@
         <h2>Wheel</h2>
         <div class="wheel-row">
           <span class="pos" id="wheelPos">—</span>
-          <span class="lbl">detents (the guest's decoded position may differ)<br>
-          <span id="wheelState">waiting…</span></span>
+          <span class="lbl" title="Detents turned here; the guest's decoded position may differ">detents<br>
+          <span id="wheelState"></span></span>
         </div>
       </div>
       <div class="panel">
         <h2>Screen</h2>
         <div class="wheel-row">
           <span class="pos" id="fpsDevice">—</span>
-          <span class="lbl">fps on the device's panel<br>
-          <span id="fpsPage">—</span> fps drawn by this page</span>
+          <span class="lbl" title="Frames per second on the device's panel, and drawn by this page">fps<br>
+          page <span id="fpsPage">—</span></span>
         </div>
       </div>
-    </div>
-    <div class="logs">
-      <div class="bar">
-        <b>console</b><span id="logState">connecting…</span>
-        <span class="tip">click to type · root / nest</span>
-      </div>
-      <div id="term"></div>
     </div>
   </section>
 </main>
@@ -328,6 +329,18 @@
     });
     es.addEventListener("fps", (e) => { $("fpsDevice").textContent = e.data; });
   }
+  // The help hides while it would cover the device: the ring (r 166 in the
+  // 340 viewBox) is drawn centred in the svg, scaled to its shorter side.
+  function placeHint() {
+    const hint = document.querySelector(".hint");
+    const svg = $("device").getBoundingClientRect(), h = hint.getBoundingClientRect();
+    const r = Math.min(svg.width, svg.height) * 166 / 340;
+    const cx = svg.left + svg.width / 2, cy = svg.top + svg.height / 2;
+    const dx = Math.max(h.left - cx, 0, cx - h.right);
+    const dy = Math.max(h.top - cy, 0, cy - h.bottom);
+    hint.classList.toggle("covers", dx * dx + dy * dy < r * r);
+  }
+  new ResizeObserver(placeHint).observe(document.querySelector(".stage"));
 
   /* ---------- console: the guest's serial, as a terminal ---------- */
   const term = new Terminal({
@@ -378,7 +391,7 @@
     for (const fn of Object.keys(LABELS).filter((f) => f in pinMap)) {
       const el = document.createElement("div");
       el.className = "pin";
-      el.innerHTML = `<span class="name"></span><span class="gpio"></span><span class="bar"><i></i></span>`;
+      el.innerHTML = `<span class="dot"></span><span class="name"></span><span class="gpio"></span>`;
       el.querySelector(".name").textContent = LABELS[fn];
       el.querySelector(".gpio").textContent = pinMap[fn];
       $("pins").append(el);
@@ -394,11 +407,12 @@
     $("device").classList.toggle("off", !on);
     $("banner").hidden = on;
     $("help").hidden = !on;
+    placeHint();
     for (const [fn, el] of Object.entries(bars)) {
       const v = state.pins[pinMap[fn]];
-      el.querySelector("i").style.width = (v === undefined ? 0 : v / 10) + "%";
-      el.querySelector(".gpio").textContent =
-        pinMap[fn] + " · " + (v === undefined ? "—" : (v >= 500 ? "high" : "low"));
+      const dot = el.querySelector(".dot");
+      dot.classList.toggle("lit", v >= 500);
+      dot.title = v === undefined ? "—" : (v >= 500 ? "high" : "low");
     }
   }
 
