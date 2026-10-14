@@ -39,6 +39,7 @@ in the same image.
 | `--ui-port N`, `UI_PORT=N` | Web page port |
 | `--cloud` | Let the unit reach the internet; by default it gets DHCP (10.0.2.x) and nothing past the virtual router |
 | `--no-provision` | Skip the pre-boot: boot the NAND exactly as it is |
+| `--sleep` | The display's stock 20 s timeout; by default the pre-boot keeps the screen on (below) |
 | `--nand FILE` | The NAND image to start from: seeds the working copy when there is none yet (or with `NAND_FRESH=1`), and is the source for `NAND_SNAPSHOT`, `NAND_RW` and `--stock-image`. Ignored, with a note, once a working copy exists |
 | `--mqtt HOST[:PORT]` | Relay `10.0.2.100:1883` in the guest to an MQTT broker, and nothing else (for nestlocal, imx6-stuff's `ha/`) |
 | `--nic-extra OPTS` | More `-nic user` options, e.g. a `guestfwd=` |
@@ -136,8 +137,9 @@ them.
 `ui/backplate.py` plays the backplate MCU on the sensor UART. It
 answers the front unit's reset with the wiring (`--wires`, default
 `Rh,C,W1,Y1,G`) and the identity of an up-to-date Backplate-6.x image, and
-streams ambient light, temperature and motion every 2 s so the display
-stays lit (`--no-presence` lets it sleep). The temperature is a room's: it
+streams ambient light, temperature and motion every 2 s, so the room reads
+as occupied (`--no-presence` leaves it empty, for auto-away; the display
+is kept on by the pre-boot, not by motion). The temperature is a room's: it
 follows the circuits the unit switches (`0x82`, circuit and state), rising
 while heat is on (W1, AUX/W2, a heat pump's compressor), falling while
 cooling is, and otherwise drifting towards 16 °C (`--ambient`,
@@ -268,6 +270,10 @@ has that shell:
   before any driver loads): the backlight driver logs two info messages
   at every brightness change, and 6.4-8's brcmfmac logs its routine ones
   as errors. `dmesg` still has them all;
+- keep the display on: nlclient blanks it `sleeptimeout` ms after the last
+  input (`/nestlabs/etc/client.config`, 20 s stock), and the backplate's
+  motion does not count as input. The pre-boot sets a day; `--sleep` puts
+  the stock value back;
 - save the WiFi network in connman's store,
   `connman/wifi_<mac>_<ssid hex>_managed_none/settings` on `user-config`
   (the MAC is U-Boot's `ethaddr`), with slirp's addresses set by hand

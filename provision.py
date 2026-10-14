@@ -15,6 +15,10 @@ image as provided, root1 after a system update) with init=/bin/sh, and the shell
   lm3695_bl backlight driver logs two info messages at every brightness
   change, every couple of seconds, and 6.4-8's brcmfmac logs its routine
   ones as errors. dmesg still has them all;
+- keeps the display on: nlclient blanks it sleeptimeout ms after the last
+  input (/nestlabs/etc/client.config, 20 s stock), and the backplate's
+  motion does not count as input. The pre-boot sets a day (--sleep puts
+  the stock timeout back);
 - saves the WiFi network the way connman does after a first join
   (user-config: connman/wifi_<mac>_<ssid hex>_managed_none/settings,
   AutoConnect), unless it is saved already. connman only autoconnects to
@@ -284,6 +288,28 @@ def quiet_console(con):
     return "console: only critical messages (dmesg keeps them all)"
 
 
+CLIENT_CONFIG = "/nestlabs/etc/client.config"
+STOCK_SLEEP_TIMEOUT = 20000               # ms, as 6.4-8 ships it
+
+
+def screen(con, sleep=False):
+    """Keep the display on: nlclient blanks it sleeptimeout ms after the
+    last input, and the backplate's motion is not input. With sleep, the
+    stock timeout."""
+    ms = STOCK_SLEEP_TIMEOUT if sleep else 24 * 3600 * 1000
+    what = f"stock {STOCK_SLEEP_TIMEOUT // 1000} s timeout" if sleep else "stays on"
+    key = f'<a key="sleeptimeout" value="{ms}"/>'
+    if con.run(f"grep -qF '{key}' {CLIENT_CONFIG}") == 0:
+        return f"screen: {what} already"
+    if con.run(f"grep -q '<a key=\"sleeptimeout\" value=\"[0-9]*\"/>' "
+               f"{CLIENT_CONFIG}") != 0:
+        return "screen: no sleeptimeout in client.config, left alone"
+    if con.run(f"sed -i 's|<a key=\"sleeptimeout\" value=\"[0-9]*\"/>|{key}|' "
+               f"{CLIENT_CONFIG}") != 0:
+        raise RuntimeError("could not write client.config")
+    return f"screen: {what}"
+
+
 def nestlocal(con, gen2=False):
     """Whether ha/qemu_install.py has put nestlocal on this root: run.sh
     --mqtt only relays the broker to it."""
@@ -424,6 +450,9 @@ def main():
     ap.add_argument("--ssid", default="QEMU",
                     help="the access point's SSID (the wifi chip's ssid "
                          "property)")
+    ap.add_argument("--sleep", action="store_true",
+                    help="put the display's stock 20 s timeout back instead "
+                         "of keeping it on")
     ap.add_argument("--factory", action="store_true",
                     help="empty the firmware's writable volumes instead")
     ap.add_argument("--root", type=int, choices=(0, 1),
@@ -456,6 +485,7 @@ def main():
             done.append(f"root file system: {root}")
             done.append(root_login(con))
             done.append(quiet_console(con))
+            done.append(screen(con, args.sleep))
             if con.run("mount -t ubifs ubi0:user-config "
                        "/media/user-config") != 0:
                 raise RuntimeError("could not mount user-config")
@@ -497,6 +527,7 @@ def gen2(args, cmd):
             done.append(root_login(con, replace=True))
             done.append(console_login(con))
             done.append(quiet_console(con))
+            done.append(screen(con, args.sleep))
             if con.run("mount -t jffs2 /dev/mtdblock11 "
                        "/media/user-config") != 0:
                 raise RuntimeError("could not mount user-config")

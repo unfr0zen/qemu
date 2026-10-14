@@ -18,6 +18,8 @@
 #   ./run.sh --cloud             # let the unit reach the internet (by
 #                                   #   default it gets DHCP and no further)
 #   ./run.sh --no-provision      # boot the NAND exactly as it is
+#   ./run.sh --sleep             # the display's stock 20 s timeout (by
+#                                   #   default the pre-boot keeps it on)
 #   ./run.sh --nand FILE         # seed the NAND state from FILE (only
 #                                   #   when there is no state yet, or with
 #                                   #   NAND_FRESH=1)
@@ -69,6 +71,7 @@ ui=0
 ui_port="${UI_PORT:-8075}"
 cloud=0
 provision=1
+sleep=0
 stock_image=""
 mqtt=""
 nic_extra=""
@@ -84,6 +87,7 @@ while [ $# -gt 0 ]; do
         --ui) ui=1; shift ;;
         --cloud) cloud=1; shift ;;
         --no-provision) provision=0; shift ;;
+        --sleep) sleep=1; shift ;;
         --stock-image) stock_image="$2"; shift 2 ;;
         --nand) nand_arg="$2"; shift 2 ;;
         --ui-port) ui_port="$2"; shift 2 ;;
@@ -287,6 +291,7 @@ PROVISION_QEMU="$MACHINE_ARGS -nographic -nic none"
 run_provision() {
     [ "$gen2" = 1 ] && set -- --gen2 "$NAND" "$@"
     [ "$gen2" = 0 ] && [ -n "$root" ] && set -- --root "$root" "$@"
+    [ "$sleep" = 1 ] && set -- --sleep "$@"
     if [ "$use_docker" = 1 ]; then
         python3 "$script_path/provision.py" "$@" -- \
             docker run --rm -i --init -v "$repo_root:$repo_root" \
