@@ -111,9 +111,9 @@ has no temperature to start from and the unit reports no time to target.
 
 By default this backplate reports a steadily lit room (vis 200, about 92 %
 brightness), starting at 21.5 C / 45 %RH, and someone in front of it (PIR
-motion on every poll), so the display wakes and stays on. --no-presence leaves the
-room empty: the display then sleeps after the client's inactivity timeout
-like a real unit on a quiet wall.
+motion on every poll), so the room reads as occupied. --no-presence leaves
+the room empty, as auto-away sees it. Motion is not input to nlclient: the
+display blanks after its sleeptimeout either way (the pre-boot sets that).
 """
 import argparse
 import json
@@ -422,8 +422,7 @@ class Backplate:
     # ---- loop ----
     def stream(self):
         """Like the real MCU, push the live readings on our own clock: the
-        front unit only polls (0xff) now and then, and motion has to keep
-        arriving for the display to stay awake."""
+        front unit only polls (0xff) now and then."""
         self.attached.wait()
         while True:
             time.sleep(self.period)
@@ -545,7 +544,7 @@ def main():
     ap.add_argument("--room-tau", type=float, default=8.0,
                     help="hours for the room to drift most of the way to --ambient")
     ap.add_argument("--no-presence", dest="presence", action="store_false",
-                    help="nobody in front: no PIR motion, the display sleeps")
+                    help="nobody in front: no PIR motion (auto-away)")
     ap.add_argument("--period", type=float, default=2.0,
                     help="seconds between live reports (ALS, temp, motion)")
     ap.add_argument("--wires", default=DEFAULT_WIRES,

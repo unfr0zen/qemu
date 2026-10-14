@@ -75,8 +75,9 @@ written.
 ```
 
 Before each boot a short pre-boot sets up a root login (`root` / `nest`),
-a quiet console, the emulated WiFi network, and skips the out-of-box setup
-(`--no-provision` boots the NAND as it is). Start over from the image with
+a quiet console, a screen that stays on, the emulated WiFi network, and
+skips the out-of-box setup (`--no-provision` boots the NAND as it is,
+`--sleep` keeps the stock 20 s screen timeout). Start over from the image with
 `NAND_FRESH=1 ./run.sh --nand FILE`. Ctrl-A X (or Ctrl-] with `--ui`) quits.
 
 Other options: `--cloud` (internet access), `--ssh PORT`, `--mqtt HOST`,
