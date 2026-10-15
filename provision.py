@@ -25,6 +25,9 @@ image as provided, root1 after a system update) with init=/bin/sh, and the shell
   saved networks. The MAC is U-Boot's ethaddr, which the wlan init script
   gives the interface. Writing through the kernel honours the UBIFS
   journal, which a rebuild from the host would not;
+- points /etc/resolv.conf at slirp's DNS (10.0.2.3): connman writes its
+  own proxy (127.0.0.1) there, and with the root read-only at boot that
+  copy is what the unit keeps;
 - marks the out-of-box setup done, with the settings the phone app's
   ConfigDone handler writes (skip-setup.py's: every *_completed flag, Eco
   onboarding, language, location), so the unit boots to the thermostat;
@@ -364,6 +367,19 @@ def wifi(con, mac, ssid):
     return f"wifi: \"{ssid}\" given slirp's gateway"
 
 
+RESOLV_CONF = f"# QEMU's user-mode DNS (qemu/provision.py)\nnameserver {SLIRP_DNS}\n"
+
+
+def resolv(con):
+    """slirp's nameserver in /etc/resolv.conf. Run last, with connman no
+    longer able to rewrite it once the root is read-only again."""
+    if con.run(f"grep -qx 'nameserver {SLIRP_DNS}' /etc/resolv.conf") == 0:
+        return "dns: slirp's already"
+    if con.run(f"printf %s {shlex.quote(RESOLV_CONF)} > /etc/resolv.conf") != 0:
+        raise RuntimeError("could not write /etc/resolv.conf")
+    return f"dns: nameserver {SLIRP_DNS}"
+
+
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, path))
     module = importlib.util.module_from_spec(spec)
@@ -493,6 +509,7 @@ def main():
             done.append(onboarding(con))
             done.append(wiring(con))
             done.append(nestlocal(con))
+            done.append(resolv(con))
             # Unmounting commits the UBIFS journals before we pull the plug.
             if con.run("sync; umount /media/user-config") != 0:
                 raise RuntimeError("user-config did not unmount cleanly")
