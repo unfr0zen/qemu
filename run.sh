@@ -419,6 +419,7 @@ $SERIAL_ARGS $BOARD_ARGS \
         keyboard=1
         ui_stdin=/dev/tty
     fi
+    # shellcheck disable=SC2046 # --keyboard is either there or not
     python3 "$script_path/ui/ui.py" \
         --board "tcp:127.0.0.1:$board_port" \
         --qmp "tcp:127.0.0.1:$qmp_port" \
