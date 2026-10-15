@@ -104,7 +104,8 @@ Docker backend or forbidden UI listener fails before provisioning.
 
 `ui/mcp_server.py` is an MCP server (stdio, standard library only) that
 gives an agent the unit: screenshots and recordings, the button and ring,
-input sequences, the console, files in and out, and QMP. The tools are
+input sequences, the console, files in and out, the guest's clock, the
+simulated backplate's room and wiring, and QMP. The tools are
 listed in [docs/qemu.md](docs/qemu.md#driving-it-from-an-agent-mcp).
 
 1. Start the unit with the page, and with ssh for fast file transfer

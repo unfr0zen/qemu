@@ -359,6 +359,7 @@ if [ "$ui" = 1 ]; then
     hmp_port=$(pick_port $((console_port + 1)))
     bp_port=$(pick_port $((hmp_port + 1)))
     ncp_port=$(pick_port $((bp_port + 1)))
+    bpctl_port=$(pick_port $((ncp_port + 1)))
     http_port=$(pick_port "$ui_port")
     if [ -n "$QEMU_UI_INFO" ]; then
         python3 - "$QEMU_UI_INFO" "$$" "$http_port" "$hmp_port" "$ui_dir" "$NAND" <<'PY'
@@ -429,11 +430,13 @@ $SERIAL_ARGS $BOARD_ARGS \
         --port "$http_port" \
         --pins "$PINS" \
         --name "Nest gen $([ "$gen2" = 1 ] && echo 2 || echo 3)" \
+        --backplate "tcp:127.0.0.1:$bpctl_port" \
         --parent $$ --cleanup "$ui_dir" < "$ui_stdin" &
     # The fake backplate (sensor) MCU on the sensor-MCU serial: answers
     # the front unit and streams bright ALS samples so nlclient lights
     # the display (it keeps the panel asleep until the ALS reports).
     python3 "$script_path/ui/backplate.py" --serial "tcp:127.0.0.1:$bp_port" \
+        --control "tcp:127.0.0.1:$bpctl_port" \
         --flash "$NAND.backplate" --parent $$ &
     # The Thread radio (em35x-ncp on ECSPI3, McSPI2 on the gen 2): the
     # ConnectIP network co-processor wpantund drives (ui/em35x.py
@@ -447,7 +450,7 @@ $SERIAL_ARGS $BOARD_ARGS \
     python3 "$script_path/ui/em35x.py" $NCP_ARGS \
         --serial "tcp:127.0.0.1:$ncp_port" --parent $$ &
     echo "$machine UI: http://127.0.0.1:$http_port" >&2
-    echo "  board tcp:$board_port · qmp tcp:$qmp_port · console tcp:$console_port · hmp tcp:$hmp_port · backplate tcp:$bp_port · ncp tcp:$ncp_port" >&2
+    echo "  board tcp:$board_port · qmp tcp:$qmp_port · console tcp:$console_port · hmp tcp:$hmp_port · backplate tcp:$bp_port (control $bpctl_port) · ncp tcp:$ncp_port" >&2
 fi
 
 # With --ui on a terminal the terminal is ui.py's; QEMU keeps off it.

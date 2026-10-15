@@ -157,7 +157,9 @@ from the image itself. What was flashed is kept like the MCU's flash, in
 updated to 6.4-8 (which ships TFE 2.3.27) would find 5.9.4-5's 2.3.11
 at every boot, start a backplate update, and open on "The wiring to your
 equipment has changed". Its docstring documents the wire format and message types;
-`--debug` logs every frame.
+`--debug` logs every frame. With `--control tcp:HOST:PORT` the room and the
+wiring change while it runs (a JSON object a line); `run.sh` gives that
+port to `ui.py`, whose `POST /backplate` the MCP `backplate` tool uses.
 
 `ui/em35x.py` plays the 802.15.4 / Thread radio, the EM35x on ECSPI3
 running Silicon Labs' ConnectIP network co-processor (`ip-modem-app`
@@ -194,6 +196,8 @@ on its command line), and looks again when that unit stops answering;
 | `console_exec` | one shell command line: its output and exit status. Logs in as `root` / `nest` when the console is at `login:`; Ctrl-C on timeout |
 | `console_send`, `console_read`, `console_wait` | raw keystrokes (interactive programs, U-Boot), output after a cursor, waiting for a regex |
 | `pull_file`, `push_file` | files out of and into the guest: over ssh when the unit runs with `--ssh PORT` (about 3 MB/s), else over the console, md5-checked (about 60 KB/s in, 130 KB/s out). An upload lands as `PATH.mcp-part` and is moved into place |
+| `set_time` | the guest's clock and RTC: `+40m`, `-2h`, `HH:MM` today, `YYYY-MM-DD HH:MM`, or `host`. Stock treats a jump as a clock change, not as time passing: it shifts its timers, so a schedule point jumped over does not fire; for schedule tests set the time, reboot, then let points pass |
+| `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `als` (the light count), `mono` / `bsl` (firmware fields reported, to trigger an update), `wires`, and `detached` (the board's detect line, flintstone: the display off its base); with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
 | `qmp` | any QMP command: `system_reset`, `stop`/`cont`, `human-monitor-command` |
 
 `console_exec` sends `echo <start>; command eval '<line>'; echo <end>$?`
@@ -223,7 +227,8 @@ has left the replay buffer) and `POST /qmp`.
 
 A BCM43341 sits behind an SDIO card on usdhc2. The stock `dhd.ko`
 (bcmdhd 1.141.66.4) loads the stock firmware (`43341b0`, 6.30.190.36) into
-it (6.4-8 drives it with brcmfmac, backported from Linux 4.12, instead), and the unit sees one open access point: SSID `QEMU`, channel 6, BSSID
+it (6.4-8 drives it with brcmfmac, backported from Linux 4.12, instead). The
+unit's own network is the open access point `QEMU`, channel 6, BSSID
 `02:43:34:10:00:01`. `run.sh` puts QEMU's user-mode network behind it
 (`-nic user,model=bcm43341,restrict=on`), so the unit is 10.0.2.15 with a
 default route through 10.0.2.2 (set by the pre-boot, below), and nothing
@@ -233,6 +238,41 @@ device the image came from and takes on that account's state: °F, and
 firmware updates, which it downloads and installs into
 the NAND. Offline, every checkout boots the same. A `-nic` or `-netdev` of
 your own replaces it.
+
+A scan also finds more access points, for testing how the UI lists and
+joins networks. By default:
+
+| SSID | Channel | RSSI | Security | BSSID |
+|---|---|---|---|---|
+| `Nest-WPA2` | 1 | -55 | WPA2-PSK (CCMP), passphrase `nestpassword` | `02:43:34:10:00:02` |
+| `Neighbour` | 11 | -78 | WPA2-PSK that rejects every passphrase | `02:43:34:10:00:03` |
+
+`-global 'bcm43341.aps=SSID:channel:rssi[:passphrase];...'` replaces
+them (up to 7; `aps=` for none). No passphrase is an open network, `*` a
+WPA2 one no passphrase opens, anything else (8 to 63 characters, `:`
+allowed, `;` not) its WPA2-PSK passphrase. BSSIDs count up from `QEMU`'s.
+Every network that can be joined carries the same user-mode network.
+
+With WPA2 the drivers leave the 4-way handshake to wpa_supplicant over
+EAPOL data frames, and install its keys with `wsec_key`; the chip model is
+the AP side: PMK from the passphrase, msg1, msg2's MIC checked with the
+KCK, msg3 with the GTK wrapped by the KEK, msg4. Data only passes once
+msg4 is in, and in the clear between chip and host either way. A wrong
+passphrase fails msg2's MIC: the model resends msg1 twice and then
+deauths (reason 15, 4-way handshake timeout), so the link never passes
+data and connman's service ends `idle` with Error `invalid-key`. To join
+by hand, provision it (connman watches the directory) and connect:
+
+```sh
+printf '[service_x]\nType=wifi\nName=Nest-WPA2\nPassphrase=nestpassword\n' \
+    > /var/lib/connman/x.config
+dbus-send --system --print-reply --dest=net.connman \
+    /net/connman/service/wifi_<mac>_4e6573742d57504132_managed_psk \
+    net.connman.Service.Connect
+```
+
+Remove the `.config` and the service's directory under `/var/lib/connman`
+afterwards; connman goes back to `QEMU` on its own.
 
 The unit joins at boot on its own: connman only autoconnects to networks
 it has saved, and the pre-boot (below) saves this one.

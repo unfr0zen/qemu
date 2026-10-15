@@ -495,7 +495,17 @@ class Server(ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-def make_handler(board, log, screen, qmp, pins, name):
+def backplate_control(spec, want):
+    """One change to backplate.py --control; the state it reports after."""
+    _, host, port = spec.split(":", 2)
+    with socket.create_connection((host, int(port)), timeout=5) as s, \
+            s.makefile("rwb") as f:
+        f.write(json.dumps(want).encode() + b"\n")
+        f.flush()
+        return json.loads(f.readline() or b"{}")
+
+
+def make_handler(board, log, screen, qmp, pins, name, backplate=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -622,6 +632,28 @@ def make_handler(board, log, screen, qmp, pins, name):
                     return
                 r = qmp.execute(want["execute"], want.get("arguments"))
                 self.send_body(200, "application/json", json.dumps(r).encode())
+            elif self.path == "/backplate":
+                # {"temp": ..., "wires": [...], "detached": true, ...}: {}
+                # reads the state.
+                if not backplate:
+                    self.send_body(503, "text/plain", b"no backplate control\n")
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    want = json.loads(self.rfile.read(n) or b"{}")
+                    # "detached" is the board's detect line, not backplate.py's.
+                    detached = want.pop("detached", None) if isinstance(want, dict) else None
+                    if detached is not None:
+                        board.drive("BP-DETACHED", 1 if detached else 0)
+                    r = backplate_control(backplate, want)
+                except ValueError:
+                    self.send_body(400, "text/plain", b"bad JSON\n")
+                    return
+                except OSError as e:
+                    self.send_body(502, "text/plain", f"{e}\n".encode())
+                    return
+                self.send_body(400 if "error" in r else 200, "application/json",
+                               json.dumps(r).encode())
             else:
                 self.send_body(404, "text/plain", b"not found\n")
 
@@ -926,6 +958,8 @@ def main():
     ap.add_argument("--parent", type=int,
                     help="exit when this process does (QEMU, via run.sh)")
     ap.add_argument("--cleanup", help="directory to remove on exit")
+    ap.add_argument("--backplate", metavar="tcp:HOST:PORT",
+                    help="backplate.py's --control, for /backplate")
     args = ap.parse_args()
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -951,7 +985,7 @@ def main():
     # Bound before the terminal goes raw: a failed bind must not leave it so.
     server = Server(("127.0.0.1", args.port),
                     make_handler(board, log, screen, qmp, parse_pins(args.pins),
-                                 args.name))
+                                 args.name, args.backplate))
     if log and args.keyboard and os.isatty(0):
         threading.Thread(target=Keyboard(log, qmp, args.parent).run,
                          daemon=True).start()
