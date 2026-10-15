@@ -438,8 +438,9 @@ class Backplate:
     def control(self, want):
         """Change the room or the wiring while running: any of temp, rh,
         ambient, heat_rate, cool_rate, room_tau (numbers), als (the visible
-        light count), presence (bool) and wires (terminals, as --wires).
-        Returns the state after."""
+        light count), presence (bool), wires (terminals, as --wires) and
+        mono / bsl (firmware fields to report, as if flashed, followed by
+        the MCU's own restart). Returns the state after."""
         rates = ("temp", "rh", "ambient", "heat_rate", "cool_rate", "room_tau")
         if "als" in want and not (isinstance(want["als"], int) and 0 <= want["als"] <= 0xffff):
             raise ValueError("als: 0 to 65535")
@@ -464,6 +465,13 @@ class Backplate:
             self.presence = bool(want["presence"])
         if "als" in want:
             self.als_vis = want["als"]
+        firmware = False
+        for k in ("mono", "bsl"):
+            if isinstance(want.get(k), dict):
+                getattr(self, k).update({f: str(v) for f, v in want[k].items() if f in MONO})
+                firmware = True
+        if firmware and self.attached.is_set():
+            self.report_wiring()
         if wires is not None and wires != self.wires:
             self.wires = wires
             if self.attached.is_set():
@@ -473,6 +481,7 @@ class Backplate:
                 "cool_rate": self.cool_rate, "room_tau": self.room_tau,
                 "presence": self.presence, "als": self.als_vis,
                 "temp_comp": self.temp_comp, "wires": self.wires,
+                "mono": self.mono, "bsl": self.bsl,
                 "circuits": sorted(self.circuits)}
 
     def serve_control(self, spec):
@@ -594,6 +603,10 @@ class Backplate:
             if not self.flash(kind, [records[s] for s in sorted(records)]):
                 print("backplate: update image rejected, keeping the old "
                       "firmware", file=sys.stderr)
+            elif kind == "M":
+                # The MCU restarts into its new firmware and announces
+                # itself as after any reset of its own.
+                self.report_wiring()
             self.update = None
         elif self.update is None and self.identity(mtype):
             self.send(*self.identity(mtype))
