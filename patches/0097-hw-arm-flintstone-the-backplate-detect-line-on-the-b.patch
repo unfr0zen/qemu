@@ -10,22 +10,23 @@ low from reset; 'set BP-DETACHED 1' lifts the display off its base.
  hw/arm/flintstone.c               |  6 +++++-
  hw/arm/flintstone_board.c         | 28 ++++++++++++++++++++++++++++
  include/hw/arm/flintstone_board.h |  3 +++
- 3 files changed, 36 insertions(+), 1 deletion(-)
+ 3 files changed, 37 insertions(+), 1 deletion(-)
 
 diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
 index 59af276..100376e 100644
 --- a/hw/arm/flintstone.c
 +++ b/hw/arm/flintstone.c
-@@ -392,7 +392,7 @@ static void flintstone_init(MachineState *machine)
+@@ -392,7 +392,8 @@ static void flintstone_init(MachineState *machine)
  
      /*
       * The board around the SoC: the front button drives GPIO2_IO18 (the
 -     * gpio-keys "HU Button"), and the firmware's own driven lines are
-+     * gpio-keys "HU Button"), the backplate detect line GPIO5_IO13, and the firmware's own driven lines are
++     * gpio-keys "HU Button"), the backplate detect line GPIO5_IO13, and
++     * the firmware's own driven lines are
       * reported back — poweroff on GPIO1_IO11, the wifi module reset on
       * GPIO1_IO04, the wheel's Hall power on GPIO7_IO02 and the battery
       * divider enable on GPIO6_IO16. The chardev is attached with
-@@ -426,6 +426,10 @@ static void flintstone_init(MachineState *machine)
+@@ -426,6 +427,10 @@ static void flintstone_init(MachineState *machine)
      qdev_connect_gpio_out(board, 0,
                            qdev_get_gpio_in(DEVICE(object_resolve_path_component(
                                OBJECT(soc), "gpio2")), 18));
