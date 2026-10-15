@@ -633,13 +633,18 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None):
                 r = qmp.execute(want["execute"], want.get("arguments"))
                 self.send_body(200, "application/json", json.dumps(r).encode())
             elif self.path == "/backplate":
-                # {"temp": ..., "wires": [...], ...}: {} reads the state.
+                # {"temp": ..., "wires": [...], "detached": true, ...}: {}
+                # reads the state.
                 if not backplate:
                     self.send_body(503, "text/plain", b"no backplate control\n")
                     return
                 n = int(self.headers.get("Content-Length") or 0)
                 try:
                     want = json.loads(self.rfile.read(n) or b"{}")
+                    # "detached" is the board's detect line, not backplate.py's.
+                    detached = want.pop("detached", None) if isinstance(want, dict) else None
+                    if detached is not None:
+                        board.drive("BP-DETACHED", 1 if detached else 0)
                     r = backplate_control(backplate, want)
                 except ValueError:
                     self.send_body(400, "text/plain", b"bad JSON\n")

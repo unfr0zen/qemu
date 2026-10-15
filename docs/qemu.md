@@ -197,7 +197,7 @@ on its command line), and looks again when that unit stops answering;
 | `console_send`, `console_read`, `console_wait` | raw keystrokes (interactive programs, U-Boot), output after a cursor, waiting for a regex |
 | `pull_file`, `push_file` | files out of and into the guest: over ssh when the unit runs with `--ssh PORT` (about 3 MB/s), else over the console, md5-checked (about 60 KB/s in, 130 KB/s out). An upload lands as `PATH.mcp-part` and is moved into place |
 | `set_time` | the guest's clock and RTC: `+40m`, `-2h`, `HH:MM` today, `YYYY-MM-DD HH:MM`, or `host`. Stock treats a jump as a clock change, not as time passing: it shifts its timers, so a schedule point jumped over does not fire; for schedule tests set the time, reboot, then let points pass |
-| `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `wires`; with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
+| `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `wires`, and `detached` (the board's detect line, flintstone: the display off its base); with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
 | `qmp` | any QMP command: `system_reset`, `stop`/`cont`, `human-monitor-command` |
 
 `console_exec` sends `echo <start>; command eval '<line>'; echo <end>$?`
