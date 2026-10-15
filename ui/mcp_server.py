@@ -1009,6 +1009,7 @@ TOOLS = {
                           "cool_rate": d(NUM, "degrees C an hour while cooling"),
                           "room_tau": d(NUM, "hours for the room to drift most of the way to ambient"),
                           "presence": d(BOOL, "report someone near (motion)"),
+                          "als": d(INT, "the ambient light's visible count (live and the 5-minute ALS_BUF samples Sunblock learns from)"),
                           "detached": d(BOOL, "lift the display off its base (the detect line; flintstone only); false puts it back"),
                           "wires": {"type": "array", "items": {"type": "string"},
                                     "description": "terminals with a wire, e.g. [\"Rh\", \"W1\", \"Y1\", \"G\", \"C\"]; the unit sees the new wiring"}})),

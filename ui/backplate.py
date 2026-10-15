@@ -31,7 +31,8 @@ Wire types and payloads (from nlclient's disassembly):
   0x22 MSG_TEMP_BUF  N x 4 B, same layout as MSG_TEMP
   0x27 MSG_PIR_BUF   N x 8 B
   0x28 MSG_PROX_BUF  N x 16 B
-  0x29 MSG_ALS_BUF   N x 6 B: u16 (unused), u16 min, u16 max - event log only
+  0x29 MSG_ALS_BUF   N x 6 B: u16 (unused), u16 min, u16 max, one a 5 minutes;
+                     Sunblock learns the day's light from the max
   0x2f MSG_END_BUF   empty ("compatible": no count check), or a u16 count of
                      the accepted Temp/Temp2/Pir/Prox/Als buffers
 (0x04 is the HVAC Wires message and 0x09 the Pins - never send those.)
@@ -137,6 +138,8 @@ MSG_PINS = 0x09
 MSG_ALS = 0x0a
 MSG_UPDATE_ACK = 0x11
 MSG_TEMP_BUF = 0x22
+MSG_ALS_BUF = 0x29
+MSG_TEMP_COMP = 0xc3
 MSG_END_BUF = 0x2f
 
 # front -> back firmware update requests
@@ -148,6 +151,8 @@ MSG_UPDATE_END = 0x93
 
 SAMPLE_PERIOD = 30      # seconds between buffered temperature samples
 MAX_SAMPLES = 240       # what the buffer holds: two hours of them
+ALS_PERIOD = 300        # seconds between buffered light samples
+MAX_ALS = 24            # two hours of them
 
 # Terminal -> byte index in MSG_WIRES / MSG_PINS (they differ).
 WIRE_INDEX = {"W1": 0, "Y1": 1, "G": 2, "O/B": 3, "AUX/W2": 4, "Y2": 7,
@@ -265,6 +270,9 @@ class Backplate:
         self.room_time = time.monotonic()
         self.samples = []                     # TEMP_BUF samples not yet flushed
         self.sample_time = self.room_time
+        self.als_samples = []                 # ALS_BUF samples not yet flushed
+        self.als_time = self.room_time
+        self.temp_comp = False                # Sunblock's SetTempCompMode
         self.presence = presence
         self.period = period
         self.wires = wires
@@ -402,6 +410,10 @@ class Backplate:
         while time.monotonic() - self.sample_time >= SAMPLE_PERIOD:
             self.sample_time += SAMPLE_PERIOD
             self.samples = self.samples[-(MAX_SAMPLES - 1):] + [self.temp_payload()]
+        while time.monotonic() - self.als_time >= ALS_PERIOD:
+            self.als_time += ALS_PERIOD
+            v = self.als_vis
+            self.als_samples = self.als_samples[-(MAX_ALS - 1):] + [struct.pack("<HHH", 0, v, v)]
         if self.presence:
             self.send(MSG_PIR, struct.pack("<HH", 0x03E8, 0x03E8))
 
@@ -411,7 +423,10 @@ class Backplate:
         chunks = [samples[i:i + 32] for i in range(0, len(samples), 32)]
         for chunk in chunks:
             self.send(MSG_TEMP_BUF, b"".join(chunk))
-        self.send(MSG_END_BUF, struct.pack("<H", len(chunks)))
+        als, self.als_samples = self.als_samples, []
+        if als:
+            self.send(MSG_ALS_BUF, b"".join(als))
+        self.send(MSG_END_BUF, struct.pack("<H", len(chunks) + bool(als)))
 
     def report_wiring(self):
         """The answer to a reset: which terminals have a wire (and power)."""
@@ -422,9 +437,12 @@ class Backplate:
     # ---- control ----
     def control(self, want):
         """Change the room or the wiring while running: any of temp, rh,
-        ambient, heat_rate, cool_rate, room_tau (numbers), presence (bool)
-        and wires (terminals, as --wires). Returns the state after."""
+        ambient, heat_rate, cool_rate, room_tau (numbers), als (the visible
+        light count), presence (bool) and wires (terminals, as --wires).
+        Returns the state after."""
         rates = ("temp", "rh", "ambient", "heat_rate", "cool_rate", "room_tau")
+        if "als" in want and not (isinstance(want["als"], int) and 0 <= want["als"] <= 0xffff):
+            raise ValueError("als: 0 to 65535")
         for k in rates:
             if k in want and not isinstance(want[k], (int, float)):
                 raise ValueError(f"{k}: a number")
@@ -444,6 +462,8 @@ class Backplate:
                 setattr(self, k, float(want[k]))
         if "presence" in want:
             self.presence = bool(want["presence"])
+        if "als" in want:
+            self.als_vis = want["als"]
         if wires is not None and wires != self.wires:
             self.wires = wires
             if self.attached.is_set():
@@ -451,7 +471,8 @@ class Backplate:
         return {"temp": round(self.temp_c, 3), "rh": self.rh,
                 "ambient": self.ambient, "heat_rate": self.heat_rate,
                 "cool_rate": self.cool_rate, "room_tau": self.room_tau,
-                "presence": self.presence, "wires": self.wires,
+                "presence": self.presence, "als": self.als_vis,
+                "temp_comp": self.temp_comp, "wires": self.wires,
                 "circuits": sorted(self.circuits)}
 
     def serve_control(self, spec):
@@ -550,6 +571,9 @@ class Backplate:
             self.send(MSG_ACK_SWITCH, payload)
         elif mtype == MSG_FLUSH:
             self.flush()
+        elif mtype == MSG_TEMP_COMP and len(payload) == 2:
+            self.temp_comp = payload[0] == 1
+            print(f"backplate: temperature compensation {'on' if self.temp_comp else 'off'}", file=sys.stderr)
         elif mtype == 0xFF:
             self.update = None                 # a reset leaves the BSL unflashed
             self.report_wiring()
