@@ -157,7 +157,9 @@ from the image itself. What was flashed is kept like the MCU's flash, in
 updated to 6.4-8 (which ships TFE 2.3.27) would find 5.9.4-5's 2.3.11
 at every boot, start a backplate update, and open on "The wiring to your
 equipment has changed". Its docstring documents the wire format and message types;
-`--debug` logs every frame.
+`--debug` logs every frame. With `--control tcp:HOST:PORT` the room and the
+wiring change while it runs (a JSON object a line); `run.sh` gives that
+port to `ui.py`, whose `POST /backplate` the MCP `backplate` tool uses.
 
 `ui/em35x.py` plays the 802.15.4 / Thread radio, the EM35x on ECSPI3
 running Silicon Labs' ConnectIP network co-processor (`ip-modem-app`
@@ -194,6 +196,8 @@ on its command line), and looks again when that unit stops answering;
 | `console_exec` | one shell command line: its output and exit status. Logs in as `root` / `nest` when the console is at `login:`; Ctrl-C on timeout |
 | `console_send`, `console_read`, `console_wait` | raw keystrokes (interactive programs, U-Boot), output after a cursor, waiting for a regex |
 | `pull_file`, `push_file` | files out of and into the guest: over ssh when the unit runs with `--ssh PORT` (about 3 MB/s), else over the console, md5-checked (about 60 KB/s in, 130 KB/s out). An upload lands as `PATH.mcp-part` and is moved into place |
+| `set_time` | the guest's clock and RTC: `+40m`, `-2h`, `HH:MM` today, `YYYY-MM-DD HH:MM`, or `host`. Stock treats a jump as a clock change, not as time passing: it shifts its timers, so a schedule point jumped over does not fire; for schedule tests set the time, reboot, then let points pass |
+| `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `wires`; with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
 | `qmp` | any QMP command: `system_reset`, `stop`/`cont`, `human-monitor-command` |
 
 `console_exec` sends `echo <start>; command eval '<line>'; echo <end>$?`

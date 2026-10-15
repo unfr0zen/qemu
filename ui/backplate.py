@@ -419,6 +419,59 @@ class Backplate:
         self.send(MSG_WIRES, wires)
         self.send(MSG_PINS, pins)
 
+    # ---- control ----
+    def control(self, want):
+        """Change the room or the wiring while running: any of temp, rh,
+        ambient, heat_rate, cool_rate, room_tau (numbers), presence (bool)
+        and wires (terminals, as --wires). Returns the state after."""
+        rates = ("temp", "rh", "ambient", "heat_rate", "cool_rate", "room_tau")
+        for k in rates:
+            if k in want and not isinstance(want[k], (int, float)):
+                raise ValueError(f"{k}: a number")
+        if "room_tau" in want and want["room_tau"] <= 0:
+            raise ValueError("room_tau: above 0")
+        wires = want.get("wires")
+        if wires is not None:
+            wires = wires.split(",") if isinstance(wires, str) else list(wires)
+            unknown = set(wires) - set(WIRE_INDEX)
+            if unknown:
+                raise ValueError(f"unknown terminals: {', '.join(sorted(unknown))}")
+        self.room_step()                      # the old room up to now
+        if "temp" in want:
+            self.temp_c = float(want["temp"])
+        for k in rates[1:]:
+            if k in want:
+                setattr(self, k, float(want[k]))
+        if "presence" in want:
+            self.presence = bool(want["presence"])
+        if wires is not None and wires != self.wires:
+            self.wires = wires
+            if self.attached.is_set():
+                self.report_wiring()          # as the MCU does on a change
+        return {"temp": round(self.temp_c, 3), "rh": self.rh,
+                "ambient": self.ambient, "heat_rate": self.heat_rate,
+                "cool_rate": self.cool_rate, "room_tau": self.room_tau,
+                "presence": self.presence, "wires": self.wires,
+                "circuits": sorted(self.circuits)}
+
+    def serve_control(self, spec):
+        """One JSON object a line in, the state (or an error) a line out."""
+        _, host, port = spec.split(":", 2)
+        srv = socket.create_server((host, int(port)))
+        while True:
+            conn, _ = srv.accept()
+            with conn, conn.makefile("rwb") as f:
+                for line in f:
+                    try:
+                        want = json.loads(line or b"{}")
+                        if not isinstance(want, dict):
+                            raise ValueError("a JSON object")
+                        reply = self.control(want)
+                    except ValueError as e:
+                        reply = {"error": str(e)}
+                    f.write(json.dumps(reply).encode() + b"\n")
+                    f.flush()
+
     # ---- loop ----
     def stream(self):
         """Like the real MCU, push the live readings on our own clock: the
@@ -549,6 +602,8 @@ def main():
                     help="seconds between live reports (ALS, temp, motion)")
     ap.add_argument("--wires", default=DEFAULT_WIRES,
                     help="connected terminals, of " + ",".join(WIRE_INDEX))
+    ap.add_argument("--control", metavar="tcp:HOST:PORT",
+                    help="take room and wiring changes as JSON lines here")
     ap.add_argument("--flash", metavar="FILE",
                     help="the MCU's flash: the firmware it runs, kept across "
                          "restarts (default: stock, every start)")
@@ -559,13 +614,17 @@ def main():
     if args.parent:
         threading.Thread(target=follow_parent, args=(args.parent,),
                          daemon=True).start()
-    Backplate(args.serial, debug=args.debug, als_vis=args.als_vis,
-              als_ir=args.als_ir, temp_c=args.temp, rh=args.rh,
-              presence=args.presence, period=args.period,
-              wires=args.wires.split(","),
-              flash_file=args.flash, ambient=args.ambient,
-              heat_rate=args.heat_rate, cool_rate=args.cool_rate,
-              room_tau=args.room_tau).serve_forever()
+    bp = Backplate(args.serial, debug=args.debug, als_vis=args.als_vis,
+                   als_ir=args.als_ir, temp_c=args.temp, rh=args.rh,
+                   presence=args.presence, period=args.period,
+                   wires=args.wires.split(","),
+                   flash_file=args.flash, ambient=args.ambient,
+                   heat_rate=args.heat_rate, cool_rate=args.cool_rate,
+                   room_tau=args.room_tau)
+    if args.control:
+        threading.Thread(target=bp.serve_control, args=(args.control,),
+                         daemon=True).start()
+    bp.serve_forever()
 
 
 if __name__ == "__main__":

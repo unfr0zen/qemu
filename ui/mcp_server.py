@@ -889,6 +889,34 @@ def t_qmp(a):
     return [text(json.loads(post("/qmp", body, timeout=60)))]
 
 
+def t_set_time(a):
+    """The guest's clock: relative (+40m, -2h, +90s, +1d), a local time
+    today (HH:MM[:SS]), a local date and time (YYYY-MM-DD HH:MM[:SS]), or
+    host (the host's time). The RTC follows, so a reboot keeps it."""
+    when = a["time"].strip()
+    m = re.fullmatch(r"([+-])(\d+)([smhd])", when)
+    if m:
+        n = int(m[2]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[3]]
+        target = f"$(( $(date +%s) {m[1]} {n} ))"
+    elif when == "host":
+        target = str(int(time.time()))
+    elif re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", when):
+        target = f"$(date -d \"$(date +%F) {when}\" +%s)"
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}(:\d{2})?", when):
+        target = f"$(date -d {shquote(when)} +%s)"
+    else:
+        raise ToolError("time: +40m, -2h, HH:MM[:SS], YYYY-MM-DD HH:MM[:SS] or host")
+    status, out, timed_out = execute(f"date -s @{target} >/dev/null && hwclock -w -u; date", 30)
+    if timed_out or status != 0:
+        raise ToolError(f"setting the clock failed: {out}")
+    return [text(f"guest time now: {out.strip()}")]
+
+
+def t_backplate(a):
+    want = {k: v for k, v in a.items() if v is not None}
+    return [text(json.loads(post("/backplate", want, timeout=15)))]
+
+
 def schema(props, required=()):
     return {"type": "object", "properties": props, "required": list(required)}
 
@@ -967,6 +995,22 @@ TOOLS = {
                           "mode": d(STR, "chmod mode, e.g. 755"),
                           "timeout_s": d(NUM, "default 600")},
                          ["path"])),
+    "set_time": (t_set_time, "Set the guest's clock (and RTC) for time-dependent tests: jump to just before a schedule point instead of waiting. "
+                 "Stock treats a jump as a clock change, not as time passing: it shifts its timers, so a schedule point jumped over does not fire. "
+                 "For schedule tests set the time, then reboot (qmp system_reset; the RTC keeps it), then let points pass.",
+                 schema({"time": d(STR, "+40m, -2h, +90s, +1d; HH:MM[:SS] today; YYYY-MM-DD HH:MM[:SS]; or host to match the host's clock")},
+                        ["time"])),
+    "backplate": (t_backplate, "The simulated backplate's room and wiring, changed while running; with no arguments, its state "
+                  "(also the circuits the unit has switched on). The room drifts to ambient over room_tau and heats/cools at the rates while switched.",
+                  schema({"temp": d(NUM, "the room now, degrees C"),
+                          "rh": d(NUM, "relative humidity, %"),
+                          "ambient": d(NUM, "where the room drifts with nothing on, degrees C"),
+                          "heat_rate": d(NUM, "degrees C an hour while heating"),
+                          "cool_rate": d(NUM, "degrees C an hour while cooling"),
+                          "room_tau": d(NUM, "hours for the room to drift most of the way to ambient"),
+                          "presence": d(BOOL, "report someone near (motion)"),
+                          "wires": {"type": "array", "items": {"type": "string"},
+                                    "description": "terminals with a wire, e.g. [\"Rh\", \"W1\", \"Y1\", \"G\", \"C\"]; the unit sees the new wiring"}})),
     "qmp": (t_qmp, "Send a QMP command to QEMU, e.g. system_reset (reboot), stop/cont (pause), human-monitor-command (HMP). quit ends QEMU and with it ui.py.",
             schema({"command": STR, "arguments": {"type": "object"}}, ["command"])),
 }
@@ -976,7 +1020,8 @@ Drives an emulated Nest thermostat (QEMU, started with ./run.sh --ui).
 status first to see whether it is up. screenshot / capture_frames show the
 screen; press_button, turn_wheel and input_sequence are the device's
 inputs; record_start/record_stop make a video. console_exec runs shell
-commands as root; pull_file/push_file move files. Console tools return a
+commands as root; pull_file/push_file move files. set_time moves the
+guest's clock; backplate sets the simulated room and wiring. Console tools return a
 cursor: pass it as `since` to console_read/console_wait so nothing printed
 in between is missed."""
 
