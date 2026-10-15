@@ -246,11 +246,13 @@ joins networks. By default:
 |---|---|---|---|---|
 | `Nest-WPA2` | 1 | -55 | WPA2-PSK (CCMP), passphrase `nestpassword` | `02:43:34:10:00:02` |
 | `Neighbour` | 11 | -78 | WPA2-PSK that rejects every passphrase | `02:43:34:10:00:03` |
+| `Attic` (hidden) | 6 | -60 | WPA2-PSK, passphrase `atticpassword` | `02:43:34:10:00:04` |
 
 `-global 'bcm43341.aps=SSID:channel:rssi[:passphrase];...'` replaces
 them (up to 7; `aps=` for none). No passphrase is an open network, `*` a
 WPA2 one no passphrase opens, anything else (8 to 63 characters, `:`
-allowed, `;` not) its WPA2-PSK passphrase. BSSIDs count up from `QEMU`'s.
+allowed, `;` not) its WPA2-PSK passphrase. A leading `!` on the SSID
+hides it (`!Attic:6:-60:atticpassword`). BSSIDs count up from `QEMU`'s.
 Every network that can be joined carries the same user-mode network.
 
 With WPA2 the drivers leave the 4-way handshake to wpa_supplicant over
@@ -273,6 +275,25 @@ dbus-send --system --print-reply --dest=net.connman \
 
 Remove the `.config` and the service's directory under `/var/lib/connman`
 afterwards; connman goes back to `QEMU` on its own.
+
+A hidden network's scan results carry an empty SSID, so connman lists it
+only as a nameless `wifi_<mac>_hidden_managed_psk`. Its name comes back
+only from a scan that probes for it (brcmfmac passes the SSIDs after the
+escan's channel list), and the join itself names it. To join `Attic`,
+provision it with `Hidden=true` and scan; connman then probes for it and
+lists it named, `wifi_<mac>_4174746963_managed_psk`, which `Connect`
+joins:
+
+```sh
+printf '[service_x]\nType=wifi\nSSID=4174746963\nHidden=true\nSecurity=psk\nPassphrase=atticpassword\n' \
+    > /var/lib/connman/x.config
+dbus-send --system --print-reply --dest=net.connman \
+    /net/connman/technology/wifi net.connman.Technology.Scan
+```
+
+A wrong passphrase ends `invalid-key` as above. A name no AP answers to
+never gets a service of its own; `Connect` on the nameless service instead
+waits for a connman agent to supply the name, and the image registers none.
 
 The unit joins at boot on its own: connman only autoconnects to networks
 it has saved, and the pre-boot (below) saves this one.

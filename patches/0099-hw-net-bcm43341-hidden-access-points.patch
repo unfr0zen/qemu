@@ -1,0 +1,183 @@
+From 3e097069d5f492c2d74db5af6c4102149d9dbb65 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 15:40:33 -0400
+Subject: [PATCH 99/99] hw/net: bcm43341: hidden access points
+
+Lets a UI's join-by-name path be tested: a leading '!' on an aps SSID
+hides it from scans unless the scan probes for its name.
+---
+ hw/net/bcm43341.c | 72 +++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 61 insertions(+), 11 deletions(-)
+
+diff --git a/hw/net/bcm43341.c b/hw/net/bcm43341.c
+index 860ff1e..b0632b7 100644
+--- a/hw/net/bcm43341.c
++++ b/hw/net/bcm43341.c
+@@ -261,7 +261,8 @@ static const struct {
+ #define EAPOL_KEY_DATA_LEN      97
+ #define EAPOL_KEY_LEN           99      /* up to the key data */
+ #define BCM_DEFAULT_APS \
+-    "Nest-WPA2:1:-55:nestpassword;Neighbour:11:-78:*"
++    "Nest-WPA2:1:-55:nestpassword;Neighbour:11:-78:*;" \
++    "!Attic:6:-60:atticpassword"
+ #define BCM_HS_TRIES            3       /* msg1/msg3 sends before deauth */
+ 
+ /* RSN: CCMP group and pairwise cipher, PSK key management */
+@@ -280,6 +281,7 @@ typedef struct BCMAp {
+     int8_t rssi;
+     bool psk;                   /* WPA2-PSK, else open */
+     bool reject;                /* WPA2-PSK that no passphrase joins */
++    bool hidden;                /* beacons carry an empty SSID */
+     uint8_t pmk[32];
+ } BCMAp;
+ 
+@@ -347,6 +349,7 @@ struct BCM43341State {
+     uint32_t bw_cap_2g;
+     uint16_t scan_sync_id;
+     bool scan_legacy;
++    uint32_t scan_named;        /* hidden APs the scan probed by name */
+     QEMUTimer *scan_timer;
+     QEMUTimer *join_timer;
+     QEMUTimer *hs_timer;
+@@ -478,9 +481,13 @@ static void bcm_send_event(BCM43341State *s, uint32_t type, uint32_t status,
+ /* -- The access points ----------------------------------------------------- */
+ 
+ /* wl_bss_info_t (version 109, 128 bytes) followed by its IEs. */
+-static size_t bcm_build_bss(const BCMAp *ap, uint8_t *p)
++/*
++ * A hidden AP's beacons carry an empty SSID; it gives its name only in
++ * answer to a probe for it, and once joined.
++ */
++static size_t bcm_build_bss(const BCMAp *ap, bool named, uint8_t *p)
+ {
+-    size_t ssid_len = strlen(ap->ssid);
++    size_t ssid_len = ap->hidden && !named ? 0 : strlen(ap->ssid);
+     uint8_t *ie = p + WL_BSS_INFO_LEN;
+     size_t ie_len;
+ 
+@@ -564,7 +571,7 @@ static void bcm_scan_done(void *opaque)
+      * bcmdhd takes one BSS per result.
+      */
+     for (unsigned i = 0; i < s->num_aps; i++) {
+-        len = bcm_build_bss(&s->aps[i], res + 12);
++        len = bcm_build_bss(&s->aps[i], s->scan_named & BIT(i), res + 12);
+         stl_le_p(res, 12 + len);
+         stl_le_p(res + 4, WL_BSS_INFO_VERSION);
+         stw_le_p(res + 8, s->scan_sync_id);
+@@ -581,8 +588,45 @@ static void bcm_scan_done(void *opaque)
+                    NULL, res, 12);
+ }
+ 
+-static void bcm_start_scan(BCM43341State *s, bool legacy, uint16_t sync_id)
++/* Whether a wlc_ssid_t names the AP. */
++static bool bcm_ssid_is(const BCMAp *ap, const uint8_t *p, size_t avail)
++{
++    uint32_t len;
++
++    if (avail < 4) {
++        return false;
++    }
++    len = ldl_le_p(p);
++    return len && len <= 32 && avail >= 4 + len && len == strlen(ap->ssid) &&
++           !memcmp(p + 4, ap->ssid, len);
++}
++
++/*
++ * A wl_scan_params_t probes by name with its ssid, or with the SSID list
++ * after channel_list (channel_num: channels low, SSIDs high 16 bits).
++ * Those names are the hidden APs that answer.
++ */
++static void bcm_start_scan(BCM43341State *s, bool legacy, uint16_t sync_id,
++                           const uint8_t *params, size_t len)
+ {
++    s->scan_named = 0;
++    for (unsigned i = 0; i < s->num_aps; i++) {
++        uint32_t num, off;
++
++        if (!s->aps[i].hidden || len < WL_SCAN_PARAMS_FIXED_SIZE) {
++            continue;
++        }
++        if (bcm_ssid_is(&s->aps[i], params, len)) {
++            s->scan_named |= BIT(i);
++        }
++        num = ldl_le_p(params + 60);
++        off = WL_SCAN_PARAMS_FIXED_SIZE + ROUND_UP((num & 0xffff) * 2, 4);
++        for (unsigned n = 0; n < (num >> 16) && off < len; n++, off += 36) {
++            if (bcm_ssid_is(&s->aps[i], params + off, len - off)) {
++                s->scan_named |= BIT(i);
++            }
++        }
++    }
+     s->scan_legacy = legacy;
+     s->scan_sync_id = sync_id;
+     timer_mod(s->scan_timer,
+@@ -1043,7 +1087,8 @@ static int bcm_set_var(BCM43341State *s, const char *name,
+         if (vlen >= 8 && lduw_le_p(val + 4) == WL_SCAN_ACTION_ABORT) {
+             timer_del(s->scan_timer);
+         } else {
+-            bcm_start_scan(s, false, vlen >= 8 ? lduw_le_p(val + 6) : 0);
++            bcm_start_scan(s, false, vlen >= 8 ? lduw_le_p(val + 6) : 0,
++                           val + 8, vlen >= 8 ? vlen - 8 : 0);
+         }
+     } else if (!strcmp(name, "join")) {
+         bcm_start_join(s, val, vlen);
+@@ -1152,7 +1197,7 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+             lduw_le_p(in + WL_SCAN_PARAMS_FIXED_SIZE) == 0xffff) {
+             timer_del(s->scan_timer);
+         } else {
+-            bcm_start_scan(s, true, 0);
++            bcm_start_scan(s, true, 0, in, inlen);
+         }
+         break;
+     case WLC_SCAN_RESULTS:
+@@ -1160,7 +1205,8 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+         if (olen >= 12 + s->num_aps * BCM_BSS_MAX) {
+             len = 12;
+             for (unsigned i = 0; i < s->num_aps; i++) {
+-                len += bcm_build_bss(&s->aps[i], out + len);
++                len += bcm_build_bss(&s->aps[i], s->scan_named & BIT(i),
++                                     out + len);
+             }
+             stl_le_p(out, len);
+             stl_le_p(out + 4, WL_BSS_INFO_VERSION);
+@@ -1196,7 +1242,7 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+         }
+         if (olen >= 4 + BCM_BSS_MAX) {
+             put32(out, olen, olen);
+-            bcm_build_bss(&s->aps[s->cur], out + 4);
++            bcm_build_bss(&s->aps[s->cur], true, out + 4);
+         }
+         break;
+     case WLC_GET_BANDLIST:
+@@ -1846,15 +1892,18 @@ static void bcm_system_reset(void *opaque)
+  * The open AP from "ssid" and "channel" first, then "aps":
+  * "SSID:channel:rssi:passphrase;..." where an empty passphrase is an open
+  * network, "*" a WPA2 one that takes none, and anything else (8 to 63
+- * characters, may hold ':') a WPA2-PSK one. BSSIDs count up from the
+- * open AP's, which is locally administered and stable across boots.
++ * characters, may hold ':') a WPA2-PSK one. A leading '!' hides the SSID.
++ * BSSIDs count up from the open AP's, which is locally administered and
++ * stable across boots.
+  */
+ static bool bcm_add_ap(BCM43341State *s, const char *ssid, unsigned channel,
+                        int rssi, const char *pass, Error **errp)
+ {
+     BCMAp *ap = &s->aps[s->num_aps];
+     size_t plen = pass ? strlen(pass) : 0;
++    bool hidden = *ssid == '!';
+ 
++    ssid += hidden;
+     if (s->num_aps == BCM_MAX_APS) {
+         error_setg(errp, "bcm43341: at most %d access points", BCM_MAX_APS);
+         return false;
+@@ -1868,6 +1917,7 @@ static bool bcm_add_ap(BCM43341State *s, const char *ssid, unsigned channel,
+         return false;
+     }
+     memset(ap, 0, sizeof(*ap));
++    ap->hidden = hidden;
+     pstrcpy(ap->ssid, sizeof(ap->ssid), ssid);
+     memcpy(ap->bssid, "\x02\x43\x34\x10\x00\x01", 6);
+     ap->bssid[5] += s->num_aps;
+-- 
+2.56.0
+
