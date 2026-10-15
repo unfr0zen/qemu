@@ -74,6 +74,14 @@ jobs:
       - name: Build
         run: ./setup.sh
 
+      # QEMU's own ARM tests: the stack changes models upstream boards share
+      # (the i.MX watchdog, I2C and uSDHC among them), and qom-test and
+      # test-hmp build every machine, flintstone and j49 included.
+      - name: qtest
+        run: |
+          ninja -C qemu-src/build
+          cd qemu-src/build && ./pyvenv/bin/meson test --suite qtest-arm --no-rebuild --print-errorlogs
+
   scripts:
     runs-on: ubuntu-24.04
     steps:
@@ -82,5 +90,14 @@ jobs:
       - name: Python
         run: python3 -m py_compile $(git ls-files '*.py')
 
+      # Syntax errors and pyflakes (undefined names, unused imports), on a
+      # pinned ruff so a new release cannot fail an unchanged tree.
+      - name: ruff
+        run: pipx run ruff==0.17.0 check --isolated --select E9,F $(git ls-files '*.py')
+
       - name: Shell
         run: for f in $(git ls-files '*.sh'); do sh -n "$f" || exit 1; done
+
+      # Warnings and errors only: the scripts split argument lists on purpose.
+      - name: shellcheck
+        run: shellcheck --severity=warning $(git ls-files '*.sh')
