@@ -1,0 +1,97 @@
+From ba3b51ee64d38e830ed9931d7f4aee951c4f896e Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 23:17:55 -0400
+Subject: [PATCH 94/94] hw/display: vivante: keep fast-clear resolves inside the
+ surface
+
+Rounding to whole status bytes added a byte past the surface, and the PE
+span rounded tiled targets to 64 rows: the clear value landed on the next
+buffer, a 16x4 block at the top left of a text texture.
+---
+ hw/display/vivante_3d.c     |  4 ++--
+ hw/display/vivante_gc.c     | 18 +++++++++++-------
+ hw/display/vivante_gc_int.h |  3 +++
+ 3 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/hw/display/vivante_3d.c b/hw/display/vivante_3d.c
+index 5afe787..33f757a 100644
+--- a/hw/display/vivante_3d.c
++++ b/hw/display/vivante_3d.c
+@@ -2171,7 +2171,7 @@ static bool viv_draw_setup(VivDraw *d)
+     d->rt_stride = st[ST_PE_COLOR_STRIDE];
+     d->rt_layout = fmt & PE_COLOR_SUPER_TILED ? VIV_SUPERTILED : VIV_TILED;
+     span = viv_pixel_offset(d->rt_layout, d->rt_stride, d->rt_bpp, 0,
+-                            ROUND_UP(d->ymax, 64));
++                            ROUND_UP(d->ymax, VIV_ROWS(d->rt_layout)));
+     viv_ts_resolve(d->s, st[ST_PE_COLOR_ADDR], span, false);
+     viv_surf_init(&d->rt, d->s, st[ST_PE_COLOR_ADDR], span, false, true);
+ 
+@@ -2186,7 +2186,7 @@ static bool viv_draw_setup(VivDraw *d)
+         zn = fu(st[ST_PE_DEPTH_NORMALIZE]);
+         d->z_scale = zn > 0.0f ? zn : d->z_bpp == 2 ? 65535.0f : 16777215.0f;
+         span = viv_pixel_offset(d->z_layout, d->z_stride, d->z_bpp, 0,
+-                                ROUND_UP(d->ymax, 64));
++                                ROUND_UP(d->ymax, VIV_ROWS(d->z_layout)));
+         viv_ts_resolve(d->s, st[ST_PE_DEPTH_ADDR], span, true);
+         viv_surf_init(&d->zb, d->s, st[ST_PE_DEPTH_ADDR], span, false, true);
+     }
+diff --git a/hw/display/vivante_gc.c b/hw/display/vivante_gc.c
+index 1d8f3d0..e7dd4d2 100644
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -296,7 +296,7 @@ void viv_ts_resolve(VivGCState *s, uint32_t surf, uint32_t size, bool depth)
+     uint32_t clear = st[depth ? ST_TS_DEPTH_CLEAR_VALUE
+                               : ST_TS_COLOR_CLEAR_VALUE];
+     hwaddr pa = viv_translate(s, surf);
+-    uint32_t first, ntiles;
++    uint32_t start, end, first, ntiles;
+     g_autofree uint8_t *ts = NULL;
+     VivSurf m;
+     bool dirty = false;
+@@ -306,11 +306,15 @@ void viv_ts_resolve(VivGCState *s, uint32_t surf, uint32_t size, bool depth)
+         pa < surf_base || pa + size > (hwaddr)surf_base + 64 * MiB) {
+         return;
+     }
+-    first = (pa - surf_base) / 64;
+-    ntiles = (pa - surf_base + size + 63) / 64 - first;
+-    /* Whole status bytes: four tiles each. */
+-    first &= ~3u;
+-    ntiles = ROUND_UP(ntiles + 3, 4);
++    /*
++     * The tiles [start, end) are the surface's. Status is read and written
++     * in whole bytes, four tiles each, but only those tiles are touched:
++     * the rest of a byte describes the memory around the surface.
++     */
++    start = (pa - surf_base) / 64;
++    end = (pa - surf_base + size + 63) / 64;
++    first = start & ~3u;
++    ntiles = ROUND_UP(end, 4) - first;
+     ts = g_malloc(ntiles / 4);
+     address_space_read(&address_space_memory, status + first / 4,
+                        MEMTXATTRS_UNSPECIFIED, ts, ntiles / 4);
+@@ -321,7 +325,7 @@ void viv_ts_resolve(VivGCState *s, uint32_t surf, uint32_t size, bool depth)
+         return;
+     }
+     viv_surf_init(&m, s, surf_base + first * 64, ntiles * 64, true, true);
+-    for (i = 0; i < ntiles; i++) {
++    for (i = start - first; i < end - first; i++) {
+         uint8_t *tile;
+ 
+         if (!(ts[i / 4] >> ((i % 4) * 2) & 3)) {
+diff --git a/hw/display/vivante_gc_int.h b/hw/display/vivante_gc_int.h
+index 8405a3e..8a5b8b2 100644
+--- a/hw/display/vivante_gc_int.h
++++ b/hw/display/vivante_gc_int.h
+@@ -68,6 +68,9 @@ struct VivGCState {
+ 
+ /* Surface layouts: rows, 4x4 tiles, or 64x64 supertiles of 4x4 tiles. */
+ enum { VIV_LINEAR, VIV_TILED, VIV_SUPERTILED };
++/* The rows a layout's tile spans: a surface's height is a multiple of it. */
++#define VIV_ROWS(layout) \
++    ((layout) == VIV_SUPERTILED ? 64 : (layout) == VIV_TILED ? 4 : 1)
+ 
+ /*
+  * Byte offset of pixel (x, y) in a surface whose pixel rows (of its
+-- 
+2.56.0
+
