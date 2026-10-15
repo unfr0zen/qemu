@@ -227,7 +227,8 @@ has left the replay buffer) and `POST /qmp`.
 
 A BCM43341 sits behind an SDIO card on usdhc2. The stock `dhd.ko`
 (bcmdhd 1.141.66.4) loads the stock firmware (`43341b0`, 6.30.190.36) into
-it (6.4-8 drives it with brcmfmac, backported from Linux 4.12, instead), and the unit sees one open access point: SSID `QEMU`, channel 6, BSSID
+it (6.4-8 drives it with brcmfmac, backported from Linux 4.12, instead). The
+unit's own network is the open access point `QEMU`, channel 6, BSSID
 `02:43:34:10:00:01`. `run.sh` puts QEMU's user-mode network behind it
 (`-nic user,model=bcm43341,restrict=on`), so the unit is 10.0.2.15 with a
 default route through 10.0.2.2 (set by the pre-boot, below), and nothing
@@ -237,6 +238,41 @@ device the image came from and takes on that account's state: °F, and
 firmware updates, which it downloads and installs into
 the NAND. Offline, every checkout boots the same. A `-nic` or `-netdev` of
 your own replaces it.
+
+A scan also finds more access points, for testing how the UI lists and
+joins networks. By default:
+
+| SSID | Channel | RSSI | Security | BSSID |
+|---|---|---|---|---|
+| `Nest-WPA2` | 1 | -55 | WPA2-PSK (CCMP), passphrase `nestpassword` | `02:43:34:10:00:02` |
+| `Neighbour` | 11 | -78 | WPA2-PSK that rejects every passphrase | `02:43:34:10:00:03` |
+
+`-global 'bcm43341.aps=SSID:channel:rssi[:passphrase];...'` replaces
+them (up to 7; `aps=` for none). No passphrase is an open network, `*` a
+WPA2 one no passphrase opens, anything else (8 to 63 characters, `:`
+allowed, `;` not) its WPA2-PSK passphrase. BSSIDs count up from `QEMU`'s.
+Every network that can be joined carries the same user-mode network.
+
+With WPA2 the drivers leave the 4-way handshake to wpa_supplicant over
+EAPOL data frames, and install its keys with `wsec_key`; the chip model is
+the AP side: PMK from the passphrase, msg1, msg2's MIC checked with the
+KCK, msg3 with the GTK wrapped by the KEK, msg4. Data only passes once
+msg4 is in, and in the clear between chip and host either way. A wrong
+passphrase fails msg2's MIC: the model resends msg1 twice and then
+deauths (reason 15, 4-way handshake timeout), so the link never passes
+data and connman's service ends `idle` with Error `invalid-key`. To join
+by hand, provision it (connman watches the directory) and connect:
+
+```sh
+printf '[service_x]\nType=wifi\nName=Nest-WPA2\nPassphrase=nestpassword\n' \
+    > /var/lib/connman/x.config
+dbus-send --system --print-reply --dest=net.connman \
+    /net/connman/service/wifi_<mac>_4e6573742d57504132_managed_psk \
+    net.connman.Service.Connect
+```
+
+Remove the `.config` and the service's directory under `/var/lib/connman`
+afterwards; connman goes back to `QEMU` on its own.
 
 The unit joins at boot on its own: connman only autoconnects to networks
 it has saved, and the pre-boot (below) saves this one.
