@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The patch stack on the QEMU it is written against (setup.sh's base):
+  # numbered without gaps, applying one at a time in order, clean under
+  # QEMU's checkpatch where this change touches it, and building.
+  patches:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Numbering
+        run: |
+          n=0
+          for p in patches/*.patch; do
+            n=$((n + 1))
+            want=$(printf '%04d-' "$n")
+            case "$(basename "$p")" in
+              "$want"*) ;;
+              *) echo "::error file=$p::expected a name starting $want"; exit 1 ;;
+            esac
+          done
+          echo "$n patches, numbered 0001 to $(printf '%04d' "$n")"
+
+      - name: Clone QEMU
+        run: |
+          base=$(sed -n 's/.*--branch \(v[0-9.]*\).*/\1/p' setup.sh | head -1)
+          git clone --depth 1 --branch "$base" https://gitlab.com/qemu-project/qemu.git qemu-src
+
+      # One at a time, as setup.sh applies them: a later patch may touch a
+      # file an earlier one creates.
+      - name: Apply
+        run: |
+          for p in patches/*.patch; do
+            git -C qemu-src apply "$PWD/$p" || { echo "::error file=$p::does not apply"; exit 1; }
+          done
+
+      # The stack predates checkpatch here, so only the patches this change
+      # adds or edits must be free of errors; every patch's result is listed.
+      - name: checkpatch
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          changed=""
+          if git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            changed=$(git diff --name-only --diff-filter=AM "$BASE" HEAD -- patches/)
+          fi
+          fail=0
+          for p in patches/*.patch; do
+            out=$(perl qemu-src/scripts/checkpatch.pl --no-signoff -q "$p" 2>&1) || true
+            total=$(printf '%s\n' "$out" | grep '^total:' || echo 'total: clean')
+            echo "$(basename "$p"): $total"
+            if printf '%s\n' "$changed" | grep -qx "$p" && printf '%s\n' "$out" | grep -q '^ERROR:'; then
+              printf '%s\n' "$out"
+              echo "::error file=$p::checkpatch errors"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build python3-venv \
+            flex bison pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev libslirp-dev
+
+      - name: Build
+        run: ./setup.sh
+
+      # QEMU's own ARM tests: the stack changes models upstream boards share
+      # (the i.MX watchdog, I2C and uSDHC among them), and qom-test and
+      # test-hmp build every machine, flintstone and j49 included.
+      - name: qtest
+        run: |
+          ninja -C qemu-src/build
+          cd qemu-src/build && ./pyvenv/bin/meson test --suite qtest-arm --no-rebuild --print-errorlogs
+
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Python
+        run: python3 -m py_compile $(git ls-files '*.py')
+
+      # Syntax errors and pyflakes (undefined names, unused imports), on a
+      # pinned ruff so a new release cannot fail an unchanged tree.
+      - name: ruff
+        run: pipx run ruff==0.17.0 check --isolated --select E9,F $(git ls-files '*.py')
+
+      - name: Shell
+        run: for f in $(git ls-files '*.sh'); do sh -n "$f" || exit 1; done
+
+      # Warnings and errors only: the scripts split argument lists on purpose.
+      - name: shellcheck
+        run: shellcheck --severity=warning $(git ls-files '*.sh')

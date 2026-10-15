@@ -326,7 +326,7 @@ def nestlocal(con, gen2=False):
 # reachable as .2 and the DNS forwarder is .3.
 SLIRP_ADDR, SLIRP_GW, SLIRP_DNS, SLIRP_PREFIX = \
     "10.0.2.15", "10.0.2.2", "10.0.2.3", "24"
-IPV4_STATIC = [f"IPv4.method=manual", f"IPv4.local_address={SLIRP_ADDR}",
+IPV4_STATIC = ["IPv4.method=manual", f"IPv4.local_address={SLIRP_ADDR}",
                f"IPv4.netmask_prefixlen={SLIRP_PREFIX}",
                f"IPv4.gateway={SLIRP_GW}",
                f"Nameservers.configuration={SLIRP_DNS};"]
