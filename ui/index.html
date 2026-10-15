@@ -27,6 +27,9 @@
   * { box-sizing: border-box; }
   html { background: var(--bg-2); }
   html, body { margin: 0; }
+  /* The wheel over the device turns the ring and over the console scrolls
+     it; the page stays put under either. */
+  html:has(#device:hover, #term:hover), html.wheel-lock { overflow: hidden; }
   body {
     min-height: 100vh;
     background: radial-gradient(ellipse at 30% 15%, #67686d 0%, var(--bg) 45%, var(--bg-2) 100%);
@@ -539,6 +542,23 @@
   // detent per 100 px of scroll (about one notch of a mouse wheel).
   const SCROLL_PX = 100;
   let scrollAcc = 0;
+  // A background window gets wheel events but no hover, so a wheel on the
+  // device or the console locks the page itself until the pointer leaves or
+  // the wheel has been still for a second.
+  let wheelLockTimer = 0;
+  function wheelUnlock() {
+    clearTimeout(wheelLockTimer);
+    document.documentElement.classList.remove("wheel-lock");
+  }
+  window.addEventListener("wheel", (e) => {
+    if (!$("device").contains(e.target) && !$("term").contains(e.target)) return;
+    document.documentElement.classList.add("wheel-lock");
+    clearTimeout(wheelLockTimer);
+    wheelLockTimer = setTimeout(wheelUnlock, 1000);
+  }, { capture: true, passive: true });
+  for (const id of ["device", "term"]) {
+    $(id).addEventListener("pointerleave", wheelUnlock);
+  }
   $("device").addEventListener("wheel", (e) => {
     e.preventDefault();
     scrollAcc += e.deltaMode === 0 ? e.deltaY : e.deltaY * SCROLL_PX;
