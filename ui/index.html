@@ -27,6 +27,9 @@
   * { box-sizing: border-box; }
   html { background: var(--bg-2); }
   html, body { margin: 0; }
+  /* The wheel over the device turns the ring and over the console scrolls
+     it; the page stays put under either. */
+  html:has(#device:hover, #term:hover) { overflow: hidden; }
   body {
     min-height: 100vh;
     background: radial-gradient(ellipse at 30% 15%, #67686d 0%, var(--bg) 45%, var(--bg-2) 100%);
