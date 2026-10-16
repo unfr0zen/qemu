@@ -313,6 +313,34 @@ def screen(con, sleep=False):
     return f"screen: {what}"
 
 
+HOSTNAME_CONF = "/etc/hostname.conf"
+STOCK_ORDER = "os serial# ethaddr file"
+FILE_ORDER = "file os serial# ethaddr"
+
+
+def hostname(con, name=None):
+    """The console prompt's name. /etc/init.d/hostname uses the first of
+    the order in hostname.conf that gives one, and stock that is U-Boot's
+    serial#. With name, /etc/hostname comes first instead (serial# is left
+    alone); without, the stock order and file go back."""
+    order = FILE_ORDER if name else STOCK_ORDER
+    if name:
+        if not re.fullmatch(r"[-A-Za-z0-9]+", name):
+            raise RuntimeError(f"not a host name: {name}")
+        if con.run("[ -f /etc/hostname.stock ] || "
+                   "cp /etc/hostname /etc/hostname.stock") != 0 or \
+                con.run(f"echo {name} > /etc/hostname") != 0:
+            raise RuntimeError("could not write /etc/hostname")
+    elif con.run("[ -f /etc/hostname.stock ]") == 0:
+        if con.run("mv /etc/hostname.stock /etc/hostname") != 0:
+            raise RuntimeError("could not restore /etc/hostname")
+    elif con.run(f"grep -qx 'order: {STOCK_ORDER}' {HOSTNAME_CONF}") == 0:
+        return "hostname: the serial number already"
+    if con.run(f"sed -i 's/^order:.*/order: {order}/' {HOSTNAME_CONF}") != 0:
+        raise RuntimeError(f"could not write {HOSTNAME_CONF}")
+    return f"hostname: {name}" if name else "hostname: the serial number"
+
+
 def nestlocal(con, gen2=False):
     """Whether ha/qemu_install.py has put nestlocal on this root: run.sh
     --mqtt only relays the broker to it."""
@@ -469,6 +497,9 @@ def main():
     ap.add_argument("--sleep", action="store_true",
                     help="put the display's stock 20 s timeout back instead "
                          "of keeping it on")
+    ap.add_argument("--hostname",
+                    help="the console prompt's name instead of the serial "
+                         "number")
     ap.add_argument("--factory", action="store_true",
                     help="empty the firmware's writable volumes instead")
     ap.add_argument("--root", type=int, choices=(0, 1),
@@ -502,6 +533,7 @@ def main():
             done.append(root_login(con))
             done.append(quiet_console(con))
             done.append(screen(con, args.sleep))
+            done.append(hostname(con, args.hostname))
             if con.run("mount -t ubifs ubi0:user-config "
                        "/media/user-config") != 0:
                 raise RuntimeError("could not mount user-config")
