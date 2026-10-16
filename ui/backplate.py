@@ -115,6 +115,13 @@ brightness), starting at 21.5 C / 45 %RH, and someone in front of it (PIR
 motion on every poll), so the room reads as occupied. --no-presence leaves
 the room empty, as auto-away sees it. Motion is not input to nlclient: the
 display blanks after its sleeptimeout either way (the pre-boot sets that).
+
+Quiet: once the front sends 0xa1 QUIET (u16, its longest sleep in seconds)
+the backplate stops reporting, as the MCU does while the front sleeps, and
+wakes it with 0x14 WAKEUP_VEC (u16) when one of the sources 0xa4 enabled
+fires: 0x01 the sleep running out, 0x04 the room leaving the first 0xc2
+step's range, 0x08 PIR or 0x80 near PIR presence; then it reports again.
+Any other frame from the front ends quiet too.
 """
 import argparse
 import json
@@ -133,6 +140,7 @@ MAX_PAYLOAD = 0x400     # the largest the front sends: an update record
 MSG_TEMP = 0x02
 MSG_WIRES = 0x04
 MSG_PIR = 0x05
+MSG_NEAR_PIR = 0x07
 MSG_ACK_SWITCH = 0x06
 MSG_PINS = 0x09
 MSG_ALS = 0x0a
@@ -140,6 +148,13 @@ MSG_UPDATE_ACK = 0x11
 MSG_TEMP_BUF = 0x22
 MSG_ALS_BUF = 0x29
 MSG_TEMP_COMP = 0xc3
+MSG_WAKEUP_VEC = 0x14
+MSG_QUIET = 0xa1
+MSG_WAKE_SOURCES = 0xa4
+MSG_TEMP_WAKE = 0xc2
+# The sleep settings sent before QUIET, which do not end it
+SLEEP_SETTINGS = {0xa4, 0xb3, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2}
+WAKE_TIMER, WAKE_TEMP, WAKE_PIR, WAKE_NEAR_PIR = 0x01, 0x04, 0x08, 0x80
 MSG_END_BUF = 0x2f
 
 # front -> back firmware update requests
@@ -190,6 +205,14 @@ MONO = dict(version="2.3.11", description="TFE (BP_A2)",
 BSL = dict(version="3.1", description="BSL",
            host="jenkins-agent-190-v17-emb-prod", user="jenkins-slave",
            date="2019-04-05 20:26:31")
+# The gen 2's (--gen2): a Backplate-2.2x running what the gen 2's
+# nlbpfirmware.plist ships for it (TFE (BP_D2D) 4.2.8, BSL 3.1). The model's
+# suffix is a guess within the image's Backplate-2.20 to 2.30.
+GEN2_MODEL = b"Backplate-2.21"
+GEN2_MONO = dict(version="4.2.8", description="TFE (BP_D2D)",
+                 host="jenkins-agent-143-v17-emb-prod", user="jenkins-slave",
+                 date="2019-04-03 17:36:54")
+GEN2_BSL = dict(GEN2_MONO, version="3.1", description="BSL")
 
 
 def srec_image(records):
@@ -254,7 +277,8 @@ class Backplate:
     def __init__(self, spec, debug=False, als_vis=200, als_ir=60,
                  temp_c=21.5, rh=45.0, presence=True, period=2.0,
                  wires=("Rh", "C", "W1", "Y1", "G"), flash_file=None,
-                 ambient=16.0, heat_rate=3.0, cool_rate=2.5, room_tau=8.0):
+                 ambient=16.0, heat_rate=3.0, cool_rate=2.5, room_tau=8.0,
+                 gen2=False):
         self.spec = spec
         self.debug = debug
         self.als_vis = als_vis
@@ -273,17 +297,25 @@ class Backplate:
         self.als_samples = []                 # ALS_BUF samples not yet flushed
         self.als_time = self.room_time
         self.temp_comp = False                # Sunblock's SetTempCompMode
+        self.quiet_until = None               # quiet: when its sleep runs out
+        self.wake_sources = 0
+        self.wake_range = (None, None)        # the first 0xc2 step, degrees C
         self.presence = presence
         self.period = period
         self.wires = wires
         self.attached = threading.Event()     # the front unit reset us
-        self.mono = dict(MONO)
-        self.bsl = dict(BSL)
+        self.gen2 = gen2
+        self.model = GEN2_MODEL if gen2 else b"Backplate-6.0"
+        self.mono = dict(GEN2_MONO if gen2 else MONO)
+        self.bsl = dict(GEN2_BSL if gen2 else BSL)
         self.flash_file = flash_file
         if flash_file and os.path.exists(flash_file):
             with open(flash_file) as f:
                 saved = json.load(f)
-            self.mono, self.bsl = saved["mono"], saved["bsl"]
+            # Only firmware for this backplate: a gen 3 image in a gen 2's
+            # flash file is from before --gen2.
+            if saved["mono"]["description"].startswith("TFE (BP_D2") == gen2:
+                self.mono, self.bsl = saved["mono"], saved["bsl"]
         self.update = None                    # (kind, {seq: record}) in the BSL
         self.buf = b""
         self.sock = None
@@ -416,6 +448,9 @@ class Backplate:
             self.als_samples = self.als_samples[-(MAX_ALS - 1):] + [struct.pack("<HHH", 0, v, v)]
         if self.presence:
             self.send(MSG_PIR, struct.pack("<HH", 0x03E8, 0x03E8))
+            # The gen 2's near PIR: someone close, past stock's threshold (15).
+            if self.gen2:
+                self.send(MSG_NEAR_PIR, struct.pack("<H", 100))
 
     def flush(self):
         """The samples since the last flush, then how many messages held them."""
@@ -505,12 +540,32 @@ class Backplate:
     # ---- loop ----
     def stream(self):
         """Like the real MCU, push the live readings on our own clock: the
-        front unit only polls (0xff) now and then."""
+        front unit only polls (0xff) now and then. Quiet, only a wake."""
         self.attached.wait()
         while True:
             time.sleep(self.period)
-            if self.update is None:
-                self.report()
+            if self.update is not None:
+                continue
+            if self.quiet_until is not None:
+                self.room_step()
+                vector = self.wake_vector()
+                if not vector:
+                    continue
+                self.quiet_until = None
+                self.send(MSG_WAKEUP_VEC, struct.pack("<H", vector))
+            self.report()
+
+    def wake_vector(self):
+        """The enabled wake sources that fire now."""
+        low, high = self.wake_range
+        fired = 0
+        if time.monotonic() >= self.quiet_until:
+            fired |= WAKE_TIMER
+        if (low is not None and self.temp_c < low) or (high is not None and self.temp_c > high):
+            fired |= WAKE_TEMP
+        if self.presence:
+            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.gen2 else 0)
+        return fired & (self.wake_sources | WAKE_TIMER)
 
     def serve_forever(self):
         threading.Thread(target=self.stream, daemon=True).start()
@@ -546,7 +601,7 @@ class Backplate:
             0x9b: (0x1b, b["version"].encode()),             # BSL version
             0x9c: (0x1c, fw_info(**b)),                      # BSL info
             0x9f: (0x1f, b"02AA01AB0000001"),                # serial
-            0x9e: (0x1e, b"Backplate-6.0"),                  # model
+            0x9e: (0x1e, self.model),                        # model
             0x85: (0x17, b"\x00\x00"),                      # BP status
         }.get(mtype)
 
@@ -573,7 +628,16 @@ class Backplate:
         return True
 
     def handle(self, mtype, payload):
-        if mtype == MSG_SWITCH and len(payload) == 2:
+        if mtype not in SLEEP_SETTINGS and mtype != MSG_QUIET:
+            self.quiet_until = None
+        if mtype == MSG_QUIET and len(payload) == 2:
+            self.quiet_until = time.monotonic() + max(1, struct.unpack("<H", payload)[0])
+        elif mtype == MSG_WAKE_SOURCES and len(payload) == 2:
+            self.wake_sources = struct.unpack("<H", payload)[0]
+        elif mtype == MSG_TEMP_WAKE and len(payload) >= 6:
+            _, low, high = struct.unpack_from("<Hhh", payload)
+            self.wake_range = tuple(None if v == -0x8000 else v / 100 for v in (low, high))
+        elif mtype == MSG_SWITCH and len(payload) == 2:
             circuit, state = payload
             if (circuit in self.circuits) != bool(state):
                 self.switch(circuit, state)
@@ -641,6 +705,8 @@ def main():
                     help="connected terminals, of " + ",".join(WIRE_INDEX))
     ap.add_argument("--control", metavar="tcp:HOST:PORT",
                     help="take room and wiring changes as JSON lines here")
+    ap.add_argument("--gen2", action="store_true",
+                    help="be the gen 2's backplate (Backplate-2.21, TFE (BP_D2D) 4.2.8)")
     ap.add_argument("--flash", metavar="FILE",
                     help="the MCU's flash: the firmware it runs, kept across "
                          "restarts (default: stock, every start)")
@@ -657,7 +723,7 @@ def main():
                    wires=args.wires.split(","),
                    flash_file=args.flash, ambient=args.ambient,
                    heat_rate=args.heat_rate, cool_rate=args.cool_rate,
-                   room_tau=args.room_tau)
+                   room_tau=args.room_tau, gen2=args.gen2)
     if args.control:
         threading.Thread(target=bp.serve_control, args=(args.control,),
                          daemon=True).start()
