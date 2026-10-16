@@ -435,9 +435,10 @@ $SERIAL_ARGS $BOARD_ARGS \
     # The fake backplate (sensor) MCU on the sensor-MCU serial: answers
     # the front unit and streams bright ALS samples so nlclient lights
     # the display (it keeps the panel asleep until the ALS reports).
+    # shellcheck disable=SC2046 # --gen2 is either there or not
     python3 "$script_path/ui/backplate.py" --serial "tcp:127.0.0.1:$bp_port" \
         --control "tcp:127.0.0.1:$bpctl_port" \
-        --flash "$NAND.backplate" --parent $$ &
+        --flash "$NAND.backplate" $([ "$gen2" = 1 ] && echo --gen2) --parent $$ &
     # The Thread radio (em35x-ncp on ECSPI3, McSPI2 on the gen 2): the
     # ConnectIP network co-processor wpantund drives (ui/em35x.py
     # --debug logs it). The gen 2's EUI-64 is the unit's own, from its

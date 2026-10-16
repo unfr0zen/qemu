@@ -133,6 +133,7 @@ MAX_PAYLOAD = 0x400     # the largest the front sends: an update record
 MSG_TEMP = 0x02
 MSG_WIRES = 0x04
 MSG_PIR = 0x05
+MSG_NEAR_PIR = 0x07
 MSG_ACK_SWITCH = 0x06
 MSG_PINS = 0x09
 MSG_ALS = 0x0a
@@ -190,6 +191,14 @@ MONO = dict(version="2.3.11", description="TFE (BP_A2)",
 BSL = dict(version="3.1", description="BSL",
            host="jenkins-agent-190-v17-emb-prod", user="jenkins-slave",
            date="2019-04-05 20:26:31")
+# The gen 2's (--gen2): a Backplate-2.2x running what the gen 2's
+# nlbpfirmware.plist ships for it (TFE (BP_D2D) 4.2.8, BSL 3.1). The model's
+# suffix is a guess within the image's Backplate-2.20 to 2.30.
+GEN2_MODEL = b"Backplate-2.21"
+GEN2_MONO = dict(version="4.2.8", description="TFE (BP_D2D)",
+                 host="jenkins-agent-143-v17-emb-prod", user="jenkins-slave",
+                 date="2019-04-03 17:36:54")
+GEN2_BSL = dict(GEN2_MONO, version="3.1", description="BSL")
 
 
 def srec_image(records):
@@ -254,7 +263,8 @@ class Backplate:
     def __init__(self, spec, debug=False, als_vis=200, als_ir=60,
                  temp_c=21.5, rh=45.0, presence=True, period=2.0,
                  wires=("Rh", "C", "W1", "Y1", "G"), flash_file=None,
-                 ambient=16.0, heat_rate=3.0, cool_rate=2.5, room_tau=8.0):
+                 ambient=16.0, heat_rate=3.0, cool_rate=2.5, room_tau=8.0,
+                 gen2=False):
         self.spec = spec
         self.debug = debug
         self.als_vis = als_vis
@@ -277,13 +287,18 @@ class Backplate:
         self.period = period
         self.wires = wires
         self.attached = threading.Event()     # the front unit reset us
-        self.mono = dict(MONO)
-        self.bsl = dict(BSL)
+        self.gen2 = gen2
+        self.model = GEN2_MODEL if gen2 else b"Backplate-6.0"
+        self.mono = dict(GEN2_MONO if gen2 else MONO)
+        self.bsl = dict(GEN2_BSL if gen2 else BSL)
         self.flash_file = flash_file
         if flash_file and os.path.exists(flash_file):
             with open(flash_file) as f:
                 saved = json.load(f)
-            self.mono, self.bsl = saved["mono"], saved["bsl"]
+            # Only firmware for this backplate: a gen 3 image in a gen 2's
+            # flash file is from before --gen2.
+            if saved["mono"]["description"].startswith("TFE (BP_D2") == gen2:
+                self.mono, self.bsl = saved["mono"], saved["bsl"]
         self.update = None                    # (kind, {seq: record}) in the BSL
         self.buf = b""
         self.sock = None
@@ -416,6 +431,9 @@ class Backplate:
             self.als_samples = self.als_samples[-(MAX_ALS - 1):] + [struct.pack("<HHH", 0, v, v)]
         if self.presence:
             self.send(MSG_PIR, struct.pack("<HH", 0x03E8, 0x03E8))
+            # The gen 2's near PIR: someone close, past stock's threshold (15).
+            if self.gen2:
+                self.send(MSG_NEAR_PIR, struct.pack("<H", 100))
 
     def flush(self):
         """The samples since the last flush, then how many messages held them."""
@@ -546,7 +564,7 @@ class Backplate:
             0x9b: (0x1b, b["version"].encode()),             # BSL version
             0x9c: (0x1c, fw_info(**b)),                      # BSL info
             0x9f: (0x1f, b"02AA01AB0000001"),                # serial
-            0x9e: (0x1e, b"Backplate-6.0"),                  # model
+            0x9e: (0x1e, self.model),                        # model
             0x85: (0x17, b"\x00\x00"),                      # BP status
         }.get(mtype)
 
@@ -641,6 +659,8 @@ def main():
                     help="connected terminals, of " + ",".join(WIRE_INDEX))
     ap.add_argument("--control", metavar="tcp:HOST:PORT",
                     help="take room and wiring changes as JSON lines here")
+    ap.add_argument("--gen2", action="store_true",
+                    help="be the gen 2's backplate (Backplate-2.21, TFE (BP_D2D) 4.2.8)")
     ap.add_argument("--flash", metavar="FILE",
                     help="the MCU's flash: the firmware it runs, kept across "
                          "restarts (default: stock, every start)")
@@ -657,7 +677,7 @@ def main():
                    wires=args.wires.split(","),
                    flash_file=args.flash, ambient=args.ambient,
                    heat_rate=args.heat_rate, cool_rate=args.cool_rate,
-                   room_tau=args.room_tau)
+                   room_tau=args.room_tau, gen2=args.gen2)
     if args.control:
         threading.Thread(target=bp.serve_control, args=(args.control,),
                          daemon=True).start()
