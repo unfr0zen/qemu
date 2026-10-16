@@ -115,6 +115,13 @@ brightness), starting at 21.5 C / 45 %RH, and someone in front of it (PIR
 motion on every poll), so the room reads as occupied. --no-presence leaves
 the room empty, as auto-away sees it. Motion is not input to nlclient: the
 display blanks after its sleeptimeout either way (the pre-boot sets that).
+
+Quiet: once the front sends 0xa1 QUIET (u16, its longest sleep in seconds)
+the backplate stops reporting, as the MCU does while the front sleeps, and
+wakes it with 0x14 WAKEUP_VEC (u16) when one of the sources 0xa4 enabled
+fires: 0x01 the sleep running out, 0x04 the room leaving the first 0xc2
+step's range, 0x08 PIR or 0x80 near PIR presence; then it reports again.
+Any other frame from the front ends quiet too.
 """
 import argparse
 import json
@@ -141,6 +148,13 @@ MSG_UPDATE_ACK = 0x11
 MSG_TEMP_BUF = 0x22
 MSG_ALS_BUF = 0x29
 MSG_TEMP_COMP = 0xc3
+MSG_WAKEUP_VEC = 0x14
+MSG_QUIET = 0xa1
+MSG_WAKE_SOURCES = 0xa4
+MSG_TEMP_WAKE = 0xc2
+# The sleep settings sent before QUIET, which do not end it
+SLEEP_SETTINGS = {0xa4, 0xb3, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2}
+WAKE_TIMER, WAKE_TEMP, WAKE_PIR, WAKE_NEAR_PIR = 0x01, 0x04, 0x08, 0x80
 MSG_END_BUF = 0x2f
 
 # front -> back firmware update requests
@@ -283,6 +297,9 @@ class Backplate:
         self.als_samples = []                 # ALS_BUF samples not yet flushed
         self.als_time = self.room_time
         self.temp_comp = False                # Sunblock's SetTempCompMode
+        self.quiet_until = None               # quiet: when its sleep runs out
+        self.wake_sources = 0
+        self.wake_range = (None, None)        # the first 0xc2 step, degrees C
         self.presence = presence
         self.period = period
         self.wires = wires
@@ -523,12 +540,32 @@ class Backplate:
     # ---- loop ----
     def stream(self):
         """Like the real MCU, push the live readings on our own clock: the
-        front unit only polls (0xff) now and then."""
+        front unit only polls (0xff) now and then. Quiet, only a wake."""
         self.attached.wait()
         while True:
             time.sleep(self.period)
-            if self.update is None:
-                self.report()
+            if self.update is not None:
+                continue
+            if self.quiet_until is not None:
+                self.room_step()
+                vector = self.wake_vector()
+                if not vector:
+                    continue
+                self.quiet_until = None
+                self.send(MSG_WAKEUP_VEC, struct.pack("<H", vector))
+            self.report()
+
+    def wake_vector(self):
+        """The enabled wake sources that fire now."""
+        low, high = self.wake_range
+        fired = 0
+        if time.monotonic() >= self.quiet_until:
+            fired |= WAKE_TIMER
+        if (low is not None and self.temp_c < low) or (high is not None and self.temp_c > high):
+            fired |= WAKE_TEMP
+        if self.presence:
+            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.gen2 else 0)
+        return fired & (self.wake_sources | WAKE_TIMER)
 
     def serve_forever(self):
         threading.Thread(target=self.stream, daemon=True).start()
@@ -591,7 +628,16 @@ class Backplate:
         return True
 
     def handle(self, mtype, payload):
-        if mtype == MSG_SWITCH and len(payload) == 2:
+        if mtype not in SLEEP_SETTINGS and mtype != MSG_QUIET:
+            self.quiet_until = None
+        if mtype == MSG_QUIET and len(payload) == 2:
+            self.quiet_until = time.monotonic() + max(1, struct.unpack("<H", payload)[0])
+        elif mtype == MSG_WAKE_SOURCES and len(payload) == 2:
+            self.wake_sources = struct.unpack("<H", payload)[0]
+        elif mtype == MSG_TEMP_WAKE and len(payload) >= 6:
+            _, low, high = struct.unpack_from("<Hhh", payload)
+            self.wake_range = tuple(None if v == -0x8000 else v / 100 for v in (low, high))
+        elif mtype == MSG_SWITCH and len(payload) == 2:
             circuit, state = payload
             if (circuit in self.circuits) != bool(state):
                 self.switch(circuit, state)
