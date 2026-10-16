@@ -180,7 +180,7 @@ the firmware sees the radio as absent.
 `ui/mcp_server.py` is an MCP server (stdio, standard library only) over
 the page's HTTP API, so an agent can use the unit the way a person at the
 page does. `.mcp.json` registers it for Claude Code as `nest` (other agents:
-[README](../README.md#driving-it-from-an-agent-mcp)). It talks to the newest
+[README](../README.md#mcp-server)). It talks to the newest
 unit running on the host, found from `ps` (each `ui.py` has its `--port`
 on its command line), and looks again when that unit stops answering;
 `--url` or `NEST_UI_URL` pins one.

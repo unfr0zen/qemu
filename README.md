@@ -48,7 +48,6 @@ pipx install 'meson>=1.5' && pipx install ninja
 - Re-run `./setup.sh` to rebuild after editing `qemu-src/`.
 - Patches apply only to a fresh clone: after pulling new patches,
   `rm -rf qemu-src && ./setup.sh`.
-- Optional: `ffmpeg` on `PATH` for MCP screen recordings.
 
 ## Run
 
@@ -85,12 +84,46 @@ You supply the NAND image; formats in [docs/nand-image.md](docs/nand-image.md).
 
 ### MCP server
 
-`ui/mcp_server.py` (stdio) exposes screenshots, recordings, inputs, console,
-files, clock, backplate and QMP of the newest `./run.sh --ui` unit.
+`ui/mcp_server.py` (stdio, standard library only) gives an agent the newest
+`./run.sh --ui` unit: screenshots, recordings, button, ring, console, files,
+clock, backplate and QMP. Tool list:
+[docs/qemu.md](docs/qemu.md#driving-it-from-an-agent-mcp).
 
-- Claude Code in this repo: declared in `.mcp.json` as `nest`.
-- Other clients: `python3 /path/to/nest-qemu/ui/mcp_server.py`.
-- Tool list: [docs/qemu.md](docs/qemu.md#driving-it-from-an-agent-mcp).
+```sh
+./run.sh --ui --ssh 2222   # --ssh: files over ssh (~3 MB/s) instead of the console (~60 KB/s)
+```
+
+Claude Code in this repo: nothing to do, `.mcp.json` declares it as `nest`.
+Elsewhere:
+
+```sh
+claude mcp add --scope user nest -- python3 /path/to/qemu/ui/mcp_server.py
+```
+
+Claude Desktop, Cursor and other JSON-configured clients:
+
+```json
+{
+  "mcpServers": {
+    "nest": {
+      "command": "python3",
+      "args": ["/path/to/qemu/ui/mcp_server.py"]
+    }
+  }
+}
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.nest]
+command = "python3"
+args = ["/path/to/qemu/ui/mcp_server.py"]
+```
+
+- Check: ask the agent to call `status`.
+- Pin a unit: `--url http://127.0.0.1:PORT` in `args`, or `NEST_UI_URL`.
+- Recordings need `ffmpeg` on `PATH` (PNG frames without it).
 
 ## Disclaimer
 
