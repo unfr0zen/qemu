@@ -1,0 +1,695 @@
+From 32652ddc26e6350a25e73a6bb9abeea6399aef90 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 07:08:06 -0400
+Subject: [PATCH 103/103] hw/usb: cihdrc-udc: fix ep0 control sequencing races
+
+Hold bus reset for 10 ms before reporting RESETDONE so subsequent SETUP
+traffic does not race reset cleanup. Retain one-shot status tokens until
+the guest primes their dTDs, and defer the next SETUP until the preceding
+EP0 completion is acknowledged. Preserve completion latches across FLUSH.
+
+Buffer fire-and-forget OUT traffic until descriptors are available, with
+bounded chardev backpressure. Accept direction-encoded IN endpoint
+addresses and retain the requested address in bridge replies.
+---
+ hw/usb/cihdrc-udc.c               | 153 ++++++++++++++++++++++---
+ hw/usb/omap3_musb.c               | 183 ++++++++++++++++++++++++++++++
+ include/hw/arm/flintstone_board.h |  34 ++++++
+ include/hw/arm/j49_board.h        |  30 +++++
+ include/hw/arm/omap3630.h         |  75 ++++++++++++
+ include/hw/usb/cihdrc-udc.h       |   6 +
+ 6 files changed, 468 insertions(+), 13 deletions(-)
+ create mode 100644 hw/usb/omap3_musb.c
+ create mode 100644 include/hw/arm/flintstone_board.h
+ create mode 100644 include/hw/arm/j49_board.h
+ create mode 100644 include/hw/arm/omap3630.h
+
+diff --git a/hw/usb/cihdrc-udc.c b/hw/usb/cihdrc-udc.c
+index 3bd866a..55ddd6b 100644
+--- a/hw/usb/cihdrc-udc.c
++++ b/hw/usb/cihdrc-udc.c
+@@ -39,6 +39,7 @@
+ #define STS_MASK        0x147
+ #define EP_MASK         0x000f000f
+ #define PORT_W1C        (BIT(1) | BIT(3) | BIT(5))
++#define PORT_RESET      BIT(8)
+ #define PORT_HSP        BIT(9)
+ #define PORT_SPEED      (3U << 26)
+ #define TD_ACTIVE       BIT(7)
+@@ -49,6 +50,14 @@
+ #define TD_ADDR         0xffffffe0
+ #define TD_TERMINATE    BIT(0)
+ #define MAX_CHAIN       1024
++#define MAX_OUT_QUEUE   16
++
++typedef struct CIOutPacket {
++    unsigned ep;
++    unsigned length;
++    unsigned offset;
++    uint8_t data[];
++} CIOutPacket;
+ 
+ static void ci_irq(CIHDRCUDCState *s)
+ {
+@@ -104,7 +113,6 @@ static void ci_flush(CIHDRCUDCState *s, uint32_t bits)
+     unsigned slot;
+ 
+     REG(s, EPSTAT) &= ~bits;
+-    REG(s, COMPLETE) &= ~bits;
+     for (slot = 0; slot < CIHDRC_EP_COUNT * 2; slot++) {
+         if (bits & ci_ep_bit(slot)) {
+             s->td[slot] = TD_TERMINATE;
+@@ -122,6 +130,9 @@ static void ci_reset(DeviceState *dev)
+     REG(s, OTGSC) = BIT(8) | BIT(11);
+     REG(s, EPCTRL) = BIT(7) | BIT(23);
+     s->setup_pending = false;
++    s->status_pending = false;
++    g_queue_clear_full(&s->out_queue, g_free);
++    timer_del(s->reset_timer);
+     ci_flush(s, EP_MASK);
+     ci_connect(s);
+     ci_irq(s);
+@@ -137,7 +148,11 @@ static void ci_speed(CIHDRCUDCState *s)
+ 
+ static void ci_setup(CIHDRCUDCState *s)
+ {
+-    if (!s->setup_pending || (REG(s, USBCMD) & CMD_SUTW)) {
++    /* SETUP handling may flush both EP0 directions: reap status first. */
++    if (!s->setup_pending || s->status_pending ||
++        (REG(s, PORTSC) & PORT_RESET) ||
++        (REG(s, COMPLETE) & (BIT(0) | BIT(16))) ||
++        (REG(s, USBCMD) & CMD_SUTW)) {
+         return;
+     }
+     s->setup_pending = false;
+@@ -148,6 +163,19 @@ static void ci_setup(CIHDRCUDCState *s)
+     ci_irq(s);
+ }
+ 
++/* Bus reset lasts at least 10 ms before the host can send SETUP. */
++static void ci_reset_done(void *opaque)
++{
++    CIHDRCUDCState *s = opaque;
++
++    REG(s, PORTSC) &= ~PORT_RESET;
++    ci_speed(s);
++    REG(s, USBSTS) |= STS_PCI;
++    ci_irq(s);
++    ci_send(s, "RESETDONE\n");
++    ci_setup(s);
++}
++
+ /* Page zero carries the initial byte offset; later pages are aligned. */
+ static bool ci_copy(uint32_t td, unsigned offset, uint8_t *data,
+                     unsigned length, bool in)
+@@ -254,6 +282,58 @@ static unsigned ci_transfer(CIHDRCUDCState *s, unsigned ep, bool in,
+     return done;
+ }
+ 
++/* OUTEP has no NAK reply: retain data until the guest provides a dTD. */
++static void ci_out(CIHDRCUDCState *s)
++{
++    CIOutPacket *packet;
++
++    while ((packet = g_queue_peek_head(&s->out_queue))) {
++        unsigned ep = packet->ep;
++        uint32_t ctrl = REG(s, EPCTRL + ep * 4);
++
++        if (!s->connected || !(REG(s, EPSTAT) & BIT(ep)) ||
++            (ctrl & 1) || (ep && !(ctrl & BIT(7)))) {
++            return;
++        }
++        packet->offset += ci_transfer(s, ep, false,
++                                      packet->data + packet->offset,
++                                      packet->length - packet->offset);
++        if (packet->offset != packet->length) {
++            return;
++        }
++        g_free(g_queue_pop_head(&s->out_queue));
++    }
++}
++
++/* The bridge sends status tokens once, even before the guest primes. */
++static void ci_status(CIHDRCUDCState *s)
++{
++    unsigned slot = s->status_in;
++    uint32_t bit = ci_ep_bit(slot);
++    uint8_t data = 0;
++
++    if (!s->status_pending || !s->connected ||
++        !(REG(s, EPSTAT) & bit) ||
++        (REG(s, EPCTRL) & (s->status_in ? BIT(16) : BIT(0)))) {
++        return;
++    }
++    /* A status token must not consume an unfinished data stage. */
++    if ((ci_dma_read32((s->td[slot] & TD_ADDR) + 4) &
++         (TD_BYTES | TD_ACTIVE | TD_HALTED)) != TD_ACTIVE) {
++        return;
++    }
++    ci_transfer(s, 0, s->status_in, &data, 0);
++    if (REG(s, COMPLETE) & bit) {
++        s->status_pending = false;
++        if (s->status_in) {
++            g_autofree char *reply =
++                g_strdup_printf("INDATA %u %c", s->status_ep, '\n');
++
++            ci_send(s, reply);
++        }
++    }
++}
++
+ static bool ci_unhex(const char *hex, uint8_t *data, unsigned *length)
+ {
+     size_t len = strlen(hex);
+@@ -286,11 +366,15 @@ static void ci_command(CIHDRCUDCState *s, char *line)
+         ci_flush(s, EP_MASK);
+         REG(s, DEVICEADDR) = 0;
+         REG(s, SETUPSTAT) = 0;
++        REG(s, COMPLETE) = 0;
+         s->setup_pending = false;
+-        ci_speed(s);
+-        REG(s, USBSTS) |= STS_URI | STS_PCI;
++        s->status_pending = false;
++        g_queue_clear_full(&s->out_queue, g_free);
++        REG(s, PORTSC) |= PORT_RESET;
++        REG(s, USBSTS) |= STS_URI;
+         ci_irq(s);
+-        ci_send(s, "RESETDONE\n");
++        timer_mod(s->reset_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * SCALE_MS);
+     } else if (argc == 2 && !strcmp(args[0], "SPEED")) {
+         if (!strcmp(args[1], "hs") || !strcmp(args[1], "fs")) {
+             s->high_speed = !strcmp(args[1], "hs");
+@@ -306,7 +390,8 @@ static void ci_command(CIHDRCUDCState *s, char *line)
+             ci_setup(s);
+         }
+     } else if (argc == 3 &&
+-               !qemu_strtoui(args[1], NULL, 10, &ep) && ep < CIHDRC_EP_COUNT) {
++               !qemu_strtoui(args[1], NULL, 10, &ep) &&
++               (ep & ~0x80U) < CIHDRC_EP_COUNT) {
+         data = g_malloc(CIHDRC_MAX_DATA);
+         if (!strcmp(args[0], "INEP") &&
+             !qemu_strtoui(args[2], NULL, 10, &length) &&
+@@ -314,23 +399,46 @@ static void ci_command(CIHDRCUDCState *s, char *line)
+             g_autoptr(GString) reply = g_string_new(NULL);
+             unsigned i;
+ 
+-            length = ci_transfer(s, ep, true, data, length);
++            if (!(ep & 0x7f) && !length) {
++                s->status_pending = true;
++                s->status_in = true;
++                s->status_ep = ep;
++                ci_status(s);
++                return;
++            }
++            length = ci_transfer(s, ep & 0x7f, true, data, length);
+             g_string_append_printf(reply, "INDATA %u ", ep);
+             for (i = 0; i < length; i++) {
+                 g_string_append_printf(reply, "%02x", data[i]);
+             }
+             g_string_append_c(reply, '\n');
+             ci_send(s, reply->str);
+-        } else if (!strcmp(args[0], "OUTEP") &&
++        } else if (!strcmp(args[0], "OUTEP") && ep < CIHDRC_EP_COUNT &&
+                    ci_unhex(args[2], data, &length)) {
+-            ci_transfer(s, ep, false, data, length);
++            if (!ep && !length) {
++                s->status_pending = true;
++                s->status_in = false;
++                ci_status(s);
++            } else {
++                CIOutPacket *packet = g_malloc(sizeof(*packet) + length);
++
++                packet->ep = ep;
++                packet->length = length;
++                packet->offset = 0;
++                memcpy(packet->data, data, length);
++                g_queue_push_tail(&s->out_queue, packet);
++                ci_out(s);
++            }
+         }
+     }
+ }
+ 
+ static int ci_can_read(void *opaque)
+ {
+-    return 4096;
++    CIHDRCUDCState *s = opaque;
++
++    /* One receive batch may take the queue past this high-water mark. */
++    return g_queue_get_length(&s->out_queue) < MAX_OUT_QUEUE ? 4096 : 0;
+ }
+ 
+ static void ci_receive(void *opaque, const uint8_t *buf, int size)
+@@ -364,6 +472,9 @@ static void ci_event(void *opaque, QEMUChrEvent event)
+     if (event == CHR_EVENT_CLOSED) {
+         s->line_len = 0;
+         s->discard_line = false;
++        s->status_pending = false;
++        s->setup_pending = false;
++        g_queue_clear_full(&s->out_queue, g_free);
+     }
+ }
+ 
+@@ -405,6 +516,7 @@ static void ci_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+     case USBSTS:
+     case COMPLETE:
+         REG(s, addr) &= ~value;
++        ci_setup(s);
+         break;
+     case SETUPSTAT:
+         if (REG(s, SETUPSTAT) & value & 1) {
+@@ -422,8 +534,9 @@ static void ci_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+         REG(s, addr) = value & 0xffffffc0;
+         break;
+     case PORTSC:
+-        REG(s, addr) = (REG(s, addr) & (BIT(0) | BIT(7) | PORT_HSP |
+-                                      BIT(12) | PORT_SPEED | PORT_W1C)) &
++        REG(s, addr) = (REG(s, addr) & (BIT(0) | BIT(7) | PORT_RESET |
++                                      PORT_HSP | BIT(12) | PORT_SPEED |
++                                      PORT_W1C)) &
+                       ~(value & PORT_W1C);
+         REG(s, addr) |= value & (0xf0000 | BIT(24) | BIT(28) | (3U << 30));
+         break;
+@@ -447,6 +560,9 @@ static void ci_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+                 }
+             }
+         }
++        ci_status(s);
++        ci_out(s);
++        qemu_chr_fe_accept_input(&s->chr);
+         break;
+     case FLUSH:
+         ci_flush(s, value & EP_MASK);
+@@ -491,19 +607,29 @@ static void ci_realize(DeviceState *dev, Error **errp)
+ 
+ static void ci_unrealize(DeviceState *dev)
+ {
+-    qemu_chr_fe_deinit(&CIHDRC_UDC(dev)->chr, false);
++    CIHDRCUDCState *s = CIHDRC_UDC(dev);
++
++    timer_del(s->reset_timer);
++    g_queue_clear_full(&s->out_queue, g_free);
++    qemu_chr_fe_deinit(&s->chr, false);
+ }
+ 
+ static void ci_init(Object *obj)
+ {
+     CIHDRCUDCState *s = CIHDRC_UDC(obj);
+ 
++    s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ci_reset_done, s);
+     s->high_speed = true;
+     memory_region_init_io(&s->iomem, obj, &ci_ops, s, TYPE_CIHDRC_UDC, 0x200);
+     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+ }
+ 
++static void ci_finalize(Object *obj)
++{
++    timer_free(CIHDRC_UDC(obj)->reset_timer);
++}
++
+ static const Property ci_properties[] = {
+     DEFINE_PROP_STRING("hostchar", CIHDRCUDCState, hostchar),
+ };
+@@ -531,6 +657,7 @@ static const TypeInfo ci_info = {
+     .parent = TYPE_SYS_BUS_DEVICE,
+     .instance_size = sizeof(CIHDRCUDCState),
+     .instance_init = ci_init,
++    .instance_finalize = ci_finalize,
+     .class_init = ci_class_init,
+ };
+ 
+diff --git a/hw/usb/omap3_musb.c b/hw/usb/omap3_musb.c
+new file mode 100644
+index 0000000..c008d3c
+--- /dev/null
++++ b/hw/usb/omap3_musb.c
+@@ -0,0 +1,183 @@
++/*
++ * OMAP3 HS USB OTG controller (Mentor MUSBMHDRC with TI's OTG wrapper),
++ * as a peripheral with nothing plugged in
++ *
++ * The MUSB core's registers read back what was written, except
++ * CONFIGDATA, which reports the OMAP3630's core: dynamic FIFOs, so the
++ * driver lays its endpoints out from the board's FIFO table (fifo_mode 4,
++ * 16 endpoints) as on the chip and a gadget gets as many as it binds.
++ * The wrapper's soft reset completes at once. With no host on the cable
++ * the gadget driver probes and then waits for a session that never
++ * comes, as on a unit off USB. (USB device mode is not modelled.)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_MUSB "omap3-musb"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3MusbState, OMAP3_MUSB)
++
++#define MUSB_CORE_SIZE      0x400
++#define MUSB_INDEX          0x0e
++#define MUSB_CONFIGDATA     0x1f        /* with INDEX 0; FIFOSIZE otherwise */
++/* MPRXE | MPTXE | HBRXE | HBTXE | DYNFIFO | SOFTCONE */
++#define OMAP3_CONFIGDATA    0xde
++#define OTG_REVISION        0x400
++#define OTG_SYSCONFIG       0x404
++#define OTG_SYSSTATUS       0x408
++#define OTG_INTERFSEL       0x40c
++#define OTG_SIMENABLE       0x410
++#define OTG_FORCESTDBY      0x414
++#define OTG_BIGENDIAN       0x418
++
++struct Omap3MusbState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    uint8_t core[MUSB_CORE_SIZE];
++    uint32_t sysconfig;
++    uint32_t interfsel;
++    uint32_t simenable;
++    uint32_t forcestdby;
++};
++
++static uint64_t musb_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3MusbState *s = opaque;
++    uint64_t v = 0;
++
++    if (addr < MUSB_CORE_SIZE) {
++        for (unsigned i = 0; i < size && addr + i < MUSB_CORE_SIZE; i++) {
++            uint8_t byte = s->core[addr + i];
++            if (addr + i == MUSB_CONFIGDATA && s->core[MUSB_INDEX] == 0) {
++                byte = OMAP3_CONFIGDATA;
++            }
++            v |= (uint64_t)byte << (8 * i);
++        }
++        return v;
++    }
++    switch (addr) {
++    case OTG_REVISION:
++        return 0x33;
++    case OTG_SYSCONFIG:
++        return s->sysconfig;
++    case OTG_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case OTG_INTERFSEL:
++        return s->interfsel;
++    case OTG_SIMENABLE:
++        return s->simenable;
++    case OTG_FORCESTDBY:
++        return s->forcestdby;
++    case OTG_BIGENDIAN:
++        return 0;
++    }
++    qemu_log_mask(LOG_UNIMP, "omap3-musb: read at 0x%" HWADDR_PRIx "\n", addr);
++    return 0;
++}
++
++static void musb_reset(DeviceState *dev)
++{
++    Omap3MusbState *s = OMAP3_MUSB(dev);
++
++    memset(s->core, 0, sizeof(s->core));
++    s->sysconfig = 0;
++    s->interfsel = 1;                   /* ULPI */
++    s->simenable = 0;
++    s->forcestdby = 1;
++}
++
++static void musb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3MusbState *s = opaque;
++
++    if (addr < MUSB_CORE_SIZE) {
++        for (unsigned i = 0; i < size && addr + i < MUSB_CORE_SIZE; i++) {
++            s->core[addr + i] = val >> (8 * i);
++        }
++        return;
++    }
++    switch (addr) {
++    case OTG_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            musb_reset(DEVICE(s));
++            return;
++        }
++        s->sysconfig = val;
++        return;
++    case OTG_INTERFSEL:
++        s->interfsel = val;
++        return;
++    case OTG_SIMENABLE:
++        s->simenable = val;
++        return;
++    case OTG_FORCESTDBY:
++        s->forcestdby = val;
++        return;
++    }
++    qemu_log_mask(LOG_UNIMP, "omap3-musb: write at 0x%" HWADDR_PRIx "\n", addr);
++}
++
++static const MemoryRegionOps musb_ops = {
++    .read = musb_read,
++    .write = musb_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static void musb_init(Object *obj)
++{
++    Omap3MusbState *s = OMAP3_MUSB(obj);
++
++    memory_region_init_io(&s->iomem, obj, &musb_ops, s, "omap3-musb", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static const VMStateDescription musb_vmstate = {
++    .name = TYPE_OMAP3_MUSB,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8_ARRAY(core, Omap3MusbState, MUSB_CORE_SIZE),
++        VMSTATE_UINT32(sysconfig, Omap3MusbState),
++        VMSTATE_UINT32(interfsel, Omap3MusbState),
++        VMSTATE_UINT32(simenable, Omap3MusbState),
++        VMSTATE_UINT32(forcestdby, Omap3MusbState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void musb_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, musb_reset);
++    dc->vmsd = &musb_vmstate;
++    dc->desc = "OMAP3 HS USB OTG (unplugged peripheral)";
++}
++
++static const TypeInfo musb_info = {
++    .name = TYPE_OMAP3_MUSB,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3MusbState),
++    .instance_init = musb_init,
++    .class_init = musb_class_init,
++};
++
++static void musb_register_types(void)
++{
++    type_register_static(&musb_info);
++}
++
++type_init(musb_register_types)
+diff --git a/include/hw/arm/flintstone_board.h b/include/hw/arm/flintstone_board.h
+new file mode 100644
+index 0000000..46a285e
+--- /dev/null
++++ b/include/hw/arm/flintstone_board.h
+@@ -0,0 +1,34 @@
++/*
++ * Nest Display-3.4 board companion — the button, the power lines and the
++ * module enables as a chardev, see flintstone_board.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_ARM_FLINTSTONE_BOARD_H
++#define HW_ARM_FLINTSTONE_BOARD_H
++
++#include "qom/object.h"
++
++#define TYPE_FLINTSTONE_BOARD "flintstone.board"
++
++typedef struct FlintstoneBoardState FlintstoneBoardState;
++DECLARE_INSTANCE_CHECKER(FlintstoneBoardState, FLINTSTONE_BOARD,
++                         TYPE_FLINTSTONE_BOARD)
++
++/* Lines the board (not the SoC) drives, reported over the chardev. */
++enum {
++    FLINTSTONE_BOARD_IN_POWEROFF = 0,   /* GPIO1_IO11, gpio-poweroff */
++    FLINTSTONE_BOARD_IN_WIFI_RESET,     /* GPIO1_IO04, brcm wifi reset */
++    FLINTSTONE_BOARD_IN_HALL_ENABLE,    /* GPIO7_IO02, wheel hall power */
++    FLINTSTONE_BOARD_IN_VBATT_ENABLE,   /* GPIO6_IO16, battery divider */
++    FLINTSTONE_BOARD_IN_BEEPER_ENABLE,  /* GPIO1_IO05, piezo enable */
++    FLINTSTONE_BOARD_IN
++};
++
++/* The piezo's drive: PWM1's frequency in Hz (0 = still), a named input. */
++#define FLINTSTONE_BOARD_BEEPER "beeper"
++
++/* The backplate detect line, a named output: high with the base off. */
++#define FLINTSTONE_BOARD_DETECT "detect"
++
++#endif /* HW_ARM_FLINTSTONE_BOARD_H */
+diff --git a/include/hw/arm/j49_board.h b/include/hw/arm/j49_board.h
+new file mode 100644
+index 0000000..ec3d0a5
+--- /dev/null
++++ b/include/hw/arm/j49_board.h
+@@ -0,0 +1,30 @@
++/*
++ * The board around the AM3703, as a chardev - Nest gen 2 (j49)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_ARM_J49_BOARD_H
++#define HW_ARM_J49_BOARD_H
++
++#include "qom/object.h"
++
++#define TYPE_J49_BOARD "j49.board"
++
++typedef struct J49BoardState J49BoardState;
++DECLARE_INSTANCE_CHECKER(J49BoardState, J49_BOARD, TYPE_J49_BOARD)
++
++/* GPIO inputs: lines the firmware drives */
++enum {
++    J49_BOARD_IN_POWEROFF = 0,      /* GPIO 161, battery disconnect */
++    J49_BOARD_IN_WIFI_ENABLE,       /* GPIO 103, WL1271 enable */
++    J49_BOARD_IN_BEEPER_ENABLE,     /* GPIO 58, piezo enable (active low) */
++    J49_BOARD_IN
++};
++
++/* named GPIO input: the piezo's drive frequency in Hz */
++#define J49_BOARD_BEEPER "beeper"
++
++#endif /* HW_ARM_J49_BOARD_H */
+diff --git a/include/hw/arm/omap3630.h b/include/hw/arm/omap3630.h
+new file mode 100644
+index 0000000..4efdbf2
+--- /dev/null
++++ b/include/hw/arm/omap3630.h
+@@ -0,0 +1,75 @@
++/*
++ * TI OMAP3630 / AM3703 SoC
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_ARM_OMAP3630_H
++#define HW_ARM_OMAP3630_H
++
++#include "hw/core/sysbus.h"
++#include "hw/char/omap3_uart.h"
++#include "hw/display/omap3_dss.h"
++#include "hw/dma/omap3_sdma.h"
++#include "hw/gpio/omap3_gpio.h"
++#include "hw/i2c/omap3_i2c.h"
++#include "hw/intc/omap3_intc.h"
++#include "hw/misc/omap3_gpmc.h"
++#include "hw/misc/omap3_prcm.h"
++#include "hw/sd/omap3_hsmmc.h"
++#include "hw/ssi/omap3_mcspi.h"
++#include "hw/timer/omap3_gptimer.h"
++#include "target/arm/cpu.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3630 "omap3630"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3630State, OMAP3630)
++
++#define OMAP3630_ROM_ADDR       0x40014000
++#define OMAP3630_ROM_SIZE       0x8000
++#define OMAP3630_ROM_ENTRY      (OMAP3630_ROM_ADDR + 0x40)  /* image entry word */
++#define OMAP3630_SRAM_ADDR      0x40200000
++#define OMAP3630_SRAM_SIZE      0x10000
++#define OMAP3630_SDRAM_ADDR     0x80000000
++
++#define OMAP3630_NUM_UART       4
++#define OMAP3630_NUM_I2C        3
++#define OMAP3630_NUM_GPIO       6
++#define OMAP3630_NUM_MMC        3
++#define OMAP3630_NUM_MCSPI      4
++
++/* MPU interrupt numbers */
++#define OMAP3630_IRQ_SYS_NIRQ   7
++
++struct Omap3630State {
++    DeviceState parent_obj;
++
++    ARMCPU cpu;
++    Omap3IntcState intc;
++    Omap3GpTimerState gpt[OMAP3_NUM_GPT];
++    Omap3SyncTimerState synctimer;
++    Omap3CmState cm;
++    Omap3PrmState prm;
++    Omap3ScmState scm;
++    Omap3SdrcState sdrc;
++    Omap3GpmcState gpmc;
++    Omap3SdmaState sdma;
++    Omap3UartState uart[OMAP3630_NUM_UART];
++    Omap3I2cState i2c[OMAP3630_NUM_I2C];
++    Omap3GpioState gpio[OMAP3630_NUM_GPIO];
++    Omap3HsmmcState mmc[OMAP3630_NUM_MMC];
++    Omap3McspiState mcspi[OMAP3630_NUM_MCSPI];
++    Omap3DssState dss;
++    DeviceState *wdt2;
++    DeviceState *musb;
++
++    MemoryRegion rom;
++    MemoryRegion sram;
++};
++
++/* Load a GP-device boot image (size, load address, code) at reset. */
++void omap3630_rom_set_entry(Omap3630State *s, uint32_t entry);
++
++#endif
+diff --git a/include/hw/usb/cihdrc-udc.h b/include/hw/usb/cihdrc-udc.h
+index 96b5d5c..93a66a7 100644
+--- a/include/hw/usb/cihdrc-udc.h
++++ b/include/hw/usb/cihdrc-udc.h
+@@ -4,6 +4,7 @@
+ 
+ #include "hw/core/sysbus.h"
+ #include "chardev/char-fe.h"
++#include "qemu/timer.h"
+ 
+ #define TYPE_CIHDRC_UDC "cihdrc-udc"
+ OBJECT_DECLARE_SIMPLE_TYPE(CIHDRCUDCState, CIHDRC_UDC)
+@@ -22,6 +23,11 @@ struct CIHDRCUDCState {
+     uint32_t offset[CIHDRC_EP_COUNT * 2];
+     bool connected;
+     bool high_speed;
++    QEMUTimer *reset_timer;
++    GQueue out_queue;
++    bool status_pending;
++    bool status_in;
++    uint8_t status_ep;
+     bool setup_pending;
+     uint8_t setup[8];
+     char line[2 * CIHDRC_MAX_DATA + 32];
+-- 
+2.56.0
+

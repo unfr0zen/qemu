@@ -1,0 +1,2199 @@
+From 4179a4580055c00333406f4b2d17104599b8a524 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 01:02:45 -0400
+Subject: [PATCH 102/103] hw/usb: CI HDRC device-mode UDC for i.MX6SX
+
+ChipIDEA controller in peripheral mode for the flintstone machine's
+usb@02184000 (dr_mode=peripheral in the stock DT): register file per
+the 4.1.15 chipidea driver contract, dQH/dTD transfer engine, setup
+buffer DMA to QH0+0x28, ENDPTSETUPSTAT/ENDPTCOMPLETE/USBSTS interrupt
+semantics, plus the imx-usbmisc register block and the usb0-hostchar
+bridge to the host-side virtual USB host (docs/usb-host-bridge-protocol.md).
+
+Stock kernel: ci_hdrc probes, g_mass_storage binds, /sys/class/udc/ci_hdrc.0
+and lun0 appear; enumeration through SET_ADDRESS verified.
+---
+ hw/arm/flintstone.c          | 534 +++++++++++++++++++++++++++++
+ hw/arm/fsl-imx6sx.c          | 630 +++++++++++++++++++++++++++++++++++
+ hw/usb/cihdrc-udc.c          | 542 ++++++++++++++++++++++++++++++
+ hw/usb/imx-usbmisc.c         |  80 +++++
+ hw/usb/meson.build           |   2 +
+ include/hw/arm/fsl-imx6sx.h  | 278 ++++++++++++++++
+ include/hw/usb/cihdrc-udc.h  |  32 ++
+ include/hw/usb/imx-usbmisc.h |  16 +
+ 8 files changed, 2114 insertions(+)
+ create mode 100644 hw/arm/flintstone.c
+ create mode 100644 hw/arm/fsl-imx6sx.c
+ create mode 100644 hw/usb/cihdrc-udc.c
+ create mode 100644 hw/usb/imx-usbmisc.c
+ create mode 100644 include/hw/arm/fsl-imx6sx.h
+ create mode 100644 include/hw/usb/cihdrc-udc.h
+ create mode 100644 include/hw/usb/imx-usbmisc.h
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+new file mode 100644
+index 0000000..5ee2cdc
+--- /dev/null
++++ b/hw/arm/flintstone.c
+@@ -0,0 +1,534 @@
++/*
++ * Nest Display-3.4 ("Flintstone") machine — i.MX6SX board emulation.
++ *
++ * The goal is to boot the device's own stock firmware images unmodified:
++ * U-Boot 2014.04 from NAND, the 4.1.15 vendor kernel and the UBIFS rootfs.
++ *
++ * Phase 1: SoC skeleton + UART console. The stock U-Boot image is loaded
++ * into RAM by hand (see qemu/run.sh), later phases add the GPMI NAND
++ * controller model and the boot-ROM stub so the chain boots by itself.
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/adc/imx6_adc.h"
++#include "hw/arm/flintstone_board.h"
++#include "hw/i2c/i2c.h"
++#include "hw/arm/fsl-imx6sx.h"
++#include "hw/misc/em35x_ncp.h"
++#include "hw/net/bcm43341.h"
++#include "hw/sd/sd.h"
++#include "hw/ssi/ssi.h"
++#include "net/net.h"
++#include "hw/arm/machines-qom.h"
++#include "hw/core/irq.h"
++#include "hw/core/boards.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/core/sysbus.h"
++#include "hw/core/cpu.h"
++#include "hw/core/split-irq.h"
++#include "system/address-spaces.h"
++#include "system/block-backend-io.h"
++#include "system/blockdev.h"
++#include "system/reset.h"
++#include "system/system.h"
++#include "qom/object.h"
++#include "qemu/error-report.h"
++#include "qemu/log.h"
++#include "qemu/units.h"
++
++#define FLINTSTONE_RAM_ADDR     FSL_IMX6SX_DRAM_ADDR
++#define FLINTSTONE_RAM_SIZE     (512 * MiB)   /* DTB: <0x80000000 0x20000000> */
++
++#define TYPE_FLINTSTONE_MACHINE MACHINE_TYPE_NAME("flintstone")
++OBJECT_DECLARE_SIMPLE_TYPE(FlintstoneMachineState, FLINTSTONE_MACHINE)
++
++struct FlintstoneMachineState {
++    MachineState parent_obj;
++    char *usb0_hostchar;
++};
++
++static char *flintstone_get_usb0_hostchar(Object *obj, Error **errp)
++{
++    return g_strdup(FLINTSTONE_MACHINE(obj)->usb0_hostchar);
++}
++
++static void flintstone_set_usb0_hostchar(Object *obj, const char *value,
++                                       Error **errp)
++{
++    FlintstoneMachineState *s = FLINTSTONE_MACHINE(obj);
++
++    g_free(s->usb0_hostchar);
++    s->usb0_hostchar = g_strdup(value);
++}
++
++static void flintstone_machine_finalize(Object *obj)
++{
++    g_free(FLINTSTONE_MACHINE(obj)->usb0_hostchar);
++}
++
++/*
++ * Boot ROM stub: on the real board the i.MX6SX boot ROM loads the NAND
++ * firmware image into DRAM per its IVT and jumps to the entry point. The
++ * image sits at NAND mtd0 fw1 with its IVT 0x400 in; the IVT's boot data
++ * gives the load address and size (the stock image: 0x877ff000, 0x61000,
++ * entry 0x87800000 — see qemu/SPEC.md; a system update writes its own).
++ */
++#define FLINTSTONE_FW_NAND_OFF  0x100000
++#define FLINTSTONE_FW_IVT_OFF   0x400
++#define FLINTSTONE_IVT_TAG      0xd1
++#define FLINTSTONE_FW_ENTRY     0x87800000   /* where -bios images start */
++
++struct FlintstoneRomBoot {
++    BlockBackend *blk;
++    const char *bios;   /* -bios: a RAM U-Boot to start instead of fw1 */
++};
++
++/* DCD: a header (tag, big-endian length, version), then commands, each
++ * tag, length, parameter: WRITE's parameter is the access width (1, 2, 4)
++ * plus flags - mask: clear the value's bits, mask|set: set them, neither:
++ * write it; its body is address/value pairs. CHECK polls until an address
++ * has a mask's bits clear or set (flags as WRITE), NOP does nothing. */
++#define DCD_TAG                 0xd2
++#define DCD_CMD_WRITE           0xcc
++#define DCD_CMD_CHECK           0xcf
++#define DCD_CMD_NOP             0xc0
++#define DCD_FLAG_MASK           0x08
++#define DCD_FLAG_SET            0x10
++#define DCD_MAX_LEN             1768    /* the i.MX6 ROM's limit */
++
++static uint32_t flintstone_dcd_load(hwaddr addr, unsigned width)
++{
++    AddressSpace *as = &address_space_memory;
++
++    switch (width) {
++    case 1:
++        return address_space_ldub(as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
++    case 2:
++        return address_space_lduw_le(as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
++    default:
++        return address_space_ldl_le(as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
++    }
++}
++
++static void flintstone_dcd_store(hwaddr addr, unsigned width, uint32_t val)
++{
++    AddressSpace *as = &address_space_memory;
++
++    switch (width) {
++    case 1:
++        address_space_stb(as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
++        break;
++    case 2:
++        address_space_stw_le(as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
++        break;
++    default:
++        address_space_stl_le(as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
++    }
++}
++
++static void flintstone_apply_dcd(const uint8_t *dcd, uint32_t len)
++{
++    uint32_t p = 4;
++
++    while (p + 4 <= len) {
++        uint8_t tag = dcd[p], par = dcd[p + 3];
++        uint32_t clen = lduw_be_p(dcd + p + 1), q;
++        unsigned width = par & 7;
++        bool mask = par & DCD_FLAG_MASK, set = par & DCD_FLAG_SET;
++
++        if (clen < 4 || clen > len - p) {
++            error_report("flintstone: DCD command at +%u is cut short", p);
++            return;
++        }
++        switch (tag) {
++        case DCD_CMD_WRITE:
++            for (q = p + 4; q + 8 <= p + clen; q += 8) {
++                hwaddr addr = ldl_be_p(dcd + q);
++                uint32_t val = ldl_be_p(dcd + q + 4);
++
++                if (mask) {
++                    uint32_t cur = flintstone_dcd_load(addr, width);
++                    val = set ? cur | val : cur & ~val;
++                }
++                flintstone_dcd_store(addr, width, val);
++            }
++            break;
++        case DCD_CMD_CHECK:
++            /* The ROM polls; the models settle at once, so one look. */
++            if (clen >= 12) {
++                hwaddr addr = ldl_be_p(dcd + p + 4);
++                uint32_t m = ldl_be_p(dcd + p + 8);
++                uint32_t cur = flintstone_dcd_load(addr, width) & m;
++
++                if (set ? cur != m : cur != 0) {
++                    qemu_log_mask(LOG_UNIMP, "flintstone: DCD check of "
++                                  "0x%" HWADDR_PRIx " not met\n", addr);
++                }
++            }
++            break;
++        case DCD_CMD_NOP:
++            break;
++        default:
++            qemu_log_mask(LOG_UNIMP, "flintstone: DCD command 0x%02x "
++                          "ignored, the rest skipped\n", tag);
++            return;
++        }
++        p += clen;
++    }
++}
++
++/*
++ * fw1's IVT (entry, dcd, boot_data, self, as addresses in the image) and
++ * boot data (start: the image's load address, size); false if there is
++ * none.
++ */
++static bool flintstone_read_ivt(BlockBackend *blk, uint32_t ivt[8],
++                                uint32_t boot_data[2])
++{
++    int i;
++
++    if (blk_pread(blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF,
++                  8 * sizeof(uint32_t), ivt, 0) < 0) {
++        return false;
++    }
++    for (i = 0; i < 8; i++) {
++        ivt[i] = le32_to_cpu(ivt[i]);
++    }
++    if ((ivt[0] & 0xff) != FLINTSTONE_IVT_TAG ||
++        blk_pread(blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF +
++                  (ivt[4] - ivt[5]), 2 * sizeof(uint32_t), boot_data, 0) < 0) {
++        return false;
++    }
++    boot_data[0] = le32_to_cpu(boot_data[0]);
++    boot_data[1] = le32_to_cpu(boot_data[1]);
++    return true;
++}
++
++/* Apply fw1's DCD, as the ROM does before it loads the image into DDR. */
++static void flintstone_fw_dcd(BlockBackend *blk, const uint32_t ivt[8])
++{
++    uint64_t off = FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF +
++                   (ivt[3] - ivt[5]);
++    g_autofree uint8_t *dcd = NULL;
++    uint8_t hdr[4];
++    uint32_t len;
++
++    if (!ivt[3]) {
++        return;                         /* no DCD */
++    }
++    if (blk_pread(blk, off, sizeof(hdr), hdr, 0) < 0 || hdr[0] != DCD_TAG) {
++        error_report("flintstone: the NAND firmware's DCD is missing");
++        return;
++    }
++    len = lduw_be_p(hdr + 1);
++    if (len < sizeof(hdr) || len > DCD_MAX_LEN) {
++        error_report("flintstone: the NAND firmware's DCD is %u bytes", len);
++        return;
++    }
++    dcd = g_malloc(len);
++    if (blk_pread(blk, off, len, dcd, 0) < 0) {
++        error_report("flintstone: ROM could not read the DCD");
++        return;
++    }
++    flintstone_apply_dcd(dcd, len);
++}
++
++static void flintstone_rom_boot(void *opaque)
++{
++    struct FlintstoneRomBoot *rom = opaque;
++    g_autofree uint8_t *buf = NULL;
++    uint32_t ivt[8], boot_data[2], start, size;
++    bool have_ivt = flintstone_read_ivt(rom->blk, ivt, boot_data);
++
++    /* Nothing else resets the CPU (no arm_load_kernel), so a watchdog
++     * reboot would otherwise resume with the MMU and caches still on. */
++    cpu_reset(first_cpu);
++
++    if (rom->bios) {
++        /* A raw U-Boot image linked at the entry point (the repo's
++         * build/u-boot-recovery.bin), as SPL would leave it in DDR, with
++         * the clocks, pads and DDR set up the way SPL does it: by
++         * replaying the unit's own DCD. Read at every reset, so a rebuilt
++         * file boots on the next reboot. */
++        g_autofree char *img = NULL;
++        gsize len;
++
++        if (!g_file_get_contents(rom->bios, &img, &len, NULL) ||
++            len > FLINTSTONE_RAM_ADDR + FLINTSTONE_RAM_SIZE - FLINTSTONE_FW_ENTRY) {
++            error_report("flintstone: cannot load -bios %s", rom->bios);
++            exit(1);
++        }
++        if (have_ivt) {
++            flintstone_fw_dcd(rom->blk, ivt);
++        }
++        cpu_physical_memory_write(FLINTSTONE_FW_ENTRY, img, len);
++        cpu_set_pc(first_cpu, FLINTSTONE_FW_ENTRY);
++        return;
++    }
++
++    if (!have_ivt) {
++        error_report("flintstone: ROM found no IVT in the NAND firmware");
++        exit(1);
++    }
++    start = boot_data[0];
++    size = boot_data[1];
++    if (start < FLINTSTONE_RAM_ADDR ||
++        size > FLINTSTONE_RAM_ADDR + FLINTSTONE_RAM_SIZE - start) {
++        error_report("flintstone: NAND firmware loads outside DRAM "
++                     "(0x%" PRIx32 " + 0x%" PRIx32 ")", start, size);
++        exit(1);
++    }
++    flintstone_fw_dcd(rom->blk, ivt);
++    buf = g_malloc(size);
++    if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF, size, buf, 0) < 0) {
++        error_report("flintstone: ROM could not read NAND firmware");
++        exit(1);
++    }
++    cpu_physical_memory_write(start, buf, size);
++    cpu_set_pc(first_cpu, ivt[1]);
++}
++
++/* /machine/wheel-position: the adc's signed detent count, either way round. */
++static void flintstone_get_wheel(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    visit_type_int64(v, name, opaque, errp);
++}
++
++static void flintstone_set_wheel(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    visit_type_int64(v, name, opaque, errp);
++}
++
++/*
++ * The wifi module on usdhc2: a BCM43341 behind an SDIO card. WL_REG_ON is
++ * GPIO1_IO04, which powers both and is reported to the board; the chip's
++ * out-of-band interrupt is GPIO5_IO15, level high (the DT's brcm-wlan).
++ * -nic user,model=bcm43341 is the network behind the access point.
++ */
++static void flintstone_init_wifi(DeviceState *soc, DeviceState *board)
++{
++    DeviceState *usdhc2 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                                "sdhc2"));
++    DeviceState *gpio1 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio1"));
++    DeviceState *gpio5 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio5"));
++    DeviceState *card = qdev_new(TYPE_SDIO_CARD);
++    DeviceState *chip = qdev_new(TYPE_BCM43341);
++    DeviceState *reg_on = qdev_new(TYPE_SPLIT_IRQ);
++
++    qemu_configure_nic_device(chip, true, NULL);
++    qdev_realize_and_unref(chip, NULL, &error_fatal);
++
++    /* Broadcom's IDs, and no standard class: the driver matches either. */
++    qdev_prop_set_uint8(card, "class", 0);
++    qdev_prop_set_uint16(card, "vendor-id", 0x02d0);
++    qdev_prop_set_uint16(card, "device-id", 0xa94d);
++    qdev_prop_set_uint16(card, "device-id-f2", 0xa94d);
++    object_property_set_link(OBJECT(card), "function-device", OBJECT(chip),
++                             &error_fatal);
++    qdev_realize_and_unref(card, qdev_get_child_bus(usdhc2, "sd-bus"),
++                           &error_fatal);
++
++    qdev_prop_set_uint32(reg_on, "num-lines", 3);
++    qdev_realize_and_unref(reg_on, NULL, &error_fatal);
++    qdev_connect_gpio_out(gpio1, 4, qdev_get_gpio_in(reg_on, 0));
++    qdev_connect_gpio_out(reg_on, 0,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_WIFI_RESET));
++    qdev_connect_gpio_out(reg_on, 1,
++                          qdev_get_gpio_in_named(card, "power", 0));
++    qdev_connect_gpio_out(reg_on, 2,
++                          qdev_get_gpio_in_named(chip, "power", 0));
++
++    qdev_connect_gpio_out_named(chip, "card-int", 0,
++                                qdev_get_gpio_in_named(card, "card-int", 0));
++    qdev_connect_gpio_out_named(chip, "host-wake", 0,
++                                qdev_get_gpio_in(gpio5, 15));
++}
++
++/*
++ * The EM357 radio (fdt@4 "spidev_em35x" and "em35x-gpios"): on ECSPI3 with
++ * its chip select on GPIO4_IO30, nRESET on GPIO2_IO00, nWAKE on
++ * GPIO2_IO05, and nHOST_INT into GPIO2_IO04.
++ */
++static void flintstone_init_ncp(DeviceState *soc)
++{
++    DeviceState *spi3 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                              "spi3"));
++    DeviceState *gpio2 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio2"));
++    DeviceState *gpio4 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                               "gpio4"));
++    DeviceState *ncp = qdev_new(TYPE_EM35X_NCP);
++
++    qdev_realize_and_unref(ncp, qdev_get_child_bus(spi3, "spi"), &error_fatal);
++    qdev_connect_gpio_out(gpio4, 30,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NSSEL, 0));
++    qdev_connect_gpio_out(gpio2, 0,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NRESET, 0));
++    qdev_connect_gpio_out(gpio2, 5,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NWAKE, 0));
++    qdev_connect_gpio_out_named(ncp, EM35X_NCP_NHOST_INT, 0,
++                                qdev_get_gpio_in(gpio2, 4));
++}
++
++static void flintstone_init(MachineState *machine)
++{
++    DeviceState *soc;
++    DeviceState *gpmi;
++    DeviceState *board;
++    DeviceState *gpio6, *gpio7, *adc1, *adc2;
++    BlockBackend *nand;
++
++    if (machine->ram_size != FLINTSTONE_RAM_SIZE) {
++        error_report("flintstone: this board has %lu MiB of DDR3",
++                     (unsigned long)(FLINTSTONE_RAM_SIZE / MiB));
++        exit(1);
++    }
++
++    soc = qdev_new(TYPE_FSL_IMX6SX);
++    if (FLINTSTONE_MACHINE(machine)->usb0_hostchar) {
++        qdev_prop_set_string(soc, "usb0-hostchar",
++                             FLINTSTONE_MACHINE(machine)->usb0_hostchar);
++    }
++    gpmi = DEVICE(object_resolve_path_component(OBJECT(soc), "gpmi"));
++    nand = blk_by_name("nand");
++    if (nand) {
++        struct FlintstoneRomBoot *rom = g_new(struct FlintstoneRomBoot, 1);
++
++        qdev_prop_set_drive_err(gpmi, "drive", nand, &error_fatal);
++        /* The boot ROM runs after CPU reset, so hook it as a reset
++         * handler: it loads the NAND firmware and starts the CPU. */
++        rom->blk = nand;
++        rom->bios = machine->firmware;
++        qemu_register_reset(flintstone_rom_boot, rom);
++    }
++    qdev_realize_and_unref(soc, NULL, &error_fatal);
++
++    memory_region_add_subregion(get_system_memory(), FLINTSTONE_RAM_ADDR,
++                                machine->ram);
++
++    /*
++     * The board around the SoC: the front button drives GPIO2_IO18 (the
++     * gpio-keys "HU Button"), the backplate detect line GPIO5_IO13, and
++     * the firmware's own driven lines are
++     * reported back — poweroff on GPIO1_IO11, the wifi module reset on
++     * GPIO1_IO04, the wheel's Hall power on GPIO7_IO02 and the battery
++     * divider enable on GPIO6_IO16. The chardev is attached with
++     * -global flintstone.board.chardev=... (run.sh --ui); without it the
++     * board is just there, unobserved.
++     */
++    board = qdev_new(TYPE_FLINTSTONE_BOARD);
++    qdev_realize_and_unref(board, NULL, &error_fatal);
++
++    gpio6 = DEVICE(object_resolve_path_component(OBJECT(soc), "gpio6"));
++    gpio7 = DEVICE(object_resolve_path_component(OBJECT(soc), "gpio7"));
++    adc1 = DEVICE(object_resolve_path_component(OBJECT(soc), "adc1"));
++    adc2 = DEVICE(object_resolve_path_component(OBJECT(soc), "adc2"));
++
++    /*
++     * GPIO7_IO02 (the wheel's hall-enable) and GPIO6_IO16 (the battery
++     * divider enable) each feed two listeners: the matching ADC's gate
++     * line, and the board report over the chardev.
++     */
++    DeviceState *hall_split = qdev_new(TYPE_SPLIT_IRQ);
++    DeviceState *vbatt_split = qdev_new(TYPE_SPLIT_IRQ);
++    DeviceState *gpio1;
++
++    qdev_prop_set_uint32(hall_split, "num-lines", 2);
++    qdev_prop_set_uint32(vbatt_split, "num-lines", 2);
++    qdev_realize_and_unref(hall_split, NULL, &error_fatal);
++    qdev_realize_and_unref(vbatt_split, NULL, &error_fatal);
++
++    gpio1 = DEVICE(object_resolve_path_component(OBJECT(soc), "gpio1"));
++
++    qdev_connect_gpio_out(board, 0,
++                          qdev_get_gpio_in(DEVICE(object_resolve_path_component(
++                              OBJECT(soc), "gpio2")), 18));
++    qdev_connect_gpio_out_named(board, FLINTSTONE_BOARD_DETECT, 0,
++                                qdev_get_gpio_in(DEVICE(
++                                    object_resolve_path_component(
++                                        OBJECT(soc), "gpio5")), 13));
++    qdev_connect_gpio_out(gpio1, 11,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_POWEROFF));
++    flintstone_init_wifi(soc, board);
++    flintstone_init_ncp(soc);
++    /* The piezo: pwm-beeper on PWM1, its enable on GPIO1_IO05. */
++    qdev_connect_gpio_out_named(DEVICE(&FSL_IMX6SX(soc)->pwm[0]), "tone", 0,
++                                qdev_get_gpio_in_named(board,
++                                                       FLINTSTONE_BOARD_BEEPER,
++                                                       0));
++    qdev_connect_gpio_out(gpio1, 5,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_BEEPER_ENABLE));
++    /* The panel backlight driver, i2c2 0x63 (the DT's lm3695@63). */
++    i2c_slave_create_simple(FSL_IMX6SX(soc)->i2c[1].bus, "lm3695", 0x63);
++    qdev_connect_gpio_out(gpio7, 2, qdev_get_gpio_in(hall_split, 0));
++    qdev_connect_gpio_out(hall_split, 0, qdev_get_gpio_in(adc1, 0));
++    qdev_connect_gpio_out(hall_split, 1,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_HALL_ENABLE));
++    qdev_connect_gpio_out(gpio6, 16, qdev_get_gpio_in(vbatt_split, 0));
++    qdev_connect_gpio_out(vbatt_split, 0, qdev_get_gpio_in(adc2, 0));
++    qdev_connect_gpio_out(vbatt_split, 1,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_VBATT_ENABLE));
++
++    /*
++     * The wheel, as the UI turns it: /machine/wheel-position counts
++     * detents. The property lives on the machine so its QOM path is
++     * stable; the storage is the adc's own, sampled per conversion.
++     */
++    object_property_add(OBJECT(machine), "wheel-position", "int",
++                        flintstone_get_wheel, flintstone_set_wheel, NULL,
++                        &IMX6_ADC(adc1)->wheel_position);
++}
++
++static void flintstone_machine_class_init(ObjectClass *oc, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++
++    object_class_property_add_str(oc, "usb0-hostchar",
++                                  flintstone_get_usb0_hostchar,
++                                  flintstone_set_usb0_hostchar);
++    mc->desc = "Nest Display-3.4 (i.MX6SX, 'Flintstone')";
++    mc->init = flintstone_init;
++    /* The vendor boot software pokes registers we do not model yet; treat
++     * those accesses as reads-0/writes-ignored instead of data aborts. */
++    mc->ignore_memory_transaction_failures = true;
++    mc->min_cpus = FSL_IMX6SX_NUM_CPUS;
++    mc->max_cpus = FSL_IMX6SX_NUM_CPUS;
++    mc->default_cpus = FSL_IMX6SX_NUM_CPUS;
++    mc->default_ram_size = FLINTSTONE_RAM_SIZE;
++    mc->default_ram_id = "flintstone.ram";
++}
++
++static const TypeInfo flintstone_machine_type = {
++    .name = TYPE_FLINTSTONE_MACHINE,
++    .parent = TYPE_MACHINE,
++    .instance_size = sizeof(FlintstoneMachineState),
++    .instance_finalize = flintstone_machine_finalize,
++    .class_init = flintstone_machine_class_init,
++    .interfaces = arm_machine_interfaces,
++};
++
++static void flintstone_machine_register_types(void)
++{
++    type_register_static(&flintstone_machine_type);
++}
++
++type_init(flintstone_machine_register_types)
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+new file mode 100644
+index 0000000..588932e
+--- /dev/null
++++ b/hw/arm/fsl-imx6sx.c
+@@ -0,0 +1,630 @@
++/*
++ * Copyright (c) 2026
++ *
++ * i.MX6SX SoC emulation for the Nest Display-3.4 ("Flintstone") board.
++ *
++ * Based on hw/arm/fsl-imx6.c, re-pointed at the i.MX6 SoloX map taken from
++ * the board's stock Device Tree (see the header for the source of truth).
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License as published by the
++ *  Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT
++ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ *  FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ *  more details.
++ *
++ *  You should have received a copy of the GNU General Public License along
++ *  with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/arm/fsl-imx6sx.h"
++#include "hw/display/vivante_gc.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/pfuze200.h"
++#include "hw/misc/unimp.h"
++#include "hw/core/boards.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/usb/imx-usb-phy.h"
++#include "net/net.h"
++#include "system/system.h"
++#include "system/reset.h"
++#include "system/address-spaces.h"
++#include "chardev/char.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
++#include "target/arm/cpu-qom.h"
++
++#define IMX6SX_ESDHC_CAPABILITIES   0x057834b4
++
++#define NAME_SIZE 20
++#define FSL_IMX6SX_NUM_ADCS 2
++
++static const struct {
++    hwaddr addr;
++    hwaddr size;
++    const char *name;
++} fsl_imx6sx_unimplemented[] = {
++    /* AIPS1 */
++    { FSL_IMX6SX_CAN1_ADDR,  0x8000,                "flexcan1-2" },
++    { FSL_IMX6SX_ANATOP_ADDR, FSL_IMX6SX_ANATOP_SIZE, "anatop" },
++    { FSL_IMX6SX_GPC_ADDR,   0x4000,                "gpc" },
++    { FSL_IMX6SX_IOMUXC_ADDR, 0x4000,               "iomuxc" },
++    { FSL_IMX6SX_IOMUXC_GPR_ADDR, 0x4000,           "iomuxc-gpr" },
++    /* AIPS2 */
++    { FSL_IMX6SX_CAAM_ADDR,  FSL_IMX6SX_CAAM_SIZE,  "caam" },
++    { FSL_IMX6SX_MLB_ADDR,   0x4000,                "mlb" },
++    { FSL_IMX6SX_ROMCP_ADDR, 0x4000,                "romcp" },
++    { FSL_IMX6SX_WEIM_ADDR,  0x4000,                "weim" },
++    { FSL_IMX6SX_OCOTP_ADDR, 0x4000,                "ocotp" },
++    { FSL_IMX6SX_SAI1_ADDR,  0xC000,                "sai-audmux" },
++    { FSL_IMX6SX_QSPI1_ADDR, 0x8000,                "qspi1-2" },
++    { FSL_IMX6SX_QSPI1_MEM_ADDR, FSL_IMX6SX_QSPI1_MEM_SIZE, "qspi1-mem" },
++    { FSL_IMX6SX_QSPI2_MEM_ADDR, FSL_IMX6SX_QSPI2_MEM_SIZE, "qspi2-mem" },
++    { FSL_IMX6SX_QOSC_ADDR,  0x4000,                "qosc" },
++    /* AIPS3 */
++    { FSL_IMX6SX_ECSPI4_ADDR, 0x4000,               "ecspi4" },
++    { FSL_IMX6SX_SEMA4_ADDR, 0x4000,                "sema4" },
++    { FSL_IMX6SX_MU_ADDR,    0x4000,                "mu" },
++    { FSL_IMX6SX_UART6_ADDR + 0x4000, 0x10000,      "pwm5-8" },
++};
++
++static void fsl_imx6sx_init(Object *obj)
++{
++    FslIMX6SXState *s = FSL_IMX6SX(obj);
++    char name[NAME_SIZE];
++    int i;
++
++    object_initialize_child(obj, "a9mpcore", &s->a9mpcore, TYPE_A9MPCORE_PRIV);
++
++    object_initialize_child(obj, "ccm", &s->ccm, TYPE_IMX6_CCM);
++
++    object_initialize_child(obj, "src", &s->src, TYPE_IMX6_SRC);
++
++    object_initialize_child(obj, "snvs", &s->snvs, TYPE_IMX7_SNVS);
++
++    object_initialize_child(obj, "gpmi", &s->gpmi, TYPE_IMX_GPMI_NAND);
++
++    object_initialize_child(obj, "sdma", &s->sdma, TYPE_IMX6_SDMA);
++    for (i = 0; i < FSL_IMX6SX_NUM_PWMS; i++) {
++        snprintf(name, NAME_SIZE, "pwm%d", i + 1);
++        object_initialize_child(obj, name, &s->pwm[i], TYPE_IMX_PWM);
++    }
++    object_initialize_child(obj, "mmdc", &s->mmdc, TYPE_IMX6_MMDC);
++    object_initialize_child(obj, "lcdif", &s->lcdif, TYPE_IMX_LCDIF);
++    for (i = 0; i < FSL_IMX6SX_NUM_ADCS; i++) {
++        snprintf(name, NAME_SIZE, "adc%d", i + 1);
++        object_initialize_child(obj, name, &s->adc[i], TYPE_IMX6_ADC);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_UARTS; i++) {
++        snprintf(name, NAME_SIZE, "uart%d", i + 1);
++        object_initialize_child(obj, name, &s->uart[i], TYPE_IMX_SERIAL);
++    }
++
++    object_initialize_child(obj, "gpt", &s->gpt, TYPE_IMX6_GPT);
++
++    for (i = 0; i < FSL_IMX6SX_NUM_EPITS; i++) {
++        snprintf(name, NAME_SIZE, "epit%d", i + 1);
++        object_initialize_child(obj, name, &s->epit[i], TYPE_IMX_EPIT);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_I2CS; i++) {
++        snprintf(name, NAME_SIZE, "i2c%d", i + 1);
++        object_initialize_child(obj, name, &s->i2c[i], TYPE_IMX_I2C);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_ECSPIS; i++) {
++        snprintf(name, NAME_SIZE, "spi%d", i + 1);
++        object_initialize_child(obj, name, &s->spi[i], TYPE_IMX_SPI);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_GPIOS; i++) {
++        snprintf(name, NAME_SIZE, "gpio%d", i + 1);
++        object_initialize_child(obj, name, &s->gpio[i], TYPE_IMX_GPIO);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_USDHCS; i++) {
++        snprintf(name, NAME_SIZE, "sdhc%d", i + 1);
++        object_initialize_child(obj, name, &s->usdhc[i], TYPE_IMX_USDHC);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_USB_PHYS; i++) {
++        snprintf(name, NAME_SIZE, "usbphy%d", i);
++        object_initialize_child(obj, name, &s->usbphy[i], TYPE_IMX_USBPHY);
++    }
++    object_initialize_child(obj, "usb0", &s->usb0, TYPE_CIHDRC_UDC);
++    object_initialize_child(obj, "usbmisc", &s->usbmisc, TYPE_IMX_USBMISC);
++    for (i = 1; i < FSL_IMX6SX_NUM_USBS; i++) {
++        snprintf(name, NAME_SIZE, "usb%d", i);
++        object_initialize_child(obj, name, &s->usb[i - 1], TYPE_CHIPIDEA);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_ETHS; i++) {
++        snprintf(name, NAME_SIZE, "eth%d", i + 1);
++        object_initialize_child(obj, name, &s->eth[i], TYPE_IMX_ENET);
++    }
++
++    for (i = 0; i < FSL_IMX6SX_NUM_WDTS; i++) {
++        snprintf(name, NAME_SIZE, "wdt%d", i);
++        object_initialize_child(obj, name, &s->wdt[i], TYPE_IMX2_WDT);
++    }
++}
++
++/*
++ * The CCM is QEMU's i.MX6Q model; its CSCMR2 reset value 0x02B92F06 has
++ * VID_CLK_SEL (bits 23:21) = 5, which is out of range for the 6SX vid_sel
++ * mux (5 parents) and makes the 4.1.15 imx6sx clock init oops in
++ * clk_register. Apply the 6SX-family reset value (the i.MX6UL CCM model,
++ * a 6SX derivative, uses the same 0x03192F06) after the CCM's own reset.
++ */
++#define FSL_IMX6SX_CCM_CSCMR2       (FSL_IMX6SX_CCM_ADDR + 0x20)
++
++static void fsl_imx6sx_ccm_reset(void *opaque)
++{
++    address_space_stl_le(&address_space_memory, FSL_IMX6SX_CCM_CSCMR2,
++                         0x03192F06, MEMTXATTRS_UNSPECIFIED, NULL);
++}
++
++/*
++ * The sysbus (and with it the CCM) joins the reset chain only once machine
++ * init is done; registering the fixup from here orders it after the CCM's
++ * own reset.
++ */
++static void fsl_imx6sx_ccm_init_done(Notifier *n, void *data)
++{
++    qemu_register_reset(fsl_imx6sx_ccm_reset, NULL);
++}
++
++static Notifier fsl_imx6sx_ccm_notifier = {
++    .notify = fsl_imx6sx_ccm_init_done,
++};
++
++static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
++{
++    MachineState *ms = MACHINE(qdev_get_machine());
++    FslIMX6SXState *s = FSL_IMX6SX(dev);
++    uint16_t i;
++    DeviceState *mpcore;
++    DeviceState *gic;
++    char name[NAME_SIZE];
++
++    if (ms->smp.cpus > FSL_IMX6SX_NUM_CPUS) {
++        error_setg(errp, "%s: Only %d CPU is supported (%d requested)",
++                   TYPE_FSL_IMX6SX, FSL_IMX6SX_NUM_CPUS, ms->smp.cpus);
++        return;
++    }
++
++    snprintf(name, NAME_SIZE, "cpu%d", 0);
++    object_initialize_child(OBJECT(dev), name, &s->cpu,
++                            ARM_CPU_TYPE_NAME("cortex-a9"));
++    if (!qdev_realize(DEVICE(&s->cpu), NULL, errp)) {
++        return;
++    }
++
++    mpcore = DEVICE(&s->a9mpcore);
++    object_property_set_int(OBJECT(mpcore), "num-cpu", ms->smp.cpus,
++                            &error_abort);
++    object_property_set_int(OBJECT(mpcore), "num-irq",
++                            FSL_IMX6SX_MAX_IRQ + GIC_INTERNAL, &error_abort);
++    if (!sysbus_realize(SYS_BUS_DEVICE(mpcore), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(mpcore), 0, FSL_IMX6SX_A9MPCORE_ADDR);
++
++    gic = mpcore;
++    sysbus_connect_irq(SYS_BUS_DEVICE(gic), 0,
++                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_IRQ));
++    sysbus_connect_irq(SYS_BUS_DEVICE(gic), ms->smp.cpus,
++                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_FIQ));
++
++    /* L2 cache controller */
++    sysbus_create_simple("l2x0", FSL_IMX6SX_PL310_ADDR, NULL);
++
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ccm), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->ccm), 0, FSL_IMX6SX_CCM_ADDR);
++    qemu_add_machine_init_done_notifier(&fsl_imx6sx_ccm_notifier);
++
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->src), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->src), 0, FSL_IMX6SX_SRC_ADDR);
++
++    /* GPMI NAND subsystem (APBH DMA at 0x01804000, GPMI 0x01806000, BCH
++     * 0x01808000) — one device, one MMIO block, two interrupt outputs.
++     * The machine attaches the NAND backend directly to the child. */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpmi), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpmi), 0, FSL_IMX6SX_APBH_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmi), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_BCH_IRQ));
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmi), 1,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_APBH_IRQ));
++
++    /* SDMA and MMDC: probe-answer stubs (see imx6_sdma.c / imx6_mmdc.c). */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdma), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdma), 0, FSL_IMX6SX_SDMA_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdma), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_SDMA_IRQ));
++
++    sysbus_realize(SYS_BUS_DEVICE(&s->mmdc), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mmdc), 0, FSL_IMX6SX_MMDC_ADDR);
++
++    /* PWM1-4: each reports its output's frequency on its "tone" line. */
++    for (i = 0; i < FSL_IMX6SX_NUM_PWMS; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwm[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwm[i]), 0,
++                        FSL_IMX6SX_PWM1_ADDR + i * 0x4000);
++    }
++
++    /* Initialize all UARTs */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } serial_table[FSL_IMX6SX_NUM_UARTS] = {
++            { FSL_IMX6SX_UART1_ADDR, FSL_IMX6SX_UART1_IRQ },
++            { FSL_IMX6SX_UART2_ADDR, FSL_IMX6SX_UART2_IRQ },
++            { FSL_IMX6SX_UART3_ADDR, FSL_IMX6SX_UART3_IRQ },
++            { FSL_IMX6SX_UART4_ADDR, FSL_IMX6SX_UART4_IRQ },
++            { FSL_IMX6SX_UART5_ADDR, FSL_IMX6SX_UART5_IRQ },
++            { FSL_IMX6SX_UART6_ADDR, FSL_IMX6SX_UART6_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_UARTS; i++) {
++            qdev_prop_set_chr(DEVICE(&s->uart[i]), "chardev", serial_hd(i));
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart[i]), 0,
++                            serial_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart[i]), 0,
++                               qdev_get_gpio_in(gic, serial_table[i].irq));
++        }
++    }
++
++    s->gpt.ccm = IMX_CCM(&s->ccm);
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpt), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpt), 0, FSL_IMX6SX_GPT_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpt), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_GPT_IRQ));
++
++    /* Initialize all EPIT timers */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } epit_table[FSL_IMX6SX_NUM_EPITS] = {
++            { FSL_IMX6SX_EPIT1_ADDR, FSL_IMX6SX_EPIT1_IRQ },
++            { FSL_IMX6SX_EPIT2_ADDR, FSL_IMX6SX_EPIT2_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_EPITS; i++) {
++            s->epit[i].ccm = IMX_CCM(&s->ccm);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->epit[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->epit[i]), 0, epit_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->epit[i]), 0,
++                               qdev_get_gpio_in(gic, epit_table[i].irq));
++        }
++    }
++
++    /* Initialize all I2C */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } i2c_table[FSL_IMX6SX_NUM_I2CS] = {
++            { FSL_IMX6SX_I2C1_ADDR, FSL_IMX6SX_I2C1_IRQ },
++            { FSL_IMX6SX_I2C2_ADDR, FSL_IMX6SX_I2C2_IRQ },
++            { FSL_IMX6SX_I2C3_ADDR, FSL_IMX6SX_I2C3_IRQ },
++            { FSL_IMX6SX_I2C4_ADDR, FSL_IMX6SX_I2C4_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_I2CS; i++) {
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->i2c[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->i2c[i]), 0, i2c_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
++                               qdev_get_gpio_in(gic, i2c_table[i].irq));
++        }
++
++        /* The PFUZE200 PMIC, i2c4 address 0x08 (see hw/i2c/pfuze200.c). */
++        i2c_slave_create_simple(s->i2c[3].bus, TYPE_PFUZE200, 0x08);
++    }
++
++    /* Initialize ECSPI1-4: contiguous 16 KiB blocks, consecutive IRQs */
++    for (i = 0; i < FSL_IMX6SX_NUM_ECSPIS; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->spi[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi[i]), 0,
++                        FSL_IMX6SX_ECSPI1_ADDR + i * 0x4000);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi[i]), 0,
++                           qdev_get_gpio_in(gic, FSL_IMX6SX_ECSPI1_IRQ + i));
++    }
++
++    /* Initialize all GPIOs */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq_low;
++            unsigned int irq_high;
++        } gpio_table[FSL_IMX6SX_NUM_GPIOS] = {
++            { FSL_IMX6SX_GPIO1_ADDR, FSL_IMX6SX_GPIO1_LOW_IRQ,
++              FSL_IMX6SX_GPIO1_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO2_ADDR, FSL_IMX6SX_GPIO2_LOW_IRQ,
++              FSL_IMX6SX_GPIO2_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO3_ADDR, FSL_IMX6SX_GPIO3_LOW_IRQ,
++              FSL_IMX6SX_GPIO3_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO4_ADDR, FSL_IMX6SX_GPIO4_LOW_IRQ,
++              FSL_IMX6SX_GPIO4_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO5_ADDR, FSL_IMX6SX_GPIO5_LOW_IRQ,
++              FSL_IMX6SX_GPIO5_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO6_ADDR, FSL_IMX6SX_GPIO6_LOW_IRQ,
++              FSL_IMX6SX_GPIO6_HIGH_IRQ },
++            { FSL_IMX6SX_GPIO7_ADDR, FSL_IMX6SX_GPIO7_LOW_IRQ,
++              FSL_IMX6SX_GPIO7_HIGH_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_GPIOS; i++) {
++            object_property_set_bool(OBJECT(&s->gpio[i]), "has-edge-sel",
++                                     true, &error_abort);
++            object_property_set_bool(OBJECT(&s->gpio[i]), "has-upper-pin-irq",
++                                     true, &error_abort);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio[i]), 0, gpio_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio[i]), 0,
++                               qdev_get_gpio_in(gic, gpio_table[i].irq_low));
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio[i]), 1,
++                               qdev_get_gpio_in(gic, gpio_table[i].irq_high));
++        }
++    }
++
++    /*
++     * The board's ADC front ends: adc1 is the magwheel (two Hall channels
++     * in quadrature, gated by the hall-enable line GPIO7_IO02, active
++     * low); adc2 reads the battery divider, gated by GPIO6_IO16 (active
++     * high). The wheel sees the UI through its wheel-position property
++     * (the machine aliases it as /machine/wheel-position).
++     */
++    object_property_set_bool(OBJECT(&s->adc[0]), "gate-active-low", true,
++                             &error_abort);
++    for (i = 0; i < FSL_IMX6SX_NUM_ADCS; i++) {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } adc_table[FSL_IMX6SX_NUM_ADCS] = {
++            { FSL_IMX6SX_ADC1_ADDR, FSL_IMX6SX_ADC1_IRQ },
++            { FSL_IMX6SX_ADC2_ADDR, FSL_IMX6SX_ADC2_IRQ },
++        };
++
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->adc[i]), 0, adc_table[i].addr);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc[i]), 0,
++                           qdev_get_gpio_in(gic, adc_table[i].irq));
++    }
++    /* The gate lines come from the board wiring in flintstone_init. */
++
++    /* LCDIF: scanout for the hx8357 panel (480x640@32bpp over the CMA fb). */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->lcdif), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->lcdif), 0, FSL_IMX6SX_LCDIF_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->lcdif), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6SX_LCDIF_IRQ));
++
++    /* Initialize all SDHC */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } esdhc_table[FSL_IMX6SX_NUM_USDHCS] = {
++            { FSL_IMX6SX_uSDHC1_ADDR, FSL_IMX6SX_uSDHC1_IRQ },
++            { FSL_IMX6SX_uSDHC2_ADDR, FSL_IMX6SX_uSDHC2_IRQ },
++            { FSL_IMX6SX_uSDHC3_ADDR, FSL_IMX6SX_uSDHC3_IRQ },
++            { FSL_IMX6SX_uSDHC4_ADDR, FSL_IMX6SX_uSDHC4_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_USDHCS; i++) {
++            /* UHS-I SDIO3.0 SDR104 1.8V ADMA */
++            object_property_set_uint(OBJECT(&s->usdhc[i]), "capareg",
++                                     IMX6SX_ESDHC_CAPABILITIES, &error_abort);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->usdhc[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->usdhc[i]), 0,
++                            esdhc_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->usdhc[i]), 0,
++                               qdev_get_gpio_in(gic, esdhc_table[i].irq));
++        }
++    }
++
++    /* USB */
++    for (i = 0; i < FSL_IMX6SX_NUM_USB_PHYS; i++) {
++        static const hwaddr usbphy_addr[FSL_IMX6SX_NUM_USB_PHYS] = {
++            FSL_IMX6SX_USBPHY1_ADDR,
++            FSL_IMX6SX_USBPHY2_ADDR,
++        };
++
++        sysbus_realize(SYS_BUS_DEVICE(&s->usbphy[i]), &error_abort);
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->usbphy[i]), 0, usbphy_addr[i]);
++    }
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } usb_table[FSL_IMX6SX_NUM_USBS] = {
++            { FSL_IMX6SX_USBOH3_USB_ADDR + 0 * 0x200, FSL_IMX6SX_USB_OTG_IRQ },
++            { FSL_IMX6SX_USBOH3_USB_ADDR + 1 * 0x200, FSL_IMX6SX_USB_HOST1_IRQ },
++            { FSL_IMX6SX_USBOH3_USB_ADDR + 2 * 0x200, FSL_IMX6SX_USB_HOST2_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_USBS; i++) {
++            SysBusDevice *usb = i ? SYS_BUS_DEVICE(&s->usb[i - 1]) :
++                                   SYS_BUS_DEVICE(&s->usb0);
++
++            if (!i && s->usb0_hostchar) {
++                qdev_prop_set_string(DEVICE(usb), "hostchar", s->usb0_hostchar);
++            }
++            if (!sysbus_realize(usb, errp)) {
++                return;
++            }
++            sysbus_mmio_map(usb, 0, usb_table[i].addr);
++            sysbus_connect_irq(usb, 0,
++                               qdev_get_gpio_in(gic, usb_table[i].irq));
++        }
++    }
++
++    sysbus_realize(SYS_BUS_DEVICE(&s->usbmisc), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->usbmisc), 0, 0x02184800);
++
++    /* Initialize both FECs */
++    {
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++            unsigned int irq_1588;
++        } eth_table[FSL_IMX6SX_NUM_ETHS] = {
++            { FSL_IMX6SX_ENET1_ADDR, FSL_IMX6SX_ENET1_IRQ,
++              FSL_IMX6SX_ENET1_1588_IRQ },
++            { FSL_IMX6SX_ENET2_ADDR, FSL_IMX6SX_ENET2_IRQ,
++              FSL_IMX6SX_ENET2_1588_IRQ },
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_ETHS; i++) {
++            if (i == 0) {
++                object_property_set_uint(OBJECT(&s->eth[i]), "phy-num",
++                                         s->phy_num, &error_abort);
++            }
++            qemu_configure_nic_device(DEVICE(&s->eth[i]), true, NULL);
++            if (!sysbus_realize(SYS_BUS_DEVICE(&s->eth[i]), errp)) {
++                return;
++            }
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->eth[i]), 0, eth_table[i].addr);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->eth[i]), 0,
++                               qdev_get_gpio_in(gic, eth_table[i].irq));
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->eth[i]), 1,
++                               qdev_get_gpio_in(gic, eth_table[i].irq_1588));
++        }
++    }
++
++    /* SNVS */
++    sysbus_realize(SYS_BUS_DEVICE(&s->snvs), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->snvs), 0, FSL_IMX6SX_SNVSHP_ADDR);
++
++    /* Watchdogs */
++    {
++        static const hwaddr wdt_addr[FSL_IMX6SX_NUM_WDTS] = {
++            FSL_IMX6SX_WDOG1_ADDR,
++            FSL_IMX6SX_WDOG2_ADDR,
++            FSL_IMX6SX_WDOG3_ADDR,
++        };
++        static const int wdt_irq[FSL_IMX6SX_NUM_WDTS] = {
++            FSL_IMX6SX_WDOG1_IRQ,
++            FSL_IMX6SX_WDOG2_IRQ,
++            FSL_IMX6SX_WDOG3_IRQ,
++        };
++
++        for (i = 0; i < FSL_IMX6SX_NUM_WDTS; i++) {
++            object_property_set_bool(OBJECT(&s->wdt[i]), "pretimeout-support",
++                                     true, &error_abort);
++            sysbus_realize(SYS_BUS_DEVICE(&s->wdt[i]), &error_abort);
++            sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt[i]), 0, wdt_addr[i]);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&s->wdt[i]), 0,
++                               qdev_get_gpio_in(gic, wdt_irq[i]));
++        }
++    }
++
++    /* Memory regions */
++    memory_region_init_rom(&s->rom, OBJECT(dev), "imx6sx.rom",
++                           FSL_IMX6SX_ROM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_ROM_ADDR,
++                                &s->rom);
++
++    memory_region_init_ram(&s->ocram, NULL, "imx6sx.ocram",
++                           FSL_IMX6SX_OCRAM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_OCRAM_ADDR,
++                                &s->ocram);
++
++    /* OCRAM_S: the kernel runs its suspend code from here */
++    memory_region_init_ram(&s->lpm_sram, NULL, "imx6sx.lpm-sram",
++                           FSL_IMX6SX_LPM_SRAM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_LPM_SRAM_ADDR,
++                                &s->lpm_sram);
++
++    memory_region_init_ram(&s->caam, NULL, "imx6sx.caam",
++                           FSL_IMX6SX_CAAM_MEM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_CAAM_MEM_ADDR,
++                                &s->caam);
++
++    /* The GC400T GPU3D (see hw/display/vivante_gc.c). */
++    {
++        DeviceState *gpu = qdev_new(TYPE_VIVANTE_GC);
++
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, FSL_IMX6SX_GPU_ADDR);
++        sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0,
++                           qdev_get_gpio_in(gic, FSL_IMX6SX_GPU_IRQ));
++    }
++
++    /* Regions the boot software touches but we do not (yet) model */
++    for (i = 0; i < ARRAY_SIZE(fsl_imx6sx_unimplemented); i++) {
++        const char *nm = fsl_imx6sx_unimplemented[i].name;
++        if (!nm) {
++            continue;
++        }
++        create_unimplemented_device(nm, fsl_imx6sx_unimplemented[i].addr,
++                                    fsl_imx6sx_unimplemented[i].size);
++    }
++}
++
++static const Property fsl_imx6sx_properties[] = {
++    DEFINE_PROP_STRING("usb0-hostchar", FslIMX6SXState, usb0_hostchar),
++    DEFINE_PROP_UINT32("fec-phy-num", FslIMX6SXState, phy_num, 0),
++};
++
++static void fsl_imx6sx_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    device_class_set_props(dc, fsl_imx6sx_properties);
++    dc->realize = fsl_imx6sx_realize;
++    dc->desc = "i.MX6SX SoC";
++    /* Reason: Uses serial_hd() in the realize() function */
++    dc->user_creatable = false;
++}
++
++static const TypeInfo fsl_imx6sx_type_info = {
++    .name = TYPE_FSL_IMX6SX,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(FslIMX6SXState),
++    .instance_init = fsl_imx6sx_init,
++    .class_init = fsl_imx6sx_class_init,
++};
++
++static void fsl_imx6sx_register_types(void)
++{
++    type_register_static(&fsl_imx6sx_type_info);
++}
++
++type_init(fsl_imx6sx_register_types)
+diff --git a/hw/usb/cihdrc-udc.c b/hw/usb/cihdrc-udc.c
+new file mode 100644
+index 0000000..3bd866a
+--- /dev/null
++++ b/hw/usb/cihdrc-udc.c
+@@ -0,0 +1,542 @@
++/*
++ * ChipIdea CI HDRC peripheral controller with a line-based host bridge.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "hw/usb/cihdrc-udc.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qemu/bswap.h"
++#include "qemu/cutils.h"
++#include "qemu/module.h"
++#include "exec/cpu-common.h"
++
++#define USBCMD          0x140
++#define USBSTS          0x144
++#define USBINTR         0x148
++#define DEVICEADDR      0x154
++#define ENDPTLISTADDR   0x158
++#define PORTSC          0x184
++#define OTGSC           0x1a4
++#define USBMODE         0x1a8
++#define SETUPSTAT       0x1ac
++#define PRIME           0x1b0
++#define FLUSH           0x1b4
++#define EPSTAT          0x1b8
++#define COMPLETE        0x1bc
++#define EPCTRL          0x1c0
++#define REG(s, r)       ((s)->regs[(r) / 4])
++#define CMD_RS          BIT(0)
++#define CMD_RST         BIT(1)
++#define CMD_SUTW        BIT(13)
++#define CMD_ATDTW       BIT(14)
++#define STS_UI          BIT(0)
++#define STS_UEI         BIT(1)
++#define STS_PCI         BIT(2)
++#define STS_URI         BIT(6)
++#define STS_MASK        0x147
++#define EP_MASK         0x000f000f
++#define PORT_W1C        (BIT(1) | BIT(3) | BIT(5))
++#define PORT_HSP        BIT(9)
++#define PORT_SPEED      (3U << 26)
++#define TD_ACTIVE       BIT(7)
++#define TD_HALTED       BIT(6)
++#define TD_BUFFER_ERR   BIT(5)
++#define TD_IOC          BIT(15)
++#define TD_BYTES        0x7fff0000
++#define TD_ADDR         0xffffffe0
++#define TD_TERMINATE    BIT(0)
++#define MAX_CHAIN       1024
++
++static void ci_irq(CIHDRCUDCState *s)
++{
++    qemu_set_irq(s->irq, !!(REG(s, USBSTS) & REG(s, USBINTR) & STS_MASK));
++}
++
++static void ci_send(CIHDRCUDCState *s, const char *text)
++{
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_write_all(&s->chr, (const uint8_t *)text, strlen(text));
++    }
++}
++
++static void ci_connect(CIHDRCUDCState *s)
++{
++    bool connected = (REG(s, USBCMD) & CMD_RS) &&
++                     (REG(s, USBMODE) & 3) == 2;
++
++    if (s->connected != connected) {
++        s->connected = connected;
++        ci_send(s, connected ? "CONNECT\n" : "DISCONNECT\n");
++    }
++}
++
++static hwaddr ci_qh(CIHDRCUDCState *s, unsigned slot)
++{
++    return (hwaddr)REG(s, ENDPTLISTADDR) + 64 * slot;
++}
++
++static uint32_t ci_dma_read32(hwaddr addr)
++{
++    uint8_t buf[4];
++
++    cpu_physical_memory_read(addr, buf, sizeof(buf));
++    return ldl_le_p(buf);
++}
++
++static void ci_dma_write32(hwaddr addr, uint32_t value)
++{
++    uint8_t buf[4];
++
++    stl_le_p(buf, value);
++    cpu_physical_memory_write(addr, buf, sizeof(buf));
++}
++
++static uint32_t ci_ep_bit(unsigned slot)
++{
++    return BIT(slot / 2 + (slot % 2) * 16);
++}
++
++static void ci_flush(CIHDRCUDCState *s, uint32_t bits)
++{
++    unsigned slot;
++
++    REG(s, EPSTAT) &= ~bits;
++    REG(s, COMPLETE) &= ~bits;
++    for (slot = 0; slot < CIHDRC_EP_COUNT * 2; slot++) {
++        if (bits & ci_ep_bit(slot)) {
++            s->td[slot] = TD_TERMINATE;
++            s->offset[slot] = 0;
++        }
++    }
++}
++
++static void ci_reset(DeviceState *dev)
++{
++    CIHDRCUDCState *s = CIHDRC_UDC(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    REG(s, PORTSC) = BIT(12) | BIT(0);
++    REG(s, OTGSC) = BIT(8) | BIT(11);
++    REG(s, EPCTRL) = BIT(7) | BIT(23);
++    s->setup_pending = false;
++    ci_flush(s, EP_MASK);
++    ci_connect(s);
++    ci_irq(s);
++}
++
++static void ci_speed(CIHDRCUDCState *s)
++{
++    REG(s, PORTSC) &= ~(PORT_HSP | PORT_SPEED);
++    if (s->high_speed && !(REG(s, PORTSC) & BIT(24))) {
++        REG(s, PORTSC) |= PORT_HSP | (2U << 26);
++    }
++}
++
++static void ci_setup(CIHDRCUDCState *s)
++{
++    if (!s->setup_pending || (REG(s, USBCMD) & CMD_SUTW)) {
++        return;
++    }
++    s->setup_pending = false;
++    cpu_physical_memory_write(ci_qh(s, 0) + 0x28, s->setup, 8);
++    REG(s, EPCTRL) &= ~(BIT(0) | BIT(16));
++    REG(s, SETUPSTAT) |= 1;
++    REG(s, USBSTS) |= STS_UI;
++    ci_irq(s);
++}
++
++/* Page zero carries the initial byte offset; later pages are aligned. */
++static bool ci_copy(uint32_t td, unsigned offset, uint8_t *data,
++                    unsigned length, bool in)
++{
++    uint32_t first = ci_dma_read32((hwaddr)td + 8);
++    unsigned position = (first & 0xfff) + offset;
++
++    if (position + length > 5 * 4096) {
++        return false;
++    }
++    while (length) {
++        unsigned page = position / 4096;
++        unsigned off = position % 4096;
++        unsigned count = MIN(length, 4096 - off);
++        hwaddr addr = ci_dma_read32((hwaddr)td + 8 + page * 4);
++
++        addr = (addr & ~0xfffULL) + off;
++        if (in) {
++            cpu_physical_memory_read(addr, data, count);
++        } else {
++            cpu_physical_memory_write(addr, data, count);
++        }
++        position += count;
++        data += count;
++        length -= count;
++    }
++    return true;
++}
++
++/* A host command can span packets; only a short OUT ends a request early. */
++static unsigned ci_transfer(CIHDRCUDCState *s, unsigned ep, bool in,
++                             uint8_t *data, unsigned length)
++{
++    unsigned slot = ep * 2 + in;
++    uint32_t bit = ci_ep_bit(slot);
++    uint32_t ctrl = REG(s, EPCTRL + ep * 4) >> (in ? 16 : 0);
++    unsigned maxpacket = (ci_dma_read32(ci_qh(s, slot)) >> 16) & 0x7ff;
++    unsigned done = 0, visits;
++    bool short_out = !in && (!length || (maxpacket && length % maxpacket));
++    bool draining = false;
++
++    if (!s->connected || !(REG(s, EPSTAT) & bit) ||
++        (ctrl & 1) || (ep && !(ctrl & BIT(7)))) {
++        return 0;
++    }
++    for (visits = 0; visits < MAX_CHAIN; visits++) {
++        uint32_t td = s->td[slot] & TD_ADDR;
++        uint32_t token = ci_dma_read32((hwaddr)td + 4);
++        uint32_t next = ci_dma_read32(td);
++        unsigned residual = (token & TD_BYTES) >> 16;
++        unsigned count = draining ? 0 : MIN(residual, length - done);
++        bool error = false;
++
++        if (!(token & TD_ACTIVE) || (token & TD_HALTED)) {
++            REG(s, EPSTAT) &= ~bit;
++            break;
++        }
++        if (!ci_copy(td, s->offset[slot], data + done, count, in)) {
++            token |= TD_BUFFER_ERR | TD_HALTED;
++            count = 0;
++            error = true;
++        }
++        done += count;
++        residual -= count;
++        s->offset[slot] += count;
++        draining |= short_out && done == length;
++        token = (token & ~TD_BYTES) | (residual << 16);
++        if (residual && !draining && !error) {
++            ci_dma_write32((hwaddr)td + 4, token);
++            ci_dma_write32(ci_qh(s, slot) + 12, token);
++            break;
++        }
++        token &= ~TD_ACTIVE;
++        ci_dma_write32((hwaddr)td + 4, token);
++        ci_dma_write32(ci_qh(s, slot) + 4, td);
++        ci_dma_write32(ci_qh(s, slot) + 8, next);
++        ci_dma_write32(ci_qh(s, slot) + 12, token);
++        REG(s, COMPLETE) |= bit;
++        if (token & TD_IOC) {
++            REG(s, USBSTS) |= STS_UI;
++        }
++        if (error) {
++            REG(s, USBSTS) |= STS_UEI;
++        }
++        s->td[slot] = next;
++        s->offset[slot] = 0;
++        if ((next & TD_TERMINATE) || error) {
++            REG(s, EPSTAT) &= ~bit;
++            break;
++        }
++        /* IOC delimits a request; a short packet must not eat the next one. */
++        if (draining && (token & TD_IOC)) {
++            break;
++        }
++        if (!draining && done == length) {
++            break;
++        }
++    }
++    if (visits == MAX_CHAIN) {
++        REG(s, EPSTAT) &= ~bit;
++        REG(s, USBSTS) |= STS_UEI;
++    }
++    ci_irq(s);
++    return done;
++}
++
++static bool ci_unhex(const char *hex, uint8_t *data, unsigned *length)
++{
++    size_t len = strlen(hex);
++    unsigned i;
++
++    if ((len & 1) || len > CIHDRC_MAX_DATA * 2) {
++        return false;
++    }
++    for (i = 0; i < len / 2; i++) {
++        int hi = g_ascii_xdigit_value(hex[2 * i]);
++        int lo = g_ascii_xdigit_value(hex[2 * i + 1]);
++
++        if (hi < 0 || lo < 0) {
++            return false;
++        }
++        data[i] = (hi << 4) | lo;
++    }
++    *length = len / 2;
++    return true;
++}
++
++static void ci_command(CIHDRCUDCState *s, char *line)
++{
++    g_auto(GStrv) args = g_strsplit(line, " ", 3);
++    unsigned argc = g_strv_length(args);
++    unsigned ep, length;
++    g_autofree uint8_t *data = NULL;
++
++    if (argc == 1 && !strcmp(args[0], "RESET")) {
++        ci_flush(s, EP_MASK);
++        REG(s, DEVICEADDR) = 0;
++        REG(s, SETUPSTAT) = 0;
++        s->setup_pending = false;
++        ci_speed(s);
++        REG(s, USBSTS) |= STS_URI | STS_PCI;
++        ci_irq(s);
++        ci_send(s, "RESETDONE\n");
++    } else if (argc == 2 && !strcmp(args[0], "SPEED")) {
++        if (!strcmp(args[1], "hs") || !strcmp(args[1], "fs")) {
++            s->high_speed = !strcmp(args[1], "hs");
++            ci_speed(s);
++        }
++    } else if (argc == 2 && !strcmp(args[0], "SETUP")) {
++        uint8_t setup[8];
++
++        if (s->connected && strlen(args[1]) == 16 &&
++            ci_unhex(args[1], setup, &length)) {
++            memcpy(s->setup, setup, sizeof(setup));
++            s->setup_pending = true;
++            ci_setup(s);
++        }
++    } else if (argc == 3 &&
++               !qemu_strtoui(args[1], NULL, 10, &ep) && ep < CIHDRC_EP_COUNT) {
++        data = g_malloc(CIHDRC_MAX_DATA);
++        if (!strcmp(args[0], "INEP") &&
++            !qemu_strtoui(args[2], NULL, 10, &length) &&
++            length <= CIHDRC_MAX_DATA) {
++            g_autoptr(GString) reply = g_string_new(NULL);
++            unsigned i;
++
++            length = ci_transfer(s, ep, true, data, length);
++            g_string_append_printf(reply, "INDATA %u ", ep);
++            for (i = 0; i < length; i++) {
++                g_string_append_printf(reply, "%02x", data[i]);
++            }
++            g_string_append_c(reply, '\n');
++            ci_send(s, reply->str);
++        } else if (!strcmp(args[0], "OUTEP") &&
++                   ci_unhex(args[2], data, &length)) {
++            ci_transfer(s, ep, false, data, length);
++        }
++    }
++}
++
++static int ci_can_read(void *opaque)
++{
++    return 4096;
++}
++
++static void ci_receive(void *opaque, const uint8_t *buf, int size)
++{
++    CIHDRCUDCState *s = opaque;
++    int i;
++
++    for (i = 0; i < size; i++) {
++        if (buf[i] == '\n') {
++            if (!s->discard_line) {
++                s->line[s->line_len] = 0;
++                ci_command(s, s->line);
++            }
++            s->line_len = 0;
++            s->discard_line = false;
++        } else if (buf[i] == 0 || s->line_len == sizeof(s->line) - 1) {
++            s->discard_line = true;
++        } else if (!s->discard_line && buf[i] != '\r') {
++            s->line[s->line_len++] = buf[i];
++        }
++    }
++}
++
++static void ci_event(void *opaque, QEMUChrEvent event)
++{
++    CIHDRCUDCState *s = opaque;
++
++    if (event == CHR_EVENT_OPENED && s->connected) {
++        ci_send(s, "CONNECT\n");
++    }
++    if (event == CHR_EVENT_CLOSED) {
++        s->line_len = 0;
++        s->discard_line = false;
++    }
++}
++
++static uint64_t ci_read(void *opaque, hwaddr addr, unsigned size)
++{
++    CIHDRCUDCState *s = opaque;
++
++    switch (addr) {
++    case 0x000:
++        return 0x04a0000a; /* CI revision 2.5 */
++    case 0x100:
++        return 0x01000040; /* HCIVERSION 1.0, CAPLENGTH 0x40 */
++    case 0x104:
++        return 1;
++    case 0x120:
++        return 1;
++    case 0x124:
++        return 0x180 | CIHDRC_EP_COUNT;
++    default:
++        return REG(s, addr);
++    }
++}
++
++static void ci_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    CIHDRCUDCState *s = opaque;
++    unsigned slot;
++
++    switch (addr) {
++    case USBCMD:
++        if (value & CMD_RST) {
++            ci_reset(DEVICE(s));
++        } else {
++            REG(s, USBCMD) = value & (CMD_RS | CMD_SUTW | CMD_ATDTW);
++            ci_setup(s);
++            ci_connect(s);
++        }
++        break;
++    case USBSTS:
++    case COMPLETE:
++        REG(s, addr) &= ~value;
++        break;
++    case SETUPSTAT:
++        if (REG(s, SETUPSTAT) & value & 1) {
++            ci_send(s, "SETUPACK\n");
++        }
++        REG(s, SETUPSTAT) &= ~value;
++        break;
++    case USBINTR:
++        REG(s, addr) = value & STS_MASK;
++        break;
++    case DEVICEADDR:
++        REG(s, addr) = value & 0xfe000000;
++        break;
++    case ENDPTLISTADDR:
++        REG(s, addr) = value & 0xffffffc0;
++        break;
++    case PORTSC:
++        REG(s, addr) = (REG(s, addr) & (BIT(0) | BIT(7) | PORT_HSP |
++                                      BIT(12) | PORT_SPEED | PORT_W1C)) &
++                      ~(value & PORT_W1C);
++        REG(s, addr) |= value & (0xf0000 | BIT(24) | BIT(28) | (3U << 30));
++        break;
++    case OTGSC:
++        REG(s, addr) = (REG(s, addr) & 0x007f1f00) & ~(value & 0x007f0000);
++        REG(s, addr) |= value & 0x7f0000ff;
++        break;
++    case USBMODE:
++        REG(s, addr) = value & 0x1b;
++        ci_connect(s);
++        break;
++    case PRIME:
++        for (slot = 0; slot < CIHDRC_EP_COUNT * 2; slot++) {
++            uint32_t bit = ci_ep_bit(slot);
++
++            if ((value & bit) && !(REG(s, EPSTAT) & bit)) {
++                s->td[slot] = ci_dma_read32(ci_qh(s, slot) + 8);
++                s->offset[slot] = 0;
++                if (!(s->td[slot] & TD_TERMINATE)) {
++                    REG(s, EPSTAT) |= bit;
++                }
++            }
++        }
++        break;
++    case FLUSH:
++        ci_flush(s, value & EP_MASK);
++        break;
++    default:
++        if (addr >= EPCTRL && addr < EPCTRL + 4 * CIHDRC_EP_COUNT) {
++            REG(s, addr) = value & 0x008d008d;
++            if (addr == EPCTRL) {
++                REG(s, addr) = (REG(s, addr) & 0x00010001) | 0x00800080;
++            }
++        }
++        break;
++    }
++    ci_irq(s);
++}
++
++static const MemoryRegionOps ci_ops = {
++    .read = ci_read,
++    .write = ci_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void ci_realize(DeviceState *dev, Error **errp)
++{
++    CIHDRCUDCState *s = CIHDRC_UDC(dev);
++
++    if (s->hostchar && *s->hostchar) {
++        Chardev *chr = qemu_chr_find(s->hostchar);
++
++        if (!chr) {
++            error_setg(errp, "cihdrc-udc: chardev '%s' not found", s->hostchar);
++            return;
++        }
++        if (!qemu_chr_fe_init(&s->chr, chr, errp)) {
++            return;
++        }
++        qemu_chr_fe_set_handlers(&s->chr, ci_can_read, ci_receive, ci_event,
++                                 NULL, s, NULL, true);
++    }
++}
++
++static void ci_unrealize(DeviceState *dev)
++{
++    qemu_chr_fe_deinit(&CIHDRC_UDC(dev)->chr, false);
++}
++
++static void ci_init(Object *obj)
++{
++    CIHDRCUDCState *s = CIHDRC_UDC(obj);
++
++    s->high_speed = true;
++    memory_region_init_io(&s->iomem, obj, &ci_ops, s, TYPE_CIHDRC_UDC, 0x200);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
++}
++
++static const Property ci_properties[] = {
++    DEFINE_PROP_STRING("hostchar", CIHDRCUDCState, hostchar),
++};
++
++static const VMStateDescription ci_vmstate = {
++    .name = TYPE_CIHDRC_UDC,
++    .unmigratable = 1,
++};
++
++static void ci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = ci_realize;
++    dc->unrealize = ci_unrealize;
++    device_class_set_legacy_reset(dc, ci_reset);
++    device_class_set_props(dc, ci_properties);
++    dc->vmsd = &ci_vmstate;
++    dc->desc = "ChipIdea CI HDRC USB peripheral controller";
++    set_bit(DEVICE_CATEGORY_USB, dc->categories);
++}
++
++static const TypeInfo ci_info = {
++    .name = TYPE_CIHDRC_UDC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(CIHDRCUDCState),
++    .instance_init = ci_init,
++    .class_init = ci_class_init,
++};
++
++static void ci_register_types(void)
++{
++    type_register_static(&ci_info);
++}
++
++type_init(ci_register_types)
+diff --git a/hw/usb/imx-usbmisc.c b/hw/usb/imx-usbmisc.c
+new file mode 100644
+index 0000000..183b614
+--- /dev/null
++++ b/hw/usb/imx-usbmisc.c
+@@ -0,0 +1,80 @@
++/*
++ * i.MX USB non-core control registers.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "hw/usb/imx-usbmisc.h"
++#include "migration/vmstate.h"
++#include "qemu/module.h"
++
++static uint64_t imx_usbmisc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    IMXUSBMiscState *s = opaque;
++
++    return s->regs[addr / 4];
++}
++
++static void imx_usbmisc_write(void *opaque, hwaddr addr, uint64_t value,
++                              unsigned size)
++{
++    IMXUSBMiscState *s = opaque;
++
++    s->regs[addr / 4] = value;
++}
++
++static const MemoryRegionOps imx_usbmisc_ops = {
++    .read = imx_usbmisc_read,
++    .write = imx_usbmisc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void imx_usbmisc_reset(DeviceState *dev)
++{
++    IMXUSBMiscState *s = IMX_USBMISC(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++}
++
++static void imx_usbmisc_init(Object *obj)
++{
++    IMXUSBMiscState *s = IMX_USBMISC(obj);
++
++    memory_region_init_io(&s->iomem, obj, &imx_usbmisc_ops, s,
++                          TYPE_IMX_USBMISC, 0x200);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
++}
++
++static const VMStateDescription imx_usbmisc_vmstate = {
++    .name = TYPE_IMX_USBMISC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, IMXUSBMiscState, 0x200 / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx_usbmisc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, imx_usbmisc_reset);
++    dc->vmsd = &imx_usbmisc_vmstate;
++    dc->desc = "i.MX USB non-core registers";
++}
++
++static const TypeInfo imx_usbmisc_info = {
++    .name = TYPE_IMX_USBMISC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMXUSBMiscState),
++    .instance_init = imx_usbmisc_init,
++    .class_init = imx_usbmisc_class_init,
++};
++
++static void imx_usbmisc_register_types(void)
++{
++    type_register_static(&imx_usbmisc_info);
++}
++
++type_init(imx_usbmisc_register_types)
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index ba55c28..5564e9a 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -91,3 +91,5 @@ endif
+ system_ss.add(when: ['CONFIG_USB', 'CONFIG_XEN_BUS', libusb], if_true: files('xen-usb.c'))
+ 
+ modules += { 'hw-usb': hw_usb_modules }
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_musb.c'))
++system_ss.add(when: 'CONFIG_FSL_IMX6SX', if_true: files('cihdrc-udc.c', 'imx-usbmisc.c'))
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+new file mode 100644
+index 0000000..627b572
+--- /dev/null
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -0,0 +1,278 @@
++/*
++ * i.MX6SX SoC emulation (Nest Display-3.4 / "Flintstone" board)
++ *
++ * Address map and IRQ numbers are taken from the board's own Device Tree
++ * blob (stock firmware `fdt@3`, compatible "nestlabs,diamond3-dvt",
++ * "fsl,imx6sx"), NOT from the i.MX6 Quad map — the 6SX differs in several
++ * places (UART2-5 sit on AIPS2, there is a third AIPS bus at 0x02200000,
++ * the GPMI/BCH/APBH block lives at 0x01800000, and there is no PCIe).
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef FSL_IMX6SX_H
++#define FSL_IMX6SX_H
++
++#include "cpu.h"
++#include "hw/adc/imx6_adc.h"
++#include "hw/char/imx_serial.h"
++#include "hw/display/imx_lcdif.h"
++#include "hw/misc/imx_gpmi_nand.h"
++#include "hw/misc/imx6_mmdc.h"
++#include "hw/misc/imx6_sdma.h"
++#include "hw/misc/imx_pwm.h"
++#include "hw/cpu/a9mpcore.h"
++#include "hw/gpio/imx_gpio.h"
++#include "hw/i2c/imx_i2c.h"
++#include "hw/ssi/imx_spi.h"
++#include "hw/misc/imx6_ccm.h"
++#include "hw/misc/imx6_src.h"
++#include "hw/misc/imx7_snvs.h"
++#include "hw/net/imx_fec.h"
++#include "hw/sd/sdhci.h"
++#include "hw/timer/imx_epit.h"
++#include "hw/timer/imx_gpt.h"
++#include "hw/usb/chipidea.h"
++#include "hw/usb/cihdrc-udc.h"
++#include "hw/usb/imx-usbmisc.h"
++#include "hw/usb/imx-usb-phy.h"
++#include "hw/watchdog/wdt_imx2.h"
++
++#define TYPE_FSL_IMX6SX "fsl-imx6sx"
++typedef struct FslIMX6SXState FslIMX6SXState;
++DECLARE_INSTANCE_CHECKER(FslIMX6SXState, FSL_IMX6SX, TYPE_FSL_IMX6SX)
++
++#define FSL_IMX6SX_NUM_CPUS     1
++#define FSL_IMX6SX_NUM_UARTS    6
++#define FSL_IMX6SX_NUM_EPITS    2
++#define FSL_IMX6SX_NUM_I2CS     4
++#define FSL_IMX6SX_NUM_ECSPIS   4
++#define FSL_IMX6SX_NUM_GPIOS    7
++#define FSL_IMX6SX_NUM_USDHCS   4
++#define FSL_IMX6SX_NUM_USBS     3
++#define FSL_IMX6SX_NUM_USB_PHYS 2
++#define FSL_IMX6SX_NUM_ETHS     2
++#define FSL_IMX6SX_NUM_WDTS     3
++/* Highest GIC SPI used on the 6SX (FEC1 1588 = 119); keep room to spare. */
++#define FSL_IMX6SX_MAX_IRQ      128
++
++/* Cortex A9 MPCore (identical to i.MX6Q) */
++#define FSL_IMX6SX_A9MPCORE_ADDR    0x00A00000
++#define FSL_IMX6SX_A9MPCORE_SIZE    0x2000
++#define FSL_IMX6SX_PL310_ADDR       0x00A02000
++#define FSL_IMX6SX_PL310_SIZE       0x1000
++
++/* Internal memories */
++#define FSL_IMX6SX_ROM_ADDR         0x00000000
++#define FSL_IMX6SX_ROM_SIZE         0x18000
++#define FSL_IMX6SX_CAAM_MEM_ADDR    0x00100000
++#define FSL_IMX6SX_CAAM_MEM_SIZE    0x8000
++#define FSL_IMX6SX_LPM_SRAM_ADDR    0x008F8000
++#define FSL_IMX6SX_LPM_SRAM_SIZE    0x4000
++#define FSL_IMX6SX_OCRAM_ADDR       0x00900000
++#define FSL_IMX6SX_OCRAM_SIZE       0x20000    /* 128 KiB mega-fast SRAM */
++
++/* Vivante GC400T GPU3D */
++#define FSL_IMX6SX_GPU_ADDR         0x01800000
++#define FSL_IMX6SX_GPU_IRQ          10
++
++/* GPMI NAND subsystem on its own bus segment (modeled in a later phase) */
++#define FSL_IMX6SX_APBH_ADDR        0x01804000
++#define FSL_IMX6SX_APBH_SIZE        0x2000
++#define FSL_IMX6SX_GPMI_ADDR        0x01806000
++#define FSL_IMX6SX_GPMI_SIZE        0x2000
++#define FSL_IMX6SX_BCH_ADDR         0x01808000
++#define FSL_IMX6SX_BCH_SIZE         0x4000
++#define FSL_IMX6SX_APBH_IRQ         13
++#define FSL_IMX6SX_BCH_IRQ          15
++
++/* AIPS1 / SPBA1 */
++#define FSL_IMX6SX_UART1_ADDR       0x02020000
++#define FSL_IMX6SX_UART1_IRQ        26
++#define FSL_IMX6SX_PWM1_ADDR        0x02080000
++#define FSL_IMX6SX_PWM2_ADDR        0x02084000
++#define FSL_IMX6SX_PWM3_ADDR        0x02088000
++#define FSL_IMX6SX_PWM4_ADDR        0x0208C000
++#define FSL_IMX6SX_NUM_PWMS         4           /* PWM1-4; 5-8 unmodelled */
++#define FSL_IMX6SX_CAN1_ADDR        0x02090000
++#define FSL_IMX6SX_CAN2_ADDR        0x02094000
++#define FSL_IMX6SX_GPT_ADDR         0x02098000
++#define FSL_IMX6SX_GPT_IRQ          55
++#define FSL_IMX6SX_GPIO1_ADDR       0x0209C000
++#define FSL_IMX6SX_GPIO1_LOW_IRQ    66
++#define FSL_IMX6SX_GPIO1_HIGH_IRQ   67
++#define FSL_IMX6SX_GPIO2_ADDR       0x020A0000
++#define FSL_IMX6SX_GPIO2_LOW_IRQ    68
++#define FSL_IMX6SX_GPIO2_HIGH_IRQ   69
++#define FSL_IMX6SX_GPIO3_ADDR       0x020A4000
++#define FSL_IMX6SX_GPIO3_LOW_IRQ    70
++#define FSL_IMX6SX_GPIO3_HIGH_IRQ   71
++#define FSL_IMX6SX_GPIO4_ADDR       0x020A8000
++#define FSL_IMX6SX_GPIO4_LOW_IRQ    72
++#define FSL_IMX6SX_GPIO4_HIGH_IRQ   73
++#define FSL_IMX6SX_GPIO5_ADDR       0x020AC000
++#define FSL_IMX6SX_GPIO5_LOW_IRQ    74
++#define FSL_IMX6SX_GPIO5_HIGH_IRQ   75
++#define FSL_IMX6SX_GPIO6_ADDR       0x020B0000
++#define FSL_IMX6SX_GPIO6_LOW_IRQ    76
++#define FSL_IMX6SX_GPIO6_HIGH_IRQ   77
++#define FSL_IMX6SX_GPIO7_ADDR       0x020B4000
++#define FSL_IMX6SX_GPIO7_LOW_IRQ    78
++#define FSL_IMX6SX_GPIO7_HIGH_IRQ   79
++#define FSL_IMX6SX_WDOG1_ADDR       0x020BC000
++#define FSL_IMX6SX_WDOG1_IRQ        80
++#define FSL_IMX6SX_WDOG2_ADDR       0x020C0000
++#define FSL_IMX6SX_WDOG2_IRQ        81
++#define FSL_IMX6SX_CCM_ADDR         0x020C4000
++#define FSL_IMX6SX_ANATOP_ADDR      0x020C8000
++#define FSL_IMX6SX_ANATOP_SIZE      0x1000
++#define FSL_IMX6SX_USBPHY1_ADDR     0x020C9000
++#define FSL_IMX6SX_USBPHY1_IRQ      44
++#define FSL_IMX6SX_USBPHY2_ADDR     0x020CA000
++#define FSL_IMX6SX_USBPHY2_IRQ      45
++#define FSL_IMX6SX_SNVSHP_ADDR      0x020CC000
++#define FSL_IMX6SX_EPIT1_ADDR       0x020D0000
++#define FSL_IMX6SX_EPIT1_IRQ        56
++#define FSL_IMX6SX_EPIT2_ADDR       0x020D4000
++#define FSL_IMX6SX_EPIT2_IRQ        57
++#define FSL_IMX6SX_SRC_ADDR         0x020D8000
++#define FSL_IMX6SX_GPC_ADDR         0x020DC000
++#define FSL_IMX6SX_IOMUXC_ADDR      0x020E0000
++#define FSL_IMX6SX_IOMUXC_GPR_ADDR  0x020E4000
++#define FSL_IMX6SX_SDMA_ADDR        0x020EC000
++#define FSL_IMX6SX_SDMA_IRQ         2
++
++/* AIPS2 */
++#define FSL_IMX6SX_CAAM_ADDR        0x02100000
++#define FSL_IMX6SX_CAAM_SIZE        0x40000
++#define FSL_IMX6SX_USBOH3_USB_ADDR  0x02184000
++#define FSL_IMX6SX_USB_OTG_IRQ      43
++#define FSL_IMX6SX_USB_HOST1_IRQ    42
++#define FSL_IMX6SX_USB_HOST2_IRQ    40
++#define FSL_IMX6SX_ENET1_ADDR       0x02188000
++#define FSL_IMX6SX_ENET1_IRQ        118
++#define FSL_IMX6SX_ENET1_1588_IRQ   119
++#define FSL_IMX6SX_MLB_ADDR         0x0218C000
++#define FSL_IMX6SX_uSDHC1_ADDR      0x02190000
++#define FSL_IMX6SX_uSDHC1_IRQ       22
++#define FSL_IMX6SX_uSDHC2_ADDR      0x02194000
++#define FSL_IMX6SX_uSDHC2_IRQ       23
++#define FSL_IMX6SX_uSDHC3_ADDR      0x02198000
++#define FSL_IMX6SX_uSDHC3_IRQ       24
++#define FSL_IMX6SX_uSDHC4_ADDR      0x0219C000
++#define FSL_IMX6SX_uSDHC4_IRQ       25
++/* ECSPI1-4 on the SPBA (ECSPI5 is on AIPS3, still unimplemented) */
++#define FSL_IMX6SX_ECSPI1_ADDR      0x02008000
++#define FSL_IMX6SX_ECSPI1_IRQ       31
++#define FSL_IMX6SX_I2C1_ADDR        0x021A0000
++#define FSL_IMX6SX_I2C1_IRQ         36
++#define FSL_IMX6SX_I2C2_ADDR        0x021A4000
++#define FSL_IMX6SX_I2C2_IRQ         37
++#define FSL_IMX6SX_I2C3_ADDR        0x021A8000
++#define FSL_IMX6SX_I2C3_IRQ         38
++#define FSL_IMX6SX_ROMCP_ADDR       0x021AC000
++#define FSL_IMX6SX_MMDC_ADDR        0x021B0000
++#define FSL_IMX6SX_ENET2_ADDR       0x021B4000
++#define FSL_IMX6SX_ENET2_IRQ        102
++#define FSL_IMX6SX_ENET2_1588_IRQ   103
++#define FSL_IMX6SX_WEIM_ADDR        0x021B8000
++#define FSL_IMX6SX_OCOTP_ADDR       0x021BC000
++#define FSL_IMX6SX_SAI1_ADDR        0x021D4000
++#define FSL_IMX6SX_AUDMUX_ADDR      0x021D8000
++#define FSL_IMX6SX_SAI2_ADDR        0x021DC000
++#define FSL_IMX6SX_QSPI1_ADDR       0x021E0000
++#define FSL_IMX6SX_QSPI1_MEM_ADDR   0x60000000
++#define FSL_IMX6SX_QSPI1_MEM_SIZE   0x10000000
++#define FSL_IMX6SX_QSPI2_ADDR       0x021E4000
++#define FSL_IMX6SX_QSPI2_MEM_ADDR   0x70000000
++#define FSL_IMX6SX_QSPI2_MEM_SIZE   0x10000000
++#define FSL_IMX6SX_UART2_ADDR       0x021E8000
++#define FSL_IMX6SX_UART2_IRQ        27
++#define FSL_IMX6SX_UART3_ADDR       0x021EC000
++#define FSL_IMX6SX_UART3_IRQ        28
++#define FSL_IMX6SX_UART4_ADDR       0x021F0000
++#define FSL_IMX6SX_UART4_IRQ        29
++#define FSL_IMX6SX_UART5_ADDR       0x021F4000
++#define FSL_IMX6SX_UART5_IRQ        30
++#define FSL_IMX6SX_I2C4_ADDR        0x021F8000
++#define FSL_IMX6SX_I2C4_IRQ         35
++#define FSL_IMX6SX_QOSC_ADDR        0x021FC000
++
++/* AIPS3 (the 6SX-only third bus) */
++#define FSL_IMX6SX_ADC1_ADDR        0x02280000
++#define FSL_IMX6SX_ADC1_IRQ         100
++#define FSL_IMX6SX_ADC2_ADDR        0x02284000
++#define FSL_IMX6SX_ADC2_IRQ         101
++#define FSL_IMX6SX_WDOG3_ADDR       0x02288000
++#define FSL_IMX6SX_WDOG3_IRQ        11
++#define FSL_IMX6SX_ECSPI4_ADDR      0x0228C000
++#define FSL_IMX6SX_SEMA4_ADDR       0x02290000
++#define FSL_IMX6SX_MU_ADDR          0x02294000
++#define FSL_IMX6SX_LCDIF_ADDR       0x02220000
++#define FSL_IMX6SX_LCDIF_SIZE       0x4000
++#define FSL_IMX6SX_LCDIF_IRQ        5
++#define FSL_IMX6SX_LCDIF2_ADDR      0x02224000
++#define FSL_IMX6SX_UART6_ADDR       0x022A0000
++#define FSL_IMX6SX_UART6_IRQ        17
++
++/* 2 GiB DRAM window, board ships with 512 MiB (DTB: 0x80000000 + 0x20000000) */
++#define FSL_IMX6SX_DRAM_ADDR        0x80000000
++#define FSL_IMX6SX_DRAM_MAX_SIZE    (2 * 1024 * 1024 * 1024ULL)
++
++struct FslIMX6SXState {
++    DeviceState parent_obj;
++
++    ARMCPU cpu;
++    A9MPPrivState a9mpcore;
++
++    IMX6CCMState ccm;
++    IMX6SRCState src;
++    IMX7SNVSState snvs;
++
++    IMXSerialState uart[FSL_IMX6SX_NUM_UARTS];
++    IMXGPTState gpt;
++    IMXEPITState epit[FSL_IMX6SX_NUM_EPITS];
++    IMXI2CState i2c[FSL_IMX6SX_NUM_I2CS];
++    IMXSPIState spi[FSL_IMX6SX_NUM_ECSPIS];
++    IMXGPIOState gpio[FSL_IMX6SX_NUM_GPIOS];
++    SDHCIState usdhc[FSL_IMX6SX_NUM_USDHCS];
++
++    IMXUSBPHYState usbphy[FSL_IMX6SX_NUM_USB_PHYS];
++    CIHDRCUDCState usb0;
++    ChipideaState usb[FSL_IMX6SX_NUM_USBS - 1];
++    IMXUSBMiscState usbmisc;
++    char *usb0_hostchar;
++
++    IMXFECState eth[FSL_IMX6SX_NUM_ETHS];
++    IMX2WdtState wdt[FSL_IMX6SX_NUM_WDTS];
++
++    ImxGpmiNandState gpmi;
++
++    Imx6SdmaState sdma;
++    IMXPWMState pwm[FSL_IMX6SX_NUM_PWMS];
++    Imx6MmdcState mmdc;
++    ImxLcdifState lcdif;
++    Imx6AdcState adc[2];
++
++    MemoryRegion rom;
++    MemoryRegion caam;
++    MemoryRegion ocram;
++    MemoryRegion lpm_sram;
++
++    uint32_t phy_num;
++};
++
++#endif /* FSL_IMX6SX_H */
+diff --git a/include/hw/usb/cihdrc-udc.h b/include/hw/usb/cihdrc-udc.h
+new file mode 100644
+index 0000000..96b5d5c
+--- /dev/null
++++ b/include/hw/usb/cihdrc-udc.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef CIHDRC_UDC_H
++#define CIHDRC_UDC_H
++
++#include "hw/core/sysbus.h"
++#include "chardev/char-fe.h"
++
++#define TYPE_CIHDRC_UDC "cihdrc-udc"
++OBJECT_DECLARE_SIMPLE_TYPE(CIHDRCUDCState, CIHDRC_UDC)
++
++#define CIHDRC_EP_COUNT 4
++#define CIHDRC_MAX_DATA 65536
++
++struct CIHDRCUDCState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++    CharFrontend chr;
++    char *hostchar;
++    uint32_t regs[0x200 / 4];
++    uint32_t td[CIHDRC_EP_COUNT * 2];
++    uint32_t offset[CIHDRC_EP_COUNT * 2];
++    bool connected;
++    bool high_speed;
++    bool setup_pending;
++    uint8_t setup[8];
++    char line[2 * CIHDRC_MAX_DATA + 32];
++    unsigned line_len;
++    bool discard_line;
++};
++
++#endif
+diff --git a/include/hw/usb/imx-usbmisc.h b/include/hw/usb/imx-usbmisc.h
+new file mode 100644
+index 0000000..643adf7
+--- /dev/null
++++ b/include/hw/usb/imx-usbmisc.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef IMX_USBMISC_H
++#define IMX_USBMISC_H
++
++#include "hw/core/sysbus.h"
++
++#define TYPE_IMX_USBMISC "imx-usbmisc"
++OBJECT_DECLARE_SIMPLE_TYPE(IMXUSBMiscState, IMX_USBMISC)
++
++struct IMXUSBMiscState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t regs[0x200 / 4];
++};
++
++#endif
+-- 
+2.56.0
+
