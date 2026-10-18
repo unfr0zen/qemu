@@ -652,7 +652,13 @@ class Msc:
                             in_len=18)
         return raw[2] & 0x0F, raw[12], raw[13]
 
-    def test_unit_ready(self):
+    def test_unit_ready(self, retries=20, interval=1.0):
+        for _ in range(retries):
+            try:
+                self._command(bytes(6))
+                return
+            except MscError:
+                time.sleep(interval)
         self._command(bytes(6))
 
     def inquiry(self):
