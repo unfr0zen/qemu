@@ -104,9 +104,17 @@
   #led.lit { fill: #2fbf55; filter: drop-shadow(0 0 1.5px rgba(47, 191, 85, .6)); }
 
   @media (max-width: 900px) {
-    main { grid-template-columns: 1fr; height: auto; padding: 16px; }
+    /* The device on top, the side below it filling the rest of the window:
+       the console takes whatever height is left, and on a short window the
+       device shrinks to keep the side in view. */
+    main { display: flex; flex-direction: column; padding: 16px; }
+    .stage { flex: 0 1 auto; }
+    .side { flex: 1 0 0; }
     svg.device { max-height: 60vh; }
-    .logs { min-height: 300px; }
+    .logs { min-height: 120px; contain: size; }  /* its rows never push the device smaller */
+    .panels { flex-wrap: wrap; }
+    .panels .panel { flex: 1 1 0; }
+    .panels .panel.lines { flex-basis: 100%; }
   }
 </style>
 </head>
