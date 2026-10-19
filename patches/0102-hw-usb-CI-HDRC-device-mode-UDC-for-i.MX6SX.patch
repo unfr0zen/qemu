@@ -1,0 +1,891 @@
+From 87bd9fec8e840b14f659fb6f3db4db059bd071c2 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:41:11 -0400
+Subject: [PATCH] hw/usb: CI HDRC device-mode UDC for i.MX6SX
+
+Expose the i.MX6SX ChipIDEA peripheral controller through a chardev
+host bridge and wire it into the flintstone machine.
+---
+ hw/arm/flintstone.c          |  54 +++-
+ hw/arm/fsl-imx6sx.c          |  24 +-
+ hw/usb/cihdrc-udc.c          | 542 +++++++++++++++++++++++++++++++++++
+ hw/usb/imx-usbmisc.c         |  80 ++++++
+ hw/usb/meson.build           |   1 +
+ include/hw/arm/fsl-imx6sx.h  |   7 +-
+ include/hw/usb/cihdrc-udc.h  |  32 +++
+ include/hw/usb/imx-usbmisc.h |  16 ++
+ 8 files changed, 748 insertions(+), 8 deletions(-)
+ create mode 100644 hw/usb/cihdrc-udc.c
+ create mode 100644 hw/usb/imx-usbmisc.c
+ create mode 100644 include/hw/usb/cihdrc-udc.h
+ create mode 100644 include/hw/usb/imx-usbmisc.h
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 551eda5..5ee2cdc 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -49,6 +49,33 @@
+ #define FLINTSTONE_RAM_ADDR     FSL_IMX6SX_DRAM_ADDR
+ #define FLINTSTONE_RAM_SIZE     (512 * MiB)   /* DTB: <0x80000000 0x20000000> */
+ 
++#define TYPE_FLINTSTONE_MACHINE MACHINE_TYPE_NAME("flintstone")
++OBJECT_DECLARE_SIMPLE_TYPE(FlintstoneMachineState, FLINTSTONE_MACHINE)
++
++struct FlintstoneMachineState {
++    MachineState parent_obj;
++    char *usb0_hostchar;
++};
++
++static char *flintstone_get_usb0_hostchar(Object *obj, Error **errp)
++{
++    return g_strdup(FLINTSTONE_MACHINE(obj)->usb0_hostchar);
++}
++
++static void flintstone_set_usb0_hostchar(Object *obj, const char *value,
++                                       Error **errp)
++{
++    FlintstoneMachineState *s = FLINTSTONE_MACHINE(obj);
++
++    g_free(s->usb0_hostchar);
++    s->usb0_hostchar = g_strdup(value);
++}
++
++static void flintstone_machine_finalize(Object *obj)
++{
++    g_free(FLINTSTONE_MACHINE(obj)->usb0_hostchar);
++}
++
+ /*
+  * Boot ROM stub: on the real board the i.MX6SX boot ROM loads the NAND
+  * firmware image into DRAM per its IVT and jumps to the entry point. The
+@@ -373,6 +400,10 @@ static void flintstone_init(MachineState *machine)
+     }
+ 
+     soc = qdev_new(TYPE_FSL_IMX6SX);
++    if (FLINTSTONE_MACHINE(machine)->usb0_hostchar) {
++        qdev_prop_set_string(soc, "usb0-hostchar",
++                             FLINTSTONE_MACHINE(machine)->usb0_hostchar);
++    }
+     gpmi = DEVICE(object_resolve_path_component(OBJECT(soc), "gpmi"));
+     nand = blk_by_name("nand");
+     if (nand) {
+@@ -467,8 +498,13 @@ static void flintstone_init(MachineState *machine)
+                         &IMX6_ADC(adc1)->wheel_position);
+ }
+ 
+-static void flintstone_machine_class_init(MachineClass *mc)
++static void flintstone_machine_class_init(ObjectClass *oc, const void *data)
+ {
++    MachineClass *mc = MACHINE_CLASS(oc);
++
++    object_class_property_add_str(oc, "usb0-hostchar",
++                                  flintstone_get_usb0_hostchar,
++                                  flintstone_set_usb0_hostchar);
+     mc->desc = "Nest Display-3.4 (i.MX6SX, 'Flintstone')";
+     mc->init = flintstone_init;
+     /* The vendor boot software pokes registers we do not model yet; treat
+@@ -481,4 +517,18 @@ static void flintstone_machine_class_init(MachineClass *mc)
+     mc->default_ram_id = "flintstone.ram";
+ }
+ 
+-DEFINE_MACHINE_ARM("flintstone", flintstone_machine_class_init)
++static const TypeInfo flintstone_machine_type = {
++    .name = TYPE_FLINTSTONE_MACHINE,
++    .parent = TYPE_MACHINE,
++    .instance_size = sizeof(FlintstoneMachineState),
++    .instance_finalize = flintstone_machine_finalize,
++    .class_init = flintstone_machine_class_init,
++    .interfaces = arm_machine_interfaces,
++};
++
++static void flintstone_machine_register_types(void)
++{
++    type_register_static(&flintstone_machine_type);
++}
++
++type_init(flintstone_machine_register_types)
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index 8e9119f..588932e 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -137,9 +137,11 @@ static void fsl_imx6sx_init(Object *obj)
+         snprintf(name, NAME_SIZE, "usbphy%d", i);
+         object_initialize_child(obj, name, &s->usbphy[i], TYPE_IMX_USBPHY);
+     }
+-    for (i = 0; i < FSL_IMX6SX_NUM_USBS; i++) {
++    object_initialize_child(obj, "usb0", &s->usb0, TYPE_CIHDRC_UDC);
++    object_initialize_child(obj, "usbmisc", &s->usbmisc, TYPE_IMX_USBMISC);
++    for (i = 1; i < FSL_IMX6SX_NUM_USBS; i++) {
+         snprintf(name, NAME_SIZE, "usb%d", i);
+-        object_initialize_child(obj, name, &s->usb[i], TYPE_CHIPIDEA);
++        object_initialize_child(obj, name, &s->usb[i - 1], TYPE_CHIPIDEA);
+     }
+ 
+     for (i = 0; i < FSL_IMX6SX_NUM_ETHS; i++) {
+@@ -478,13 +480,24 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+         };
+ 
+         for (i = 0; i < FSL_IMX6SX_NUM_USBS; i++) {
+-            sysbus_realize(SYS_BUS_DEVICE(&s->usb[i]), &error_abort);
+-            sysbus_mmio_map(SYS_BUS_DEVICE(&s->usb[i]), 0, usb_table[i].addr);
+-            sysbus_connect_irq(SYS_BUS_DEVICE(&s->usb[i]), 0,
++            SysBusDevice *usb = i ? SYS_BUS_DEVICE(&s->usb[i - 1]) :
++                                   SYS_BUS_DEVICE(&s->usb0);
++
++            if (!i && s->usb0_hostchar) {
++                qdev_prop_set_string(DEVICE(usb), "hostchar", s->usb0_hostchar);
++            }
++            if (!sysbus_realize(usb, errp)) {
++                return;
++            }
++            sysbus_mmio_map(usb, 0, usb_table[i].addr);
++            sysbus_connect_irq(usb, 0,
+                                qdev_get_gpio_in(gic, usb_table[i].irq));
+         }
+     }
+ 
++    sysbus_realize(SYS_BUS_DEVICE(&s->usbmisc), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->usbmisc), 0, 0x02184800);
++
+     /* Initialize both FECs */
+     {
+         static const struct {
+@@ -586,6 +599,7 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+ }
+ 
+ static const Property fsl_imx6sx_properties[] = {
++    DEFINE_PROP_STRING("usb0-hostchar", FslIMX6SXState, usb0_hostchar),
+     DEFINE_PROP_UINT32("fec-phy-num", FslIMX6SXState, phy_num, 0),
+ };
+ 
+diff --git a/hw/usb/cihdrc-udc.c b/hw/usb/cihdrc-udc.c
+new file mode 100644
+index 0000000..3bd866a
+--- /dev/null
++++ b/hw/usb/cihdrc-udc.c
+@@ -0,0 +1,542 @@
++/*
++ * ChipIdea CI HDRC peripheral controller with a line-based host bridge.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "hw/usb/cihdrc-udc.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qemu/bswap.h"
++#include "qemu/cutils.h"
++#include "qemu/module.h"
++#include "exec/cpu-common.h"
++
++#define USBCMD          0x140
++#define USBSTS          0x144
++#define USBINTR         0x148
++#define DEVICEADDR      0x154
++#define ENDPTLISTADDR   0x158
++#define PORTSC          0x184
++#define OTGSC           0x1a4
++#define USBMODE         0x1a8
++#define SETUPSTAT       0x1ac
++#define PRIME           0x1b0
++#define FLUSH           0x1b4
++#define EPSTAT          0x1b8
++#define COMPLETE        0x1bc
++#define EPCTRL          0x1c0
++#define REG(s, r)       ((s)->regs[(r) / 4])
++#define CMD_RS          BIT(0)
++#define CMD_RST         BIT(1)
++#define CMD_SUTW        BIT(13)
++#define CMD_ATDTW       BIT(14)
++#define STS_UI          BIT(0)
++#define STS_UEI         BIT(1)
++#define STS_PCI         BIT(2)
++#define STS_URI         BIT(6)
++#define STS_MASK        0x147
++#define EP_MASK         0x000f000f
++#define PORT_W1C        (BIT(1) | BIT(3) | BIT(5))
++#define PORT_HSP        BIT(9)
++#define PORT_SPEED      (3U << 26)
++#define TD_ACTIVE       BIT(7)
++#define TD_HALTED       BIT(6)
++#define TD_BUFFER_ERR   BIT(5)
++#define TD_IOC          BIT(15)
++#define TD_BYTES        0x7fff0000
++#define TD_ADDR         0xffffffe0
++#define TD_TERMINATE    BIT(0)
++#define MAX_CHAIN       1024
++
++static void ci_irq(CIHDRCUDCState *s)
++{
++    qemu_set_irq(s->irq, !!(REG(s, USBSTS) & REG(s, USBINTR) & STS_MASK));
++}
++
++static void ci_send(CIHDRCUDCState *s, const char *text)
++{
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_write_all(&s->chr, (const uint8_t *)text, strlen(text));
++    }
++}
++
++static void ci_connect(CIHDRCUDCState *s)
++{
++    bool connected = (REG(s, USBCMD) & CMD_RS) &&
++                     (REG(s, USBMODE) & 3) == 2;
++
++    if (s->connected != connected) {
++        s->connected = connected;
++        ci_send(s, connected ? "CONNECT\n" : "DISCONNECT\n");
++    }
++}
++
++static hwaddr ci_qh(CIHDRCUDCState *s, unsigned slot)
++{
++    return (hwaddr)REG(s, ENDPTLISTADDR) + 64 * slot;
++}
++
++static uint32_t ci_dma_read32(hwaddr addr)
++{
++    uint8_t buf[4];
++
++    cpu_physical_memory_read(addr, buf, sizeof(buf));
++    return ldl_le_p(buf);
++}
++
++static void ci_dma_write32(hwaddr addr, uint32_t value)
++{
++    uint8_t buf[4];
++
++    stl_le_p(buf, value);
++    cpu_physical_memory_write(addr, buf, sizeof(buf));
++}
++
++static uint32_t ci_ep_bit(unsigned slot)
++{
++    return BIT(slot / 2 + (slot % 2) * 16);
++}
++
++static void ci_flush(CIHDRCUDCState *s, uint32_t bits)
++{
++    unsigned slot;
++
++    REG(s, EPSTAT) &= ~bits;
++    REG(s, COMPLETE) &= ~bits;
++    for (slot = 0; slot < CIHDRC_EP_COUNT * 2; slot++) {
++        if (bits & ci_ep_bit(slot)) {
++            s->td[slot] = TD_TERMINATE;
++            s->offset[slot] = 0;
++        }
++    }
++}
++
++static void ci_reset(DeviceState *dev)
++{
++    CIHDRCUDCState *s = CIHDRC_UDC(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    REG(s, PORTSC) = BIT(12) | BIT(0);
++    REG(s, OTGSC) = BIT(8) | BIT(11);
++    REG(s, EPCTRL) = BIT(7) | BIT(23);
++    s->setup_pending = false;
++    ci_flush(s, EP_MASK);
++    ci_connect(s);
++    ci_irq(s);
++}
++
++static void ci_speed(CIHDRCUDCState *s)
++{
++    REG(s, PORTSC) &= ~(PORT_HSP | PORT_SPEED);
++    if (s->high_speed && !(REG(s, PORTSC) & BIT(24))) {
++        REG(s, PORTSC) |= PORT_HSP | (2U << 26);
++    }
++}
++
++static void ci_setup(CIHDRCUDCState *s)
++{
++    if (!s->setup_pending || (REG(s, USBCMD) & CMD_SUTW)) {
++        return;
++    }
++    s->setup_pending = false;
++    cpu_physical_memory_write(ci_qh(s, 0) + 0x28, s->setup, 8);
++    REG(s, EPCTRL) &= ~(BIT(0) | BIT(16));
++    REG(s, SETUPSTAT) |= 1;
++    REG(s, USBSTS) |= STS_UI;
++    ci_irq(s);
++}
++
++/* Page zero carries the initial byte offset; later pages are aligned. */
++static bool ci_copy(uint32_t td, unsigned offset, uint8_t *data,
++                    unsigned length, bool in)
++{
++    uint32_t first = ci_dma_read32((hwaddr)td + 8);
++    unsigned position = (first & 0xfff) + offset;
++
++    if (position + length > 5 * 4096) {
++        return false;
++    }
++    while (length) {
++        unsigned page = position / 4096;
++        unsigned off = position % 4096;
++        unsigned count = MIN(length, 4096 - off);
++        hwaddr addr = ci_dma_read32((hwaddr)td + 8 + page * 4);
++
++        addr = (addr & ~0xfffULL) + off;
++        if (in) {
++            cpu_physical_memory_read(addr, data, count);
++        } else {
++            cpu_physical_memory_write(addr, data, count);
++        }
++        position += count;
++        data += count;
++        length -= count;
++    }
++    return true;
++}
++
++/* A host command can span packets; only a short OUT ends a request early. */
++static unsigned ci_transfer(CIHDRCUDCState *s, unsigned ep, bool in,
++                             uint8_t *data, unsigned length)
++{
++    unsigned slot = ep * 2 + in;
++    uint32_t bit = ci_ep_bit(slot);
++    uint32_t ctrl = REG(s, EPCTRL + ep * 4) >> (in ? 16 : 0);
++    unsigned maxpacket = (ci_dma_read32(ci_qh(s, slot)) >> 16) & 0x7ff;
++    unsigned done = 0, visits;
++    bool short_out = !in && (!length || (maxpacket && length % maxpacket));
++    bool draining = false;
++
++    if (!s->connected || !(REG(s, EPSTAT) & bit) ||
++        (ctrl & 1) || (ep && !(ctrl & BIT(7)))) {
++        return 0;
++    }
++    for (visits = 0; visits < MAX_CHAIN; visits++) {
++        uint32_t td = s->td[slot] & TD_ADDR;
++        uint32_t token = ci_dma_read32((hwaddr)td + 4);
++        uint32_t next = ci_dma_read32(td);
++        unsigned residual = (token & TD_BYTES) >> 16;
++        unsigned count = draining ? 0 : MIN(residual, length - done);
++        bool error = false;
++
++        if (!(token & TD_ACTIVE) || (token & TD_HALTED)) {
++            REG(s, EPSTAT) &= ~bit;
++            break;
++        }
++        if (!ci_copy(td, s->offset[slot], data + done, count, in)) {
++            token |= TD_BUFFER_ERR | TD_HALTED;
++            count = 0;
++            error = true;
++        }
++        done += count;
++        residual -= count;
++        s->offset[slot] += count;
++        draining |= short_out && done == length;
++        token = (token & ~TD_BYTES) | (residual << 16);
++        if (residual && !draining && !error) {
++            ci_dma_write32((hwaddr)td + 4, token);
++            ci_dma_write32(ci_qh(s, slot) + 12, token);
++            break;
++        }
++        token &= ~TD_ACTIVE;
++        ci_dma_write32((hwaddr)td + 4, token);
++        ci_dma_write32(ci_qh(s, slot) + 4, td);
++        ci_dma_write32(ci_qh(s, slot) + 8, next);
++        ci_dma_write32(ci_qh(s, slot) + 12, token);
++        REG(s, COMPLETE) |= bit;
++        if (token & TD_IOC) {
++            REG(s, USBSTS) |= STS_UI;
++        }
++        if (error) {
++            REG(s, USBSTS) |= STS_UEI;
++        }
++        s->td[slot] = next;
++        s->offset[slot] = 0;
++        if ((next & TD_TERMINATE) || error) {
++            REG(s, EPSTAT) &= ~bit;
++            break;
++        }
++        /* IOC delimits a request; a short packet must not eat the next one. */
++        if (draining && (token & TD_IOC)) {
++            break;
++        }
++        if (!draining && done == length) {
++            break;
++        }
++    }
++    if (visits == MAX_CHAIN) {
++        REG(s, EPSTAT) &= ~bit;
++        REG(s, USBSTS) |= STS_UEI;
++    }
++    ci_irq(s);
++    return done;
++}
++
++static bool ci_unhex(const char *hex, uint8_t *data, unsigned *length)
++{
++    size_t len = strlen(hex);
++    unsigned i;
++
++    if ((len & 1) || len > CIHDRC_MAX_DATA * 2) {
++        return false;
++    }
++    for (i = 0; i < len / 2; i++) {
++        int hi = g_ascii_xdigit_value(hex[2 * i]);
++        int lo = g_ascii_xdigit_value(hex[2 * i + 1]);
++
++        if (hi < 0 || lo < 0) {
++            return false;
++        }
++        data[i] = (hi << 4) | lo;
++    }
++    *length = len / 2;
++    return true;
++}
++
++static void ci_command(CIHDRCUDCState *s, char *line)
++{
++    g_auto(GStrv) args = g_strsplit(line, " ", 3);
++    unsigned argc = g_strv_length(args);
++    unsigned ep, length;
++    g_autofree uint8_t *data = NULL;
++
++    if (argc == 1 && !strcmp(args[0], "RESET")) {
++        ci_flush(s, EP_MASK);
++        REG(s, DEVICEADDR) = 0;
++        REG(s, SETUPSTAT) = 0;
++        s->setup_pending = false;
++        ci_speed(s);
++        REG(s, USBSTS) |= STS_URI | STS_PCI;
++        ci_irq(s);
++        ci_send(s, "RESETDONE\n");
++    } else if (argc == 2 && !strcmp(args[0], "SPEED")) {
++        if (!strcmp(args[1], "hs") || !strcmp(args[1], "fs")) {
++            s->high_speed = !strcmp(args[1], "hs");
++            ci_speed(s);
++        }
++    } else if (argc == 2 && !strcmp(args[0], "SETUP")) {
++        uint8_t setup[8];
++
++        if (s->connected && strlen(args[1]) == 16 &&
++            ci_unhex(args[1], setup, &length)) {
++            memcpy(s->setup, setup, sizeof(setup));
++            s->setup_pending = true;
++            ci_setup(s);
++        }
++    } else if (argc == 3 &&
++               !qemu_strtoui(args[1], NULL, 10, &ep) && ep < CIHDRC_EP_COUNT) {
++        data = g_malloc(CIHDRC_MAX_DATA);
++        if (!strcmp(args[0], "INEP") &&
++            !qemu_strtoui(args[2], NULL, 10, &length) &&
++            length <= CIHDRC_MAX_DATA) {
++            g_autoptr(GString) reply = g_string_new(NULL);
++            unsigned i;
++
++            length = ci_transfer(s, ep, true, data, length);
++            g_string_append_printf(reply, "INDATA %u ", ep);
++            for (i = 0; i < length; i++) {
++                g_string_append_printf(reply, "%02x", data[i]);
++            }
++            g_string_append_c(reply, '\n');
++            ci_send(s, reply->str);
++        } else if (!strcmp(args[0], "OUTEP") &&
++                   ci_unhex(args[2], data, &length)) {
++            ci_transfer(s, ep, false, data, length);
++        }
++    }
++}
++
++static int ci_can_read(void *opaque)
++{
++    return 4096;
++}
++
++static void ci_receive(void *opaque, const uint8_t *buf, int size)
++{
++    CIHDRCUDCState *s = opaque;
++    int i;
++
++    for (i = 0; i < size; i++) {
++        if (buf[i] == '\n') {
++            if (!s->discard_line) {
++                s->line[s->line_len] = 0;
++                ci_command(s, s->line);
++            }
++            s->line_len = 0;
++            s->discard_line = false;
++        } else if (buf[i] == 0 || s->line_len == sizeof(s->line) - 1) {
++            s->discard_line = true;
++        } else if (!s->discard_line && buf[i] != '\r') {
++            s->line[s->line_len++] = buf[i];
++        }
++    }
++}
++
++static void ci_event(void *opaque, QEMUChrEvent event)
++{
++    CIHDRCUDCState *s = opaque;
++
++    if (event == CHR_EVENT_OPENED && s->connected) {
++        ci_send(s, "CONNECT\n");
++    }
++    if (event == CHR_EVENT_CLOSED) {
++        s->line_len = 0;
++        s->discard_line = false;
++    }
++}
++
++static uint64_t ci_read(void *opaque, hwaddr addr, unsigned size)
++{
++    CIHDRCUDCState *s = opaque;
++
++    switch (addr) {
++    case 0x000:
++        return 0x04a0000a; /* CI revision 2.5 */
++    case 0x100:
++        return 0x01000040; /* HCIVERSION 1.0, CAPLENGTH 0x40 */
++    case 0x104:
++        return 1;
++    case 0x120:
++        return 1;
++    case 0x124:
++        return 0x180 | CIHDRC_EP_COUNT;
++    default:
++        return REG(s, addr);
++    }
++}
++
++static void ci_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    CIHDRCUDCState *s = opaque;
++    unsigned slot;
++
++    switch (addr) {
++    case USBCMD:
++        if (value & CMD_RST) {
++            ci_reset(DEVICE(s));
++        } else {
++            REG(s, USBCMD) = value & (CMD_RS | CMD_SUTW | CMD_ATDTW);
++            ci_setup(s);
++            ci_connect(s);
++        }
++        break;
++    case USBSTS:
++    case COMPLETE:
++        REG(s, addr) &= ~value;
++        break;
++    case SETUPSTAT:
++        if (REG(s, SETUPSTAT) & value & 1) {
++            ci_send(s, "SETUPACK\n");
++        }
++        REG(s, SETUPSTAT) &= ~value;
++        break;
++    case USBINTR:
++        REG(s, addr) = value & STS_MASK;
++        break;
++    case DEVICEADDR:
++        REG(s, addr) = value & 0xfe000000;
++        break;
++    case ENDPTLISTADDR:
++        REG(s, addr) = value & 0xffffffc0;
++        break;
++    case PORTSC:
++        REG(s, addr) = (REG(s, addr) & (BIT(0) | BIT(7) | PORT_HSP |
++                                      BIT(12) | PORT_SPEED | PORT_W1C)) &
++                      ~(value & PORT_W1C);
++        REG(s, addr) |= value & (0xf0000 | BIT(24) | BIT(28) | (3U << 30));
++        break;
++    case OTGSC:
++        REG(s, addr) = (REG(s, addr) & 0x007f1f00) & ~(value & 0x007f0000);
++        REG(s, addr) |= value & 0x7f0000ff;
++        break;
++    case USBMODE:
++        REG(s, addr) = value & 0x1b;
++        ci_connect(s);
++        break;
++    case PRIME:
++        for (slot = 0; slot < CIHDRC_EP_COUNT * 2; slot++) {
++            uint32_t bit = ci_ep_bit(slot);
++
++            if ((value & bit) && !(REG(s, EPSTAT) & bit)) {
++                s->td[slot] = ci_dma_read32(ci_qh(s, slot) + 8);
++                s->offset[slot] = 0;
++                if (!(s->td[slot] & TD_TERMINATE)) {
++                    REG(s, EPSTAT) |= bit;
++                }
++            }
++        }
++        break;
++    case FLUSH:
++        ci_flush(s, value & EP_MASK);
++        break;
++    default:
++        if (addr >= EPCTRL && addr < EPCTRL + 4 * CIHDRC_EP_COUNT) {
++            REG(s, addr) = value & 0x008d008d;
++            if (addr == EPCTRL) {
++                REG(s, addr) = (REG(s, addr) & 0x00010001) | 0x00800080;
++            }
++        }
++        break;
++    }
++    ci_irq(s);
++}
++
++static const MemoryRegionOps ci_ops = {
++    .read = ci_read,
++    .write = ci_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void ci_realize(DeviceState *dev, Error **errp)
++{
++    CIHDRCUDCState *s = CIHDRC_UDC(dev);
++
++    if (s->hostchar && *s->hostchar) {
++        Chardev *chr = qemu_chr_find(s->hostchar);
++
++        if (!chr) {
++            error_setg(errp, "cihdrc-udc: chardev '%s' not found", s->hostchar);
++            return;
++        }
++        if (!qemu_chr_fe_init(&s->chr, chr, errp)) {
++            return;
++        }
++        qemu_chr_fe_set_handlers(&s->chr, ci_can_read, ci_receive, ci_event,
++                                 NULL, s, NULL, true);
++    }
++}
++
++static void ci_unrealize(DeviceState *dev)
++{
++    qemu_chr_fe_deinit(&CIHDRC_UDC(dev)->chr, false);
++}
++
++static void ci_init(Object *obj)
++{
++    CIHDRCUDCState *s = CIHDRC_UDC(obj);
++
++    s->high_speed = true;
++    memory_region_init_io(&s->iomem, obj, &ci_ops, s, TYPE_CIHDRC_UDC, 0x200);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
++}
++
++static const Property ci_properties[] = {
++    DEFINE_PROP_STRING("hostchar", CIHDRCUDCState, hostchar),
++};
++
++static const VMStateDescription ci_vmstate = {
++    .name = TYPE_CIHDRC_UDC,
++    .unmigratable = 1,
++};
++
++static void ci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = ci_realize;
++    dc->unrealize = ci_unrealize;
++    device_class_set_legacy_reset(dc, ci_reset);
++    device_class_set_props(dc, ci_properties);
++    dc->vmsd = &ci_vmstate;
++    dc->desc = "ChipIdea CI HDRC USB peripheral controller";
++    set_bit(DEVICE_CATEGORY_USB, dc->categories);
++}
++
++static const TypeInfo ci_info = {
++    .name = TYPE_CIHDRC_UDC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(CIHDRCUDCState),
++    .instance_init = ci_init,
++    .class_init = ci_class_init,
++};
++
++static void ci_register_types(void)
++{
++    type_register_static(&ci_info);
++}
++
++type_init(ci_register_types)
+diff --git a/hw/usb/imx-usbmisc.c b/hw/usb/imx-usbmisc.c
+new file mode 100644
+index 0000000..183b614
+--- /dev/null
++++ b/hw/usb/imx-usbmisc.c
+@@ -0,0 +1,80 @@
++/*
++ * i.MX USB non-core control registers.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "hw/usb/imx-usbmisc.h"
++#include "migration/vmstate.h"
++#include "qemu/module.h"
++
++static uint64_t imx_usbmisc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    IMXUSBMiscState *s = opaque;
++
++    return s->regs[addr / 4];
++}
++
++static void imx_usbmisc_write(void *opaque, hwaddr addr, uint64_t value,
++                              unsigned size)
++{
++    IMXUSBMiscState *s = opaque;
++
++    s->regs[addr / 4] = value;
++}
++
++static const MemoryRegionOps imx_usbmisc_ops = {
++    .read = imx_usbmisc_read,
++    .write = imx_usbmisc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void imx_usbmisc_reset(DeviceState *dev)
++{
++    IMXUSBMiscState *s = IMX_USBMISC(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++}
++
++static void imx_usbmisc_init(Object *obj)
++{
++    IMXUSBMiscState *s = IMX_USBMISC(obj);
++
++    memory_region_init_io(&s->iomem, obj, &imx_usbmisc_ops, s,
++                          TYPE_IMX_USBMISC, 0x200);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
++}
++
++static const VMStateDescription imx_usbmisc_vmstate = {
++    .name = TYPE_IMX_USBMISC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, IMXUSBMiscState, 0x200 / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx_usbmisc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, imx_usbmisc_reset);
++    dc->vmsd = &imx_usbmisc_vmstate;
++    dc->desc = "i.MX USB non-core registers";
++}
++
++static const TypeInfo imx_usbmisc_info = {
++    .name = TYPE_IMX_USBMISC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMXUSBMiscState),
++    .instance_init = imx_usbmisc_init,
++    .class_init = imx_usbmisc_class_init,
++};
++
++static void imx_usbmisc_register_types(void)
++{
++    type_register_static(&imx_usbmisc_info);
++}
++
++type_init(imx_usbmisc_register_types)
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index f734f96..5564e9a 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -92,3 +92,4 @@ system_ss.add(when: ['CONFIG_USB', 'CONFIG_XEN_BUS', libusb], if_true: files('xe
+ 
+ modules += { 'hw-usb': hw_usb_modules }
+ system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_musb.c'))
++system_ss.add(when: 'CONFIG_FSL_IMX6SX', if_true: files('cihdrc-udc.c', 'imx-usbmisc.c'))
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+index cbf1fa2..627b572 100644
+--- a/include/hw/arm/fsl-imx6sx.h
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -46,6 +46,8 @@
+ #include "hw/timer/imx_epit.h"
+ #include "hw/timer/imx_gpt.h"
+ #include "hw/usb/chipidea.h"
++#include "hw/usb/cihdrc-udc.h"
++#include "hw/usb/imx-usbmisc.h"
+ #include "hw/usb/imx-usb-phy.h"
+ #include "hw/watchdog/wdt_imx2.h"
+ 
+@@ -249,7 +251,10 @@ struct FslIMX6SXState {
+     SDHCIState usdhc[FSL_IMX6SX_NUM_USDHCS];
+ 
+     IMXUSBPHYState usbphy[FSL_IMX6SX_NUM_USB_PHYS];
+-    ChipideaState usb[FSL_IMX6SX_NUM_USBS];
++    CIHDRCUDCState usb0;
++    ChipideaState usb[FSL_IMX6SX_NUM_USBS - 1];
++    IMXUSBMiscState usbmisc;
++    char *usb0_hostchar;
+ 
+     IMXFECState eth[FSL_IMX6SX_NUM_ETHS];
+     IMX2WdtState wdt[FSL_IMX6SX_NUM_WDTS];
+diff --git a/include/hw/usb/cihdrc-udc.h b/include/hw/usb/cihdrc-udc.h
+new file mode 100644
+index 0000000..96b5d5c
+--- /dev/null
++++ b/include/hw/usb/cihdrc-udc.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef CIHDRC_UDC_H
++#define CIHDRC_UDC_H
++
++#include "hw/core/sysbus.h"
++#include "chardev/char-fe.h"
++
++#define TYPE_CIHDRC_UDC "cihdrc-udc"
++OBJECT_DECLARE_SIMPLE_TYPE(CIHDRCUDCState, CIHDRC_UDC)
++
++#define CIHDRC_EP_COUNT 4
++#define CIHDRC_MAX_DATA 65536
++
++struct CIHDRCUDCState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++    CharFrontend chr;
++    char *hostchar;
++    uint32_t regs[0x200 / 4];
++    uint32_t td[CIHDRC_EP_COUNT * 2];
++    uint32_t offset[CIHDRC_EP_COUNT * 2];
++    bool connected;
++    bool high_speed;
++    bool setup_pending;
++    uint8_t setup[8];
++    char line[2 * CIHDRC_MAX_DATA + 32];
++    unsigned line_len;
++    bool discard_line;
++};
++
++#endif
+diff --git a/include/hw/usb/imx-usbmisc.h b/include/hw/usb/imx-usbmisc.h
+new file mode 100644
+index 0000000..643adf7
+--- /dev/null
++++ b/include/hw/usb/imx-usbmisc.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef IMX_USBMISC_H
++#define IMX_USBMISC_H
++
++#include "hw/core/sysbus.h"
++
++#define TYPE_IMX_USBMISC "imx-usbmisc"
++OBJECT_DECLARE_SIMPLE_TYPE(IMXUSBMiscState, IMX_USBMISC)
++
++struct IMXUSBMiscState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t regs[0x200 / 4];
++};
++
++#endif
+-- 
+2.56.0
+

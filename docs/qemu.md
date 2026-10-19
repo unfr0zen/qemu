@@ -469,8 +469,9 @@ layout moved) bakes that path in: remove it and run `setup.sh` again.
 - The radio's bootloader: an NCP firmware update (`zb-loader
   --app-easyload`) fails. None is needed, as the chip reports the version
   the firmware ships.
-- USB device mode (the ChipIdea gadget): no ACM console from the
-  emulator (`ci_hdrc.0: no supported roles`).
+- USB host attachment on macOS: local enumeration needs a virtual USB
+  host controller driver. Linux attachment and the gen 3 UDC bridge are
+  described in [the USB bridge guide](usb-host-bridge-protocol.md).
 - ENET: QEMU warns `nic imx.enet.0 has no peer`, which is harmless because
   the guest does not use it.
 - Cosmetic: U-Boot reports an i.MX6Q (the OCOTP reads zero) and cannot
