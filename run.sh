@@ -15,6 +15,8 @@
 #                                   #   The terminal stays the console too
 #                                   #   (Ctrl-] or Ctrl-A X quits).
 #   ./run.sh --ui --nlclient FILE # isolated NAND, install FILE after boot
+#   ./run.sh --no-usb            # disable automatic Linux USB attachment
+#   ./run.sh --usb               # require USB (macOS: export over USB/IP)
 #   ./run.sh --cloud             # let the unit reach the internet (by
 #                                   #   default it gets DHCP and no further)
 #   ./run.sh --no-provision      # boot the NAND exactly as it is
@@ -70,6 +72,7 @@ fi
 
 # Options of our own, before anything QEMU should see.
 ui=0
+usb=auto
 ui_port="${UI_PORT:-8075}"
 cloud=0
 provision=1
@@ -88,6 +91,8 @@ while [ $# -gt 0 ]; do
         --root0) root=0; shift ;;
         --root1) root=1; shift ;;
         --ui) ui=1; shift ;;
+        --usb) usb=1; shift ;;
+        --no-usb) usb=0; shift ;;
         --cloud) cloud=1; shift ;;
         --no-provision) provision=0; shift ;;
         --sleep) sleep=1; shift ;;
@@ -101,6 +106,29 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
+
+usb_attach=""
+if [ "$gen2" = 1 ] && [ "$usb" = auto ]; then
+    usb=0
+fi
+if [ "$usb" != 0 ]; then
+    if [ "$gen2" = 1 ]; then
+        echo "ERROR: --usb requires gen 3 (flintstone); j49 has no UDC bridge." >&2
+        exit 1
+    fi
+    if [ "$(uname -s)" = Linux ]; then
+        if python3 "$script_path/ui/usbip.py" --check-host; then
+            usb=1
+            usb_attach=--attach
+        elif [ "$usb" = 1 ]; then
+            exit 1
+        else
+            usb=0
+        fi
+    elif [ "$usb" = auto ]; then
+        usb=0
+    fi
+fi
 
 # Fail before modifying NAND or starting UI helpers when the host cannot
 # run this backend. In particular, a printed UI URL must not mask a
@@ -459,6 +487,23 @@ $SERIAL_ARGS $BOARD_ARGS \
     echo "  board tcp:$board_port · qmp tcp:$qmp_port · console tcp:$console_port · hmp tcp:$hmp_port · backplate tcp:$bp_port (control $bpctl_port) · ncp tcp:$ncp_port" >&2
 fi
 
+USB_ARGS=""
+DOCKER_USB_PORTS=""
+if [ "$usb" = 1 ]; then
+    usb_port=$(pick_port 7111)
+    usbip_port=$(pick_port 3240)
+    usb_bind=127.0.0.1
+    if [ "$use_docker" = 1 ]; then
+        usb_bind=0.0.0.0
+        DOCKER_USB_PORTS="-p 127.0.0.1:$usb_port:$usb_port"
+    fi
+    USB_ARGS="-chardev socket,id=usbhost,host=$usb_bind,port=$usb_port,server=on,wait=off,nodelay=on -M usb0-hostchar=usbhost"
+    python3 "$script_path/ui/usbip.py" --socket "tcp:127.0.0.1:$usb_port" --port "$usbip_port" $usb_attach --parent $$ &
+    if [ -z "$usb_attach" ]; then
+        echo "USB/IP export: 127.0.0.1:$usbip_port (attach from a Linux host)" >&2
+    fi
+fi
+
 # With --ui on a terminal the terminal is ui.py's; QEMU keeps off it.
 [ "$keyboard" = 1 ] && exec < /dev/null
 if [ "$use_docker" = 1 ]; then
@@ -479,17 +524,17 @@ if [ "$use_docker" = 1 ]; then
     exec docker run --rm --init --name "$machine-$$" $tty_flags \
         -v "$repo_root:$repo_root" \
         -w "$repo_root" \
-        $DOCKER_UI_PORTS $DOCKER_SSH_PORT \
+        $DOCKER_UI_PORTS $DOCKER_SSH_PORT $DOCKER_USB_PORTS \
         $QEMU_DOCKER_ARGS \
         "$tag" "$QEMU" $MACHINE_ARGS $extra $ICOUNT_ARGS \
             -drive if=none,id=nand,format=raw,file="$NAND",snapshot=$NAND_SNAP \
             $NIC_ARGS \
-            $UI_ARGS \
+            $UI_ARGS $USB_ARGS \
             "$@"
 fi
 
     exec "$QEMU" $MACHINE_ARGS $extra $ICOUNT_ARGS \
         -drive if=none,id=nand,format=raw,file="$NAND",snapshot=$NAND_SNAP \
         $NIC_ARGS \
-        $UI_ARGS \
+        $UI_ARGS $USB_ARGS \
         "$@"

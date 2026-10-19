@@ -12,7 +12,9 @@ QEMU machines that boot the stock firmware of Nest Learning Thermostats from the
 | `-M j49` | gen 2 (Display-2.x) | TI AM3703 | x-loader, U-Boot 2012.10, Linux 2.6.37, JFFS2 root |
 
 - Modelled: display, ring, button, piezo, backplate, WiFi, Thread radio.
-- Not modelled: USB device mode, ENET, other Thread nodes.
+- Gen 3 USB: automatic host attachment on supported Linux hosts;
+  [USB/IP export](docs/usb-host-bridge-protocol.md) on macOS.
+- Not modelled: gen 2 USB device mode, ENET, other Thread nodes.
 - Hosts: Linux, macOS (Apple silicon and Intel).
 
 ## Setup
@@ -59,6 +61,7 @@ You supply the NAND image; formats in [docs/nand-image.md](docs/nand-image.md).
 ./run.sh --nand nand-logical.bin   # first boot
 ./run.sh                           # later boots
 ./run.sh --ui                      # + web page at http://127.0.0.1:8075
+./run.sh --no-usb                  # opt out of automatic Linux USB attachment
 
 # gen 2: raw chip, data + OOB pages
 ./run.sh --gen2 --nand nand-j49.raw

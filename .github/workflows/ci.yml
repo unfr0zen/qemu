@@ -74,6 +74,9 @@ jobs:
       - name: Build
         run: ./setup.sh
 
+      - name: UDC bridge
+        run: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m unittest discover -s tests -p 'test_cihdrc_bridge.py'
+
       # QEMU's own ARM tests: the stack changes models upstream boards share
       # (the i.MX watchdog, I2C and uSDHC among them), and qom-test and
       # test-hmp build every machine, flintstone and j49 included.
@@ -94,6 +97,9 @@ jobs:
       # pinned ruff so a new release cannot fail an unchanged tree.
       - name: ruff
         run: pipx run ruff==0.17.0 check --isolated --select E9,F $(git ls-files '*.py')
+
+      - name: USB/IP protocol
+        run: python3 -m unittest discover -s tests -p 'test_usbip.py'
 
       - name: Shell
         run: for f in $(git ls-files '*.sh'); do sh -n "$f" || exit 1; done
