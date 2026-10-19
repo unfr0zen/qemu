@@ -120,12 +120,12 @@ the gen 2's board behind it:
 `ui/backplate.py` plays the backplate MCU on UART3 (`/dev/ttyO2`),
 as on the gen 3.
 
-`ui/em35x.py --gen2` plays the EM357 Thread radio on McSPI2 (spidev
+`ui/em35x.py --board j49` plays the EM357 Thread radio on McSPI2 (spidev
 2.0: chip select 0, nRESET on GPIO 61, nHOST_INT on GPIO 182, no nWAKE
 line). The gen 2 runs the same ConnectIP `ip-modem-app` 2.0.4 build 301 as
 the gen 3, built for the EM357 (`Sep 23 2015 16:39:22`), whose command
 table has `SetTransmitHookActive` (0x6991) where the gen 3's has
-0x6993/0x6994; `--gen2` reports that build and answers that command. The
+0x6993/0x6994; `--board j49` reports that build and answers that command. The
 radio's EUI-64 is the unit's own, from its environment's `hwaddr1`.
 
 ## WiFi and network
