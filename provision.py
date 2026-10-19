@@ -341,13 +341,13 @@ def hostname(con, name=None):
     return f"hostname: {name}" if name else "hostname: the serial number"
 
 
-def nestlocal(con, gen2=False):
+def nestlocal(con, board="flintstone"):
     """Whether ha/qemu_install.py has put nestlocal on this root: run.sh
     --mqtt only relays the broker to it."""
     if con.run("[ -x /nestlabs/sbin/nestlocal ]") == 0:
         return "nestlocal: installed (run.sh --mqtt HOST bridges it)"
     return ("nestlocal: not installed (for --mqtt: python3 ha/qemu_install.py"
-            + (" --gen2)" if gen2 else ")"))
+            + (" --gen2)" if board == "j49" else ")"))
 
 
 # QEMU's user-mode network is fixed: the guest gets .15, the host is
@@ -583,7 +583,7 @@ def gen2(args, cmd):
             done.append(wifi(con, mac, args.ssid))
             done.append(onboarding(con))
             done.append(wiring(con))
-            done.append(nestlocal(con, gen2=True))
+            done.append(nestlocal(con, board="j49"))
             if con.run("sync; umount /media/user-config") != 0:
                 raise RuntimeError("user-config did not unmount cleanly")
             if con.run("mount -o remount,ro /") != 0:

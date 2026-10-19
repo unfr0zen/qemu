@@ -1,7 +1,6 @@
 #!/bin/sh
 #
-# Boot the gen3 stock firmware in the flintstone machine (or, with --gen2,
-# the gen 2's in the j49 machine).
+# Boot stock firmware in the flintstone, j49 or diamond machine.
 #
 # The stock U-Boot image is carved out of the NAND image by the machine's
 # boot ROM stub itself: nothing external is loaded, the ROM reads the NAND
@@ -39,6 +38,7 @@
 #                                   #   a system update switches it
 #   ./run.sh --gen2 [--ui]       # the gen 2 (j49) from its own image
 #   ./run.sh --gen1 [--ui]       # the gen 1 (diamond) from its own raw NAND
+#   ./run.sh --machine diamond   # explicit machine selection
 #
 # QEMU_FORCE_DOCKER=1 runs a native build through Linux/Docker as well.
 # QEMU_DOCKER_ARGS adds options to that docker run (a network to join, say).
@@ -83,14 +83,16 @@ stock_image=""
 mqtt=""
 nic_extra=""
 ssh_port=""
-gen2=0
-gen1=0
+machine_option=""
 root=""
 nand_arg=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --gen2) gen2=1; shift ;;
-        --gen1) gen1=1; shift ;;
+        --gen2) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=j49; shift ;;
+        --gen1) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=diamond; shift ;;
+        --machine) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }
+                   case "$2" in flintstone|j49|diamond) machine_option=$2 ;; *) echo "ERROR: unknown machine: $2" >&2; exit 1 ;; esac
+                   shift 2 ;;
         --root0) root=0; shift ;;
         --root1) root=1; shift ;;
         --ui) ui=1; shift ;;
@@ -109,17 +111,14 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
-if [ "$gen1" = 1 ] && [ "$gen2" = 1 ]; then
-    echo "ERROR: choose --gen1 or --gen2" >&2
-    exit 1
-fi
-if [ "$gen1" = 1 ] && [ -n "$stock_image" ]; then
+machine=${machine_option:-flintstone}
+if [ "$machine" = diamond ] && [ -n "$stock_image" ]; then
     echo "ERROR: --stock-image needs a validated Diamond NAND image" >&2
     exit 1
 fi
 omap=0
-if [ "$gen1" = 1 ] || [ "$gen2" = 1 ]; then omap=1; fi
-if [ "$gen1" = 1 ]; then provision=0; fi
+if [ "$machine" != flintstone ]; then omap=1; fi
+if [ "$machine" = diamond ]; then provision=0; fi
 
 usb_attach=""
 if [ "$omap" = 1 ] && [ "$usb" = auto ]; then
@@ -200,20 +199,17 @@ pick_port() {
 # (or $NAND) names, else .qemu/nand.bin. It is only needed to seed the
 # state; once the state exists, a plain run boots that alone.
 NAND_PRISTINE="$repo_root/.qemu/nand.bin"
-machine=flintstone
 MACHINE_ARGS="-M flintstone -m 512M"
 NAND_STATE_DEFAULT="$repo_root/.qemu/nand-state.bin"
-if [ "$gen2" = 1 ]; then
+if [ "$machine" = j49 ]; then
     # The gen 2 boots its raw NAND (data + OOB pages), as nand.raw. No
     # image ships here: it carries the unit's data and its owner's
     # credentials.
-    machine=j49
     MACHINE_ARGS="-M j49 -m 64M"
     NAND_PRISTINE="$repo_root/.qemu/nand.raw"
     NAND_STATE_DEFAULT="$repo_root/.qemu/j49-nand-state.raw"
 fi
-if [ "$gen1" = 1 ]; then
-    machine=diamond
+if [ "$machine" = diamond ]; then
     MACHINE_ARGS="-M diamond -m 64M"
     NAND_PRISTINE="$repo_root/.qemu/diamond-nand.raw"
     NAND_STATE_DEFAULT="$repo_root/.qemu/diamond-nand-state.raw"
@@ -227,7 +223,7 @@ use_state=0
     [ "$NAND_FRESH" != "1" ] && [ -f "$NAND_STATE" ] && use_state=1
 if [ "$use_state" = 0 ] && [ ! -f "$NAND" ]; then
     echo "ERROR: NAND image not found: $NAND" >&2
-    echo "  no NAND state at $NAND_STATE either: seed it with ./run.sh$([ "$gen1" = 1 ] && echo " --gen1")$([ "$gen2" = 1 ] && echo " --gen2") --nand FILE" >&2
+    echo "  no NAND state at $NAND_STATE either: seed it with ./run.sh$([ "$machine" = diamond ] && echo " --gen1")$([ "$machine" = j49 ] && echo " --gen2") --nand FILE" >&2
     exit 1
 fi
 if [ "$use_state" = 1 ] && [ -n "$nand_given" ]; then
@@ -341,10 +337,10 @@ fi
 # nothing is kept on the host, so any checkout and any NAND boot the same.
 PROVISION_QEMU="$MACHINE_ARGS -nographic -nic none"
 run_provision() {
-    [ "$gen2" = 1 ] && set -- --gen2 "$NAND" "$@"
-    [ "$gen2" = 0 ] && [ -n "$root" ] && set -- --root "$root" "$@"
+    [ "$machine" = j49 ] && set -- --gen2 "$NAND" "$@"
+    [ "$machine" != j49 ] && [ -n "$root" ] && set -- --root "$root" "$@"
     [ "$sleep" = 1 ] && set -- --sleep "$@"
-    [ "$gen2" = 0 ] && [ -n "$hostname" ] && set -- --hostname "$hostname" "$@"
+    [ "$machine" != j49 ] && [ -n "$hostname" ] && set -- --hostname "$hostname" "$@"
     if [ "$use_docker" = 1 ]; then
         python3 "$script_path/provision.py" "$@" -- \
             docker run --rm -i --init -v "$repo_root:$repo_root" \
@@ -366,7 +362,7 @@ elif [ -n "$root" ] && [ "$provision" = 0 ] && [ -z "$stock_image" ]; then
     echo "ERROR: --root$root needs the pre-boot on gen 3 (drop --no-provision)" >&2
     exit 1
 fi
-if [ "$gen2" = 1 ] && { [ "$provision" = 1 ] || [ -n "$stock_image" ]; }; then
+if [ "$machine" = j49 ] && { [ "$provision" = 1 ] || [ -n "$stock_image" ]; }; then
     # The release U-Boot silences the console (its built-in silent=1 blanks
     # the first console= it passes); the unit's own environment, edited as
     # fw_setenv would, adds a second one. The firmware is unchanged.
@@ -380,7 +376,7 @@ if [ -n "$stock_image" ]; then
         exit 1
     fi
     echo "stock image: $NAND (boot it with NAND=$NAND NAND_SNAPSHOT=1" \
-         "./run.sh$([ "$gen2" = 1 ] && echo " --gen2") --no-provision)" >&2
+         "./run.sh$([ "$machine" = j49 ] && echo " --gen2") --no-provision)" >&2
     exit 0
 elif [ "$provision" = 1 ]; then
     run_provision || echo "provision: booting the unit as it is" >&2
@@ -434,7 +430,7 @@ PY
     # the container's ethernet address, not its loopback. A native build
     # gets the same; it is a localhost dev box either way.
     bind=0.0.0.0
-    if [ "$gen2" = 1 ]; then
+    if [ "$machine" = j49 ]; then
         # UART1 is the console, UART3 the backplate's serial (ttyO2).
         SERIAL_ARGS="-serial chardev:con -serial null -serial chardev:bp"
         BOARD_ARGS="-global driver=j49.board,property=chardev,value=boardui \
@@ -442,7 +438,7 @@ PY
 -global driver=em35x-ncp,property=chardev,value=ncp \
 -global driver=j49.board,property=poweroff-exit,value=on"
         PINS="button=HU-BUTTON,poweroff=POWEROFF,wifi_enable=WIFI-ENABLE,beeper_en=BEEPER-EN"
-    elif [ "$gen1" = 1 ]; then
+    elif [ "$machine" = diamond ]; then
         # Diamond's radio is on UART2; UART3 remains the backplate.
         SERIAL_ARGS="-serial chardev:con -serial chardev:radio -serial chardev:bp"
         BOARD_ARGS="-global driver=j49.board,property=chardev,value=boardui \
@@ -489,26 +485,25 @@ $SERIAL_ARGS $BOARD_ARGS \
         --screen-file "$ui_dir/screen.ppm" \
         --port "$http_port" \
         --pins "$PINS" \
-        --name "Nest gen $([ "$gen1" = 1 ] && echo 1 || { [ "$gen2" = 1 ] && echo 2 || echo 3; })" \
+        --name "Nest gen $([ "$machine" = diamond ] && echo 1 || { [ "$machine" = j49 ] && echo 2 || echo 3; })" \
         --backplate "tcp:127.0.0.1:$bpctl_port" \
         --parent $$ --cleanup "$ui_dir" < "$ui_stdin" &
     # The fake backplate (sensor) MCU on the sensor-MCU serial: answers
     # the front unit and streams bright ALS samples so nlclient lights
     # the display (it keeps the panel asleep until the ALS reports).
-    # shellcheck disable=SC2046 # --gen2 is either there or not
     python3 "$script_path/ui/backplate.py" --serial "tcp:127.0.0.1:$bp_port" \
         --control "tcp:127.0.0.1:$bpctl_port" \
-        --flash "$NAND.backplate" $([ "$omap" = 1 ] && echo --gen2) --parent $$ &
+        --flash "$NAND.backplate" --board "$machine" --parent $$ &
     # The Thread radio (em35x-ncp on ECSPI3, McSPI2 on the gen 2): the
     # ConnectIP network co-processor wpantund drives (ui/em35x.py
     # --debug logs it). The gen 2's EUI-64 is the unit's own, from its
     # environment (hwaddr1), as the unit reports its 15.4 MAC address.
     NCP_ARGS=""
-    if [ "$gen2" = 1 ]; then
+    if [ "$machine" = j49 ]; then
         eui64=$(python3 "$script_path/j49_env.py" "$NAND" | sed -n 's/^hwaddr1=//p')
-        NCP_ARGS="--gen2${eui64:+ --eui64 $eui64}"
+        NCP_ARGS="--board j49${eui64:+ --eui64 $eui64}"
     fi
-    if [ "$gen1" = 1 ]; then
+    if [ "$machine" = diamond ]; then
         python3 "$script_path/ui/diamond_radio.py" \
             --serial "tcp:127.0.0.1:$ncp_port" --parent $$ &
     else

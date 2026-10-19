@@ -205,9 +205,9 @@ MONO = dict(version="2.3.11", description="TFE (BP_A2)",
 BSL = dict(version="3.1", description="BSL",
            host="jenkins-agent-190-v17-emb-prod", user="jenkins-slave",
            date="2019-04-05 20:26:31")
-# The gen 2's (--gen2): a Backplate-2.2x running what the gen 2's
-# nlbpfirmware.plist ships for it (TFE (BP_D2D) 4.2.8, BSL 3.1). The model's
-# suffix is a guess within the image's Backplate-2.20 to 2.30.
+# The j49's Backplate-2.2x uses these firmware identities. Diamond uses
+# this model provisionally. The suffix is a guess within the image's
+# Backplate-2.20 to 2.30.
 GEN2_MODEL = b"Backplate-2.21"
 GEN2_MONO = dict(version="4.2.8", description="TFE (BP_D2D)",
                  host="jenkins-agent-143-v17-emb-prod", user="jenkins-slave",
@@ -278,7 +278,7 @@ class Backplate:
                  temp_c=21.5, rh=45.0, presence=True, period=2.0,
                  wires=("Rh", "C", "W1", "Y1", "G"), flash_file=None,
                  ambient=16.0, heat_rate=3.0, cool_rate=2.5, room_tau=8.0,
-                 gen2=False):
+                 board="flintstone"):
         self.spec = spec
         self.debug = debug
         self.als_vis = als_vis
@@ -304,17 +304,16 @@ class Backplate:
         self.period = period
         self.wires = wires
         self.attached = threading.Event()     # the front unit reset us
-        self.gen2 = gen2
-        self.model = GEN2_MODEL if gen2 else b"Backplate-6.0"
-        self.mono = dict(GEN2_MONO if gen2 else MONO)
-        self.bsl = dict(GEN2_BSL if gen2 else BSL)
+        self.board = board
+        self.model = GEN2_MODEL if board != "flintstone" else b"Backplate-6.0"
+        self.mono = dict(GEN2_MONO if board != "flintstone" else MONO)
+        self.bsl = dict(GEN2_BSL if board != "flintstone" else BSL)
         self.flash_file = flash_file
         if flash_file and os.path.exists(flash_file):
             with open(flash_file) as f:
                 saved = json.load(f)
-            # Only firmware for this backplate: a gen 3 image in a gen 2's
-            # flash file is from before --gen2.
-            if saved["mono"]["description"].startswith("TFE (BP_D2") == gen2:
+            # Keep saved firmware only for the selected backplate family.
+            if saved["mono"]["description"].startswith("TFE (BP_D2") == (board != "flintstone"):
                 self.mono, self.bsl = saved["mono"], saved["bsl"]
         self.update = None                    # (kind, {seq: record}) in the BSL
         self.buf = b""
@@ -449,7 +448,7 @@ class Backplate:
         if self.presence:
             self.send(MSG_PIR, struct.pack("<HH", 0x03E8, 0x03E8))
             # The gen 2's near PIR: someone close, past stock's threshold (15).
-            if self.gen2:
+            if self.board != "flintstone":
                 self.send(MSG_NEAR_PIR, struct.pack("<H", 100))
 
     def flush(self):
@@ -564,7 +563,7 @@ class Backplate:
         if (low is not None and self.temp_c < low) or (high is not None and self.temp_c > high):
             fired |= WAKE_TEMP
         if self.presence:
-            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.gen2 else 0)
+            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.board != "flintstone" else 0)
         return fired & (self.wake_sources | WAKE_TIMER)
 
     def serve_forever(self):
@@ -705,8 +704,8 @@ def main():
                     help="connected terminals, of " + ",".join(WIRE_INDEX))
     ap.add_argument("--control", metavar="tcp:HOST:PORT",
                     help="take room and wiring changes as JSON lines here")
-    ap.add_argument("--gen2", action="store_true",
-                    help="be the gen 2's backplate (Backplate-2.21, TFE (BP_D2D) 4.2.8)")
+    ap.add_argument("--board", choices=("flintstone", "j49", "diamond"), default="flintstone",
+                    help="backplate board model; Diamond uses the provisional j49 model")
     ap.add_argument("--flash", metavar="FILE",
                     help="the MCU's flash: the firmware it runs, kept across "
                          "restarts (default: stock, every start)")
@@ -723,7 +722,7 @@ def main():
                    wires=args.wires.split(","),
                    flash_file=args.flash, ambient=args.ambient,
                    heat_rate=args.heat_rate, cool_rate=args.cool_rate,
-                   room_tau=args.room_tau, gen2=args.gen2)
+                   room_tau=args.room_tau, board=args.board)
     if args.control:
         threading.Thread(target=bp.serve_control, args=(args.control,),
                          daemon=True).start()
