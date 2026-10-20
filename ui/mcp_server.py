@@ -108,7 +108,8 @@ def request(method, path, body=None, timeout=10):
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status, r.headers.get("Content-Type", ""), r.read()
         except urllib.error.HTTPError as e:
-            msg = e.read().decode(errors="replace").strip()
+            with e:
+                msg = e.read().decode(errors="replace").strip()
             if e.code == 404:
                 msg += (f" (the unit at {url} runs a ui.py older than this "
                         "server: restart it)")
@@ -912,6 +913,11 @@ def t_set_time(a):
     return [text(f"guest time now: {out.strip()}")]
 
 
+def t_usb(a):
+    want = {k: v for k, v in a.items() if v is not None}
+    return [text(json.loads(post("/usb", want)))]
+
+
 def t_backplate(a):
     want = {k: v for k, v in a.items() if v is not None}
     return [text(json.loads(post("/backplate", want, timeout=15)))]
@@ -1015,6 +1021,8 @@ TOOLS = {
                           "detached": d(BOOL, "lift the display off its base (the detect line; flintstone only); false puts it back"),
                           "wires": {"type": "array", "items": {"type": "string"},
                                     "description": "terminals with a wire, e.g. [\"Rh\", \"W1\", \"Y1\", \"G\", \"C\"]; the unit sees the new wiring"}})),
+    "usb": (t_usb, "Plug or unplug the gen 3 USB cable. connected=false drops VBUS and detaches the host USB/IP device; true restores VBUS and allows re-enumeration. Omit connected to read cable and VBUS state. Requires a QEMU build with USB cable control; firmware charger notifications are asynchronous.",
+            schema({"connected": BOOL})),
     "qmp": (t_qmp, "Send a QMP command to QEMU, e.g. system_reset (reboot), stop/cont (pause), human-monitor-command (HMP). quit ends QEMU and with it ui.py.",
             schema({"command": STR, "arguments": {"type": "object"}}, ["command"])),
 }
@@ -1025,7 +1033,8 @@ status first to see whether it is up. screenshot / capture_frames show the
 screen; press_button, turn_wheel and input_sequence are the device's
 inputs; record_start/record_stop make a video. console_exec runs shell
 commands as root; pull_file/push_file move files. set_time moves the
-guest's clock; backplate sets the simulated room and wiring. Console tools return a
+guest's clock; backplate sets the simulated room and wiring; usb plugs or
+unplugs the host USB cable. Console tools return a
 cursor: pass it as `since` to console_read/console_wait so nothing printed
 in between is missed."""
 

@@ -538,6 +538,8 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None):
             elif self.path == "/config":
                 body = json.dumps({"pins": pins, "name": name}).encode()
                 self.send_body(200, "application/json", body)
+            elif self.path == "/usb":
+                self.usb({})
             elif self.path == "/wheel":
                 pos = qmp.wheel_position() if qmp else None
                 self.send_body(200, "application/json",
@@ -571,6 +573,30 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None):
                 self.font(self.path[len("/font/"):])
             else:
                 self.send_body(404, "text/plain", b"not found\n")
+
+        def usb(self, want):
+            if not qmp:
+                self.send_body(503, "text/plain", b"no QMP\n")
+                return
+            if not isinstance(want, dict) or set(want) - {"connected"} or \
+                    ("connected" in want and type(want["connected"]) is not bool):
+                self.send_body(400, "text/plain", b"connected must be a boolean\n")
+                return
+            if "connected" in want:
+                result = qmp.execute("qom-set", {"path": "/machine",
+                                     "property": "usb-connected",
+                                     "value": want["connected"]})
+                if "error" in result:
+                    self.send_body(503, "application/json", json.dumps(result).encode())
+                    return
+            state = {}
+            for key, prop in (("connected", "usb-connected"), ("vbus", "usb-vbus")):
+                result = qmp.execute("qom-get", {"path": "/machine", "property": prop})
+                if "error" in result:
+                    self.send_body(503, "application/json", json.dumps(result).encode())
+                    return
+                state[key] = result["return"]
+            self.send_body(200, "application/json", json.dumps(state).encode())
 
         def do_POST(self):
             # The press and the release are separate so a hold lasts as
@@ -616,6 +642,14 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None):
                 n = int(self.headers.get("Content-Length") or 0)
                 log.send(self.rfile.read(n).decode(errors="replace"))
                 self.send_body(204, "text/plain", b"")
+            elif self.path == "/usb":
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    want = json.loads(self.rfile.read(n) or b"{}")
+                except ValueError:
+                    self.send_body(400, "text/plain", b"bad JSON\n")
+                    return
+                self.usb(want)
             elif self.path == "/qmp":
                 # {"execute": ..., "arguments": {...}}, passed to QEMU as is.
                 if not qmp:
