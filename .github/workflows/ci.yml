@@ -101,6 +101,9 @@ jobs:
       - name: USB/IP protocol and cable control
         run: python3 -m unittest discover -s tests -p 'test_usb*.py'
 
+      - name: Filesystem channel and helper
+        run: python3 -m unittest discover -s tests -p 'test_fs*.py'
+
       - name: Shell
         run: for f in $(git ls-files '*.sh'); do sh -n "$f" || exit 1; done
 

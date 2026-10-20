@@ -27,6 +27,7 @@ import argparse
 import base64
 import codecs
 import collections
+import errno
 import hashlib
 import json
 import os
@@ -44,6 +45,8 @@ import time
 import urllib.parse
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from fs_channel import FileChannel, LIMIT
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The page's wordmark typeface (Inter, SIL OFL; see fonts/OFL-Inter.txt).
@@ -505,7 +508,7 @@ def backplate_control(spec, want):
         return json.loads(f.readline() or b"{}")
 
 
-def make_handler(board, log, screen, qmp, pins, name, backplate=None):
+def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -540,6 +543,11 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None):
                 self.send_body(200, "application/json", body)
             elif self.path == "/usb":
                 self.usb({})
+            elif self.path == "/fs":
+                self.send_body(200, "application/json", json.dumps({
+                    "mode": filesystem.mode if filesystem else None}).encode())
+            elif urllib.parse.urlsplit(self.path).path == "/fs/file":
+                self.file_transfer(False)
             elif self.path == "/wheel":
                 pos = qmp.wheel_position() if qmp else None
                 self.send_body(200, "application/json",
@@ -602,7 +610,9 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None):
             # The press and the release are separate so a hold lasts as
             # long as the pointer is down; the firmware times any holds
             # off the line itself.
-            if self.path == "/button/press" and "button" in pins:
+            if urllib.parse.urlsplit(self.path).path == "/fs/file":
+                self.file_transfer(True)
+            elif self.path == "/button/press" and "button" in pins:
                 board.drive(pins["button"], 1)
                 self.send_body(204, "text/plain", b"")
             elif self.path == "/button/release" and "button" in pins:
@@ -796,6 +806,32 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None):
             with open(path, "rb") as f:
                 self.send_body(200, types[ext] + "; charset=utf-8", f.read())
 
+        def file_transfer(self, writing):
+            if not filesystem:
+                self.close_connection = True
+                self.send_body(503, "text/plain", b"filesystem channel disabled: start with --fs ro or --fs rw\n")
+                return
+            try:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                path = query.get("path", [""])[0]
+                data = None
+                if writing:
+                    count = int(self.headers.get("Content-Length", "0"))
+                    if count < 0 or count > LIMIT:
+                        self.close_connection = True
+                        raise ValueError("filesystem transfers are limited to 16 MiB")
+                    data = self.rfile.read(count)
+                    if len(data) != count:
+                        raise ValueError("incomplete upload")
+                result = filesystem.transfer(path, data, query.get("mode", [None])[0])
+                self.send_body(200, "application/octet-stream", result)
+            except ValueError as error:
+                self.send_body(400, "text/plain", str(error).encode())
+            except OSError as error:
+                status = (404 if error.errno == errno.ENOENT else
+                          403 if isinstance(error, PermissionError) or error.errno == errno.EROFS else 503)
+                self.send_body(status, "text/plain", str(error).encode())
+
         def font(self, name):
             """A webfont kept next to the page."""
             path = os.path.join(FONTS, name)
@@ -975,6 +1011,8 @@ def main():
                     help="flintstone.board chardev (tcp:HOST:PORT or path)")
     ap.add_argument("--qmp", help="QEMU's QMP (tcp:HOST:PORT or path)")
     ap.add_argument("--console", help="the guest's serial (tcp:HOST:PORT or path)")
+    ap.add_argument("--fs", help="dedicated filesystem UART (tcp:HOST:PORT)")
+    ap.add_argument("--fs-mode", choices=("ro", "rw"), default="ro")
     ap.add_argument("--echo-console", action="store_true",
                     help="also print the console on stdout (run.sh's terminal)")
     ap.add_argument("--keyboard", action="store_true",
@@ -1019,7 +1057,8 @@ def main():
     # Bound before the terminal goes raw: a failed bind must not leave it so.
     server = Server(("127.0.0.1", args.port),
                     make_handler(board, log, screen, qmp, parse_pins(args.pins),
-                                 args.name, args.backplate))
+                                 args.name, args.backplate,
+                                 FileChannel(args.fs, args.fs_mode) if args.fs else None))
     if log and args.keyboard and os.isatty(0):
         threading.Thread(target=Keyboard(log, qmp, args.parent).run,
                          daemon=True).start()

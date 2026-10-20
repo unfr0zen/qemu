@@ -110,7 +110,7 @@ def request(method, path, body=None, timeout=10):
         except urllib.error.HTTPError as e:
             with e:
                 msg = e.read().decode(errors="replace").strip()
-            if e.code == 404:
+            if e.code == 404 and not path.startswith("/fs/file?"):
                 msg += (f" (the unit at {url} runs a ui.py older than this "
                         "server: restart it)")
             raise ToolError(f"{method} {path}: HTTP {e.code} {msg}") from None
@@ -646,11 +646,22 @@ def ssh(port, command, stdin=b"", timeout_s=600):
     return r.returncode, r.stdout, r.stderr.decode(errors="replace").strip()
 
 
-def transfer(via, over_ssh, over_console):
-    """over_ssh(port) where ssh works and `via` allows it, else
-    over_console(); returns (result, how it went)."""
-    if via not in ("auto", "ssh", "console"):
-        raise ToolError("via is auto, ssh or console")
+def transfer(via, over_ssh, over_console, over_fs=None):
+    """Prefer an enabled side channel, then SSH and console when allowed.
+    Returns (result, how it went); side-channel failures never fall back."""
+    if via not in ("auto", "ssh", "console", "sidechannel"):
+        raise ToolError("via is auto, sidechannel, ssh or console")
+    if via in ("auto", "sidechannel") and over_fs:
+        try:
+            enabled = get_json("/fs").get("mode")
+        except ToolError as error:
+            if via != "auto" or "HTTP 404" not in str(error):
+                raise
+            enabled = None
+        if enabled:
+            return over_fs(), f"sidechannel ({enabled})"
+        if via == "sidechannel":
+            raise ToolError("filesystem channel disabled: start with --fs ro or --fs rw")
     if via != "console":
         port = ssh_port()
         if port is None and via == "ssh":
@@ -856,7 +867,9 @@ def t_pull_file(a):
     timeout_s = float(a.get("timeout_s", 300))
     data, how = transfer(a.get("via", "auto"),
                          lambda port: pull_ssh(port, a["path"], timeout_s),
-                         lambda: pull(a["path"], timeout_s))
+                         lambda: pull(a["path"], timeout_s),
+                         lambda: request("GET", "/fs/file?" + urllib.parse.urlencode({"path": a["path"]}),
+                                         timeout=timeout_s)[2])
     if a.get("local_path"):
         return [text(f"{len(data)} bytes saved to {save(data, a['local_path'])} "
                      f"via {how}")]
@@ -879,7 +892,10 @@ def t_push_file(a):
     timeout_s = float(a.get("timeout_s", 600))
     _, how = transfer(a.get("via", "auto"),
                       lambda port: push_ssh(port, data, a["path"], a.get("mode"), timeout_s),
-                      lambda: push(data, a["path"], a.get("mode"), timeout_s))
+                      lambda: push(data, a["path"], a.get("mode"), timeout_s),
+                      lambda: post("/fs/file?" + urllib.parse.urlencode({
+                          "path": a["path"], **({"mode": a["mode"]} if "mode" in a else {})}),
+                                   data, timeout=timeout_s))
     return [text(f"wrote {len(data)} bytes to {a['path']} via {how}")]
 
 
@@ -987,15 +1003,15 @@ TOOLS = {
                              "since": d(INT, "cursor to search from (default: now, so pass one from before the action you are waiting on)"),
                              "timeout_s": d(NUM, "default 30")},
                             ["pattern"])),
-    "pull_file": (t_pull_file, "Read a file from the guest's filesystem: over ssh when the unit runs with --ssh (MB/s), else over the console (md5-checked, ~130 KB/s). Text comes back inline; binary needs local_path.",
+    "pull_file": (t_pull_file, "Read a guest file: dedicated UART with --fs ro/rw (no SSH or console), otherwise SSH or console. Text comes back inline; binary needs local_path. Sidechannel limit: 16 MiB.",
                   schema({"path": d(STR, "guest path"),
                           "local_path": d(STR, "save to this host path instead of returning it"),
-                          "via": d(STR, "auto (default: ssh if forwarded, else console), ssh or console"),
+                          "via": d(STR, "auto (default: sidechannel if enabled, else ssh/console), sidechannel, ssh or console"),
                           "timeout_s": d(NUM, "default 300")},
                          ["path"])),
-    "push_file": (t_push_file, "Write a file into the guest: over ssh when the unit runs with --ssh (MB/s), else over the console (md5-checked, ~60 KB/s). Lands as path.mcp-part and is moved into place. The root filesystem is read-only until: mount -o remount,rw /",
+    "push_file": (t_push_file, "Write a guest file atomically: dedicated UART with --fs rw (no SSH or console), otherwise SSH or console. --fs ro rejects writes. Sidechannel limit: 16 MiB. Guest read-only mounts remain read-only.",
                   schema({"path": d(STR, "guest path"),
-                          "via": d(STR, "auto (default: ssh if forwarded, else console), ssh or console"),
+                          "via": d(STR, "auto (default: sidechannel if enabled, else ssh/console), sidechannel, ssh or console"),
                           "content": d(STR, "text to write"),
                           "local_path": d(STR, "host file to send instead of content"),
                           "mode": d(STR, "chmod mode, e.g. 755"),
