@@ -98,8 +98,8 @@ jobs:
       - name: ruff
         run: pipx run ruff==0.17.0 check --isolated --select E9,F $(git ls-files '*.py')
 
-      - name: USB/IP protocol
-        run: python3 -m unittest discover -s tests -p 'test_usbip.py'
+      - name: USB/IP protocol and cable control
+        run: python3 -m unittest discover -s tests -p 'test_usb*.py'
 
       - name: Shell
         run: for f in $(git ls-files '*.sh'); do sh -n "$f" || exit 1; done

@@ -1,0 +1,34 @@
+From 49f77de3a29180eeaaa69ed6e89ab0e1d1c2f6a2 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:38:23 -0400
+Subject: [PATCH 108/109] hw/arm: fsl-imx6sx: correct USB charger status
+ register
+
+USB1_CHRG_DET_STAT is at anatop offset 0x1d0. Report plug contact
+with CHRG_DETECTED and DM_STATE clear for a standard downstream port.
+Offset 0x240 belongs to the second USB port, not USB1 charger status.
+---
+ hw/arm/fsl-imx6sx.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index ae9eb3f..1b079e3 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -637,8 +637,11 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+ 
+         /* USB1_VBUS_DETECT_STAT (anatop+0x1C0): all VBUS thresholds met */
+         usb_analog_regs[0] = BIT(0) | BIT(2) | BIT(3) | BIT(4);
+-        /* USB1_CHRG_DETECT_STAT (anatop+0x240): SDP (standard downstream) */
+-        usb_analog_regs[0x80 / 4] = BIT(0) | BIT(1) | BIT(2) | BIT(3);
++        /*
++         * USB1_CHRG_DET_STAT (anatop+0x1D0): standard downstream port,
++         * with plug contact detected, no charger detected, and DM low.
++         */
++        usb_analog_regs[0x10 / 4] = BIT(0);
+         memory_region_init_io(&usb_analog_mr, NULL, &usb_analog_ops,
+                               usb_analog_regs, "anatop-usb-analog", 0x100);
+         memory_region_add_subregion(get_system_memory(),
+-- 
+2.56.0
+

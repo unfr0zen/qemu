@@ -30,6 +30,39 @@ Only one importer can use the bridge. Control, bulk and interrupt URBs are
 supported; isochronous transfers and alternate endpoint settings are not.
 [USB/IP protocol](https://www.kernel.org/doc/html/latest/usb/usbip_protocol.html).
 
+## Cable control
+
+With `./run.sh --ui`, MCP tool `usb` accepts `{"connected": false}` to
+unplug and `{"connected": true}` to plug the cable back in. An empty
+object reads the state. The UI API exposes the same control through
+`POST /usb`; `GET /usb` reads it. Both return `connected` (the requested
+cable state) and `vbus` (the effective voltage, which also requires an
+open host bridge). Gen 2 does not expose this control.
+
+Unplugging drops OTGSC B-session-valid and USB1 analog VBUS/charger
+status, and latches the VBUS-change interrupt. The stock driver updates
+`/sys/devices/soc0/soc/2100000.aips-bus/2184000.usb/power_supply/imx_usb_charger/present`
+asynchronously. USB/IP terminates the active import; Linux auto-attach
+removes the host device and enumerates it again when the cable is plugged
+back in. A manual importer must attach again. The exporter stays running,
+and controller or guest resets preserve the requested cable state.
+
+The QMP properties are `/machine/usb-connected` (read/write) and
+`/machine/usb-vbus` (read-only). Repeating the current cable setting does
+not create an interrupt. Device-controller reset preserves OTG interrupt
+status and enables; machine reset clears them.
+
+To check the complete MCP-to-firmware-to-host path, boot the unit with
+`./run.sh --ui --usb`, find its local bus ID with `usbip port`, and run:
+
+```sh
+python3 tests/check_usb_cable.py --url http://127.0.0.1:8075 --host-busid 5-1
+```
+
+This requires an idle guest shell. It checks three unplug/plug cycles,
+charger `present`, VBUS registers, host removal, and fresh enumeration.
+It prints JSON observations and leaves the cable plugged in.
+
 ## host -> QEMU
 
     SETUP <16 hex>          8-byte setup packet. The model writes it into
@@ -64,10 +97,10 @@ supported; isochronous transfers and alternate endpoint settings are not.
     SETUPACK                The guest driver took the SETUP (ENDPTSETUPSTAT
                             bit cleared after it read the buffer).
     RESETDONE               Reply to RESET.
-    CONNECT                 The gadget driver enabled the UDC (USBMODE
-                            device + run/session active) - virtual cable
-                            attached.
-    DISCONNECT              UDC stopped (module unload / soft disconnect).
+    CONNECT                 VBUS is present and the gadget driver enabled
+                            the UDC (USBMODE device + run/session active).
+    DISCONNECT              Cable unplugged or UDC stopped (module unload
+                            / soft disconnect).
 
 Unprimed endpoints return NAK without closing the bridge. The host
 serializes control transfers on EP0.

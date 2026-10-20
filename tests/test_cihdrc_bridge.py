@@ -1,5 +1,6 @@
 """Exercise UDC tokens and guest DMA without firmware, through QEMU qtest."""
 import os
+import json
 import socket
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ class UdcTest(unittest.TestCase):
             os.environ["QEMU_SYSTEM_ARM"], "-M", "flintstone,usb0-hostchar=usb",
             "-accel", "qtest", "-display", "none", "-nodefaults",
             "-qtest", f"unix:{self.root}/qtest,server=on,wait=off",
+            "-qmp", f"unix:{self.root}/qmp,server=on,wait=off",
             "-chardev", f"socket,id=usb,path={self.root}/bridge,server=on,wait=off",
         ], stdout=subprocess.DEVNULL, stderr=self.stderr)
         for _ in range(250):
@@ -34,13 +36,16 @@ class UdcTest(unittest.TestCase):
             if self.proc.poll() is not None:
                 self.fail((self.root / "stderr").read_text())
             time.sleep(0.02)
-        for name in ("qtest", "bridge"):
+        for name in ("qtest", "bridge", "qmp"):
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.sockets.append(sock)
             sock.settimeout(3)
             sock.connect(str(self.root / name))
             self.streams.append(sock.makefile("rwb", buffering=0))
-        self.qtest, self.bridge = self.streams
+        self.qtest, self.bridge, self.monitor = self.streams
+        self.assertIn("QMP", json.loads(self.monitor.readline()))
+        self.qmp("qmp_capabilities")
+        self.irq = False
         self.write(self.BASE + 0x1a8, 2)
         self.write(self.BASE + 0x140, 1)
         self.assertEqual(self.bridge.readline(), b"CONNECT\n")
@@ -50,7 +55,11 @@ class UdcTest(unittest.TestCase):
     def cleanup(self):
         if hasattr(self, "proc"):
             self.proc.terminate()
-            self.proc.wait(timeout=5)
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
         for stream in getattr(self, "streams", []):
             stream.close()
         for sock in getattr(self, "sockets", []):
@@ -61,8 +70,27 @@ class UdcTest(unittest.TestCase):
     def command(self, text):
         self.qtest.write((text + "\n").encode())
         reply = self.qtest.readline().decode().strip()
+        while reply.startswith("IRQ "):
+            self.irq = reply.split()[1] == "raise"
+            reply = self.qtest.readline().decode().strip()
         self.assertTrue(reply.startswith("OK"), reply)
         return reply
+
+    def qmp(self, command, arguments=None):
+        message = {"execute": command}
+        if arguments is not None:
+            message["arguments"] = arguments
+        self.monitor.write(json.dumps(message).encode() + b"\n")
+        while True:
+            result = json.loads(self.monitor.readline())
+            if "event" not in result:
+                self.assertIn("return", result)
+                return result["return"]
+
+    def cable(self, connected):
+        self.qmp("qom-set", {"path": "/machine", "property": "usb-connected",
+                             "value": connected})
+        return self.qmp("qom-get", {"path": "/machine", "property": "usb-vbus"})
 
     def write(self, addr, value):
         self.command(f"writel {addr:#x} {value:#x}")
@@ -84,6 +112,111 @@ class UdcTest(unittest.TestCase):
         if payload:
             self.command(f"write {self.DATA:#x} {len(payload)} 0x{payload.hex()}")
         self.write(self.BASE + 0x1b0, 1 << (ep + 16 * direction))
+
+    def test_vbus_edges(self):
+        otgsc = self.BASE + 0x1a4
+        bsv, status, enable = 1 << 11, 1 << 19, 1 << 27
+        self.command("irq_intercept_out usb0 sysbus-irq")
+        self.assertEqual(self.read(otgsc) & (bsv | status | enable), bsv | status)
+        self.assertFalse(self.irq)
+        self.write(otgsc, enable)
+        self.assertTrue(self.irq)
+        self.write(otgsc, 0)
+        self.assertFalse(self.irq)
+        self.assertTrue(self.read(otgsc) & status)
+        self.write(otgsc, enable)
+        self.assertTrue(self.irq)
+        self.write(otgsc, enable | status)
+        self.assertFalse(self.irq)
+        self.assertEqual(self.read(otgsc) & (bsv | status | enable), bsv | enable)
+
+        for _ in range(2):
+            self.bridge.close()
+            self.sockets[self.streams.index(self.bridge)].close()
+            for _ in range(100):
+                value = self.read(otgsc)
+                if not value & bsv:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(value & (bsv | status | enable), status | enable)
+            self.assertTrue(self.irq)
+            self.write(otgsc, enable | status)
+            self.assertFalse(self.irq)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            sock.connect(str(self.root / "bridge"))
+            self.sockets.append(sock)
+            self.bridge = sock.makefile("rwb", buffering=0)
+            self.streams.append(self.bridge)
+            self.assertEqual(self.bridge.readline(), b"CONNECT\n")
+            self.assertEqual(self.read(otgsc) & (bsv | status | enable),
+                             bsv | status | enable)
+            self.assertTrue(self.irq)
+            self.write(otgsc, enable | status)
+            self.assertFalse(self.irq)
+
+        # Device-controller reset preserves the OTG block, including IRQ enables.
+        self.write(self.BASE + 0x140, 2)
+        self.assertEqual(self.read(otgsc) & (bsv | status | enable), bsv | enable)
+        self.assertFalse(self.irq)
+        self.bridge.close()
+        self.sockets[self.streams.index(self.bridge)].close()
+        for _ in range(100):
+            if not self.read(otgsc) & bsv:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.read(otgsc) & (bsv | status | enable), status | enable)
+        self.assertTrue(self.irq)
+        self.write(self.BASE + 0x140, 2)
+        self.assertEqual(self.read(otgsc) & (bsv | status | enable), status | enable)
+        self.assertTrue(self.irq)
+        self.write(otgsc, status)
+        self.assertFalse(self.irq)
+
+    def test_cable_control(self):
+        otgsc = self.BASE + 0x1a4
+        bsv, status, enable = 1 << 11, 1 << 19, 1 << 27
+        self.command("irq_intercept_out usb0 sysbus-irq")
+        self.write(otgsc, status | enable)
+        for _ in range(2):
+            self.assertFalse(self.cable(False))
+            self.assertEqual(self.bridge.readline(), b"DISCONNECT\n")
+            self.assertEqual(self.read(otgsc) & (bsv | status | enable), status | enable)
+            self.assertTrue(self.irq)
+            self.assertEqual(self.read(0x020c81c0), 0)
+            self.assertEqual(self.read(0x020c81d0), 0)
+            # Status registers cannot be changed by guest writes.
+            self.write(0x020c81c0, 0xffffffff)
+            self.write(0x020c81d0, 0xffffffff)
+            self.assertEqual(self.read(0x020c81c0), 0)
+            self.assertEqual(self.read(0x020c81d0), 0)
+            self.write(otgsc, status | enable)
+            self.assertFalse(self.irq)
+            # Repeating the requested state does not synthesize a new edge.
+            self.assertFalse(self.cable(False))
+            self.assertEqual(self.read(otgsc) & status, 0)
+            self.assertTrue(self.cable(True))
+            self.assertEqual(self.bridge.readline(), b"CONNECT\n")
+            self.assertEqual(self.read(otgsc) & (bsv | status | enable),
+                             bsv | status | enable)
+            self.assertTrue(self.irq)
+            self.assertEqual(self.read(0x020c81c0), 0x1d)
+            self.assertEqual(self.read(0x020c81d0), 1)
+            self.write(otgsc, status | enable)
+            self.assertFalse(self.irq)
+
+        self.cable(False)
+        self.bridge.readline()
+        self.qmp("system_reset")
+        self.assertFalse(self.qmp("qom-get", {"path": "/machine",
+                                              "property": "usb-connected"}))
+        self.assertEqual(self.read(otgsc) & (bsv | status | enable), 0)
+        self.assertFalse(self.irq)
+        self.assertEqual(self.read(0x020c81c0), 0)
+
+    def test_charger_status(self):
+        self.assertEqual(self.read(0x020c8000 + 0x1d0), 1)
+        self.assertEqual(self.read(0x020c8000 + 0x240), 0)
 
     def test_acknowledged_tokens(self):
         self.token("TOKENIN 1 512", "TOKEN 1 IN NAK")
