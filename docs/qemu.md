@@ -195,7 +195,7 @@ on its command line), and looks again when that unit stops answering;
 | `input_sequence` | presses, holds, turns, waits, console keystrokes and screenshots in order, optionally recorded |
 | `console_exec` | one shell command line: its output and exit status. Logs in as `root` / `nest` when the console is at `login:`; Ctrl-C on timeout |
 | `console_send`, `console_read`, `console_wait` | raw keystrokes (interactive programs, U-Boot), output after a cursor, waiting for a regex |
-| `pull_file`, `push_file` | files out of and into the guest: over ssh when the unit runs with `--ssh PORT` (about 3 MB/s), else over the console, md5-checked (about 60 KB/s in, 130 KB/s out). An upload lands as `PATH.mcp-part` and is moved into place |
+| `pull_file`, `push_file` | files out of and into the guest: QEMU debugger with `--fs ro` / `--fs rw`, otherwise ssh with `--ssh PORT` (about 3 MB/s), else the console, md5-checked (about 60 KB/s in, 130 KB/s out). Uploads are staged beside the destination and renamed into place |
 | `set_time` | the guest's clock and RTC: `+40m`, `-2h`, `HH:MM` today, `YYYY-MM-DD HH:MM`, or `host`. Stock treats a jump as a clock change, not as time passing: it shifts its timers, so a schedule point jumped over does not fire; for schedule tests set the time, reboot, then let points pass |
 | `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `als` (the light count), `mono` / `bsl` (firmware fields reported, to trigger an update), `wires`, and `detached` (the board's detect line, flintstone: the display off its base); with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
 | `qmp` | any QMP command: `system_reset`, `stop`/`cont`, `human-monitor-command` |
@@ -216,6 +216,57 @@ comes from `SSH_ASKPASS`, no `sshpass` needed. `via: console` forces the
 console; `auto` falls back to it when ssh fails. Over the console a file
 is base64 (`openssl base64` on the gen 3, whose busybox has none), or
 `od`/`printf` without either.
+
+Live filesystem access without SSH, a console login, networking or USB:
+
+```sh
+./run.sh --ui --no-provision --fs ro   # read files from stock firmware
+./run.sh --ui --no-provision --fs rw   # also atomically replace files
+```
+
+This gen 3 option uses QEMU's GDB remote protocol from the host. It
+installs no executable, service or init entry in the guest and requires
+no firmware changes, provisioning, login or compiler. Python uses only
+the standard library. Gen 1 and gen 2 are not supported by this channel.
+
+For each transfer, the host catches a root task at the ARM Linux EABI
+syscall dispatcher, saves its registers and 80-byte syscall frame, and
+uses existing kernel syscall handlers for the file operations. A temporary
+64 KiB user mapping carries paths and bytes. QEMU CPU breakpoints stop
+each handler at its kernel return, before the return-to-user path can run;
+they do not patch guest instructions. Descriptors and the mapping are
+released, the original registers and frame are restored and read back for
+verification, and the task continues its original syscall. No injected
+guest program executes.
+
+MCP `pull_file` and `push_file` prefer this channel when enabled;
+`via: sidechannel` selects it explicitly. `ro` rejects uploads before
+attaching the debugger; reads use `O_NOATIME`. A transfer does not fall back to SSH
+or console to bypass that restriction. Explicit `via: ssh` and
+`via: console` retain their existing permissions. `rw` permits writes on
+writable guest mounts; it does not remount the root filesystem.
+
+Transfers support absolute paths and files up to 16 MiB, including binary,
+empty, procfs and sysfs reads. Uploads target regular files: the host
+writes a temporary sibling, preserves an existing file's owner and mode
+(or uses root and `0644` for a new file), applies an explicit octal `mode`
+when supplied, fsyncs the file, renames it and fsyncs its parent directory.
+Symlink destinations are rejected. The running guest kernel performs all
+filesystem operations, including UBIFS locking and journaling.
+
+The guest kernel must be running, mounting its filesystems and processing
+syscalls; a hung kernel cannot service this channel. The UI rejects file
+access while QEMU is paused. `--fs` owns QEMU's debugger, so do not pass
+`-s`/`-gdb`, attach another debugger or change the VM's run state during a
+transfer. An unverified context restoration attempts to stop QEMU through
+the debugger and QMP, reports whether the debugger stop was confirmed, and
+disables further filesystem requests. It does not detach and resume the
+borrowed task. Unsupported syscall vectors and dispatchers are
+reported without attempting filesystem operations.
+
+The HTTP interface is `GET /fs` for the channel mode,
+`GET /fs/file?path=ABSOLUTE_PATH` for raw file bytes and
+`POST /fs/file?path=ABSOLUTE_PATH[&mode=640]` with raw upload bytes.
 
 The API the server uses, beside what the page uses: `GET /screen.png`
 (the newest frame), `GET /state` (lines, wiring, wheel),

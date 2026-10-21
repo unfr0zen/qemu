@@ -30,6 +30,8 @@
 #                                   #   10.0.2.100:1883, and nothing else
 #   ./run.sh --nic-extra OPTS    # more -nic user options (guestfwd=...)
 #   ./run.sh --ssh PORT          # the unit's port 22 on 127.0.0.1:PORT
+#   ./run.sh --ui --fs ro        # live files through QEMU's debugger (gen 3)
+#   ./run.sh --ui --fs rw        # also allow atomic writes through the kernel
 #   ./run.sh --stock-image FILE  # write FILE: the image as a unit that
 #                                   #   was never set up, then exit
 #   ./run.sh -d guest_log ...    # extra QEMU args pass through
@@ -83,6 +85,7 @@ stock_image=""
 mqtt=""
 nic_extra=""
 ssh_port=""
+fs_mode=""
 machine_option=""
 root=""
 nand_arg=""
@@ -108,10 +111,20 @@ while [ $# -gt 0 ]; do
         --mqtt) mqtt="$2"; shift 2 ;;
         --nic-extra) nic_extra="$nic_extra,$2"; shift 2 ;;
         --ssh) ssh_port="$2"; shift 2 ;;
+        --fs) case "${2:-}" in ro|rw) fs_mode=$2 ;; *) echo "ERROR: --fs needs ro or rw" >&2; exit 1 ;; esac; shift 2 ;;
         *) break ;;
     esac
 done
 machine=${machine_option:-flintstone}
+if [ -n "$fs_mode" ]; then
+    if [ "$machine" != flintstone ] || [ "$ui" != 1 ] || [ -n "$stock_image" ]; then
+        echo "ERROR: --fs needs gen 3 and --ui" >&2
+        exit 1
+    fi
+    for arg in "$@"; do
+        case "$arg" in -s|-gdb) echo "ERROR: --fs owns QEMU's debugger; drop $arg" >&2; exit 1 ;; esac
+    done
+fi
 if [ "$machine" = diamond ] && [ -n "$stock_image" ]; then
     echo "ERROR: --stock-image needs a validated Diamond NAND image" >&2
     exit 1
@@ -164,13 +177,16 @@ except OSError as error:
 PY
 fi
 
-# Is a TCP port already listening? Uses python3, which --ui needs anyway.
+# Probe by binding: a connected QEMU chardev can have a full listen backlog.
 port_busy() {
     python3 -c "
 import socket, sys
-s = socket.socket()
-s.settimeout(0.3)
-sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1]))) == 0 else 1)
+with socket.socket() as listener:
+    try:
+        listener.bind(('127.0.0.1', int(sys.argv[1])))
+    except OSError:
+        sys.exit(0)
+sys.exit(1)
 " "$1" 2>/dev/null
 }
 pick_port() {
@@ -409,16 +425,28 @@ if [ "$ui" = 1 ]; then
     bp_port=$(pick_port $((hmp_port + 1)))
     ncp_port=$(pick_port $((bp_port + 1)))
     bpctl_port=$(pick_port $((ncp_port + 1)))
+    FS_UI_ARGS=""
+    FS_QEMU_ARGS=""
+    fs_endpoint=""
+    if [ -n "$fs_mode" ]; then
+        fs_port=$(pick_port $((bpctl_port + 1)))
+        fs_bind=127.0.0.1
+        [ "$use_docker" = 1 ] && fs_bind=0.0.0.0
+        fs_endpoint="tcp:127.0.0.1:$fs_port"
+        FS_UI_ARGS="--fs $fs_endpoint --fs-mode $fs_mode"
+        FS_QEMU_ARGS="-gdb tcp:$fs_bind:$fs_port"
+    fi
     http_port=$(pick_port "$ui_port")
     if [ -n "$QEMU_UI_INFO" ]; then
-        python3 - "$QEMU_UI_INFO" "$$" "$http_port" "$hmp_port" "$ui_dir" "$NAND" <<'PY'
+        python3 - "$QEMU_UI_INFO" "$$" "$http_port" "$hmp_port" "$ui_dir" "$NAND" "$fs_endpoint" "$fs_mode" <<'PY'
 import json
 from pathlib import Path
 import sys
-path, pid, http, hmp, directory, nand = sys.argv[1:]
+path, pid, http, hmp, directory, nand, fs, fs_mode = sys.argv[1:]
 info = dict(pid=int(pid), ui_url=f'http://127.0.0.1:{http}',
             hmp_host='127.0.0.1', hmp_port=int(hmp),
-            screendump=str(Path(directory) / 'hmp-shot.ppm'), nand=nand)
+            screendump=str(Path(directory) / 'hmp-shot.ppm'), nand=nand,
+            fs_channel=fs or None, fs_mode=fs_mode or None)
 target = Path(path)
 target.parent.mkdir(parents=True, exist_ok=True)
 scratch = target.with_suffix('.tmp')
@@ -456,7 +484,7 @@ PY
     UI_ARGS="-chardev socket,id=boardui,host=$bind,port=$board_port,server=on,wait=off,nodelay=on \
 -chardev socket,id=con,host=$bind,port=$console_port,server=on,wait=off,nodelay=on \
 -chardev socket,id=bp,host=$bind,port=$bp_port,server=on,wait=off,nodelay=on \
-$SERIAL_ARGS $BOARD_ARGS \
+$FS_QEMU_ARGS $SERIAL_ARGS $BOARD_ARGS \
 -qmp tcp:$bind:$qmp_port,server=on,wait=off \
 -mon chardev=hmp,mode=readline -chardev socket,id=hmp,host=$bind,port=$hmp_port,server=on,wait=off,nodelay=on \
 -display none -monitor none"
@@ -467,6 +495,7 @@ $SERIAL_ARGS $BOARD_ARGS \
 -p 127.0.0.1:$hmp_port:$hmp_port \
 -p 127.0.0.1:$bp_port:$bp_port \
 -p 127.0.0.1:$ncp_port:$ncp_port"
+        [ -n "$fs_mode" ] && DOCKER_UI_PORTS="$DOCKER_UI_PORTS -p 127.0.0.1:$fs_port:$fs_port"
     fi
     # The terminal is a second keyboard beside the page's (ui.py makes it
     # raw; Ctrl-] or Ctrl-A X quits). An & job's stdin is /dev/null unless
@@ -487,6 +516,7 @@ $SERIAL_ARGS $BOARD_ARGS \
         --pins "$PINS" \
         --name "Nest gen $([ "$machine" = diamond ] && echo 1 || { [ "$machine" = j49 ] && echo 2 || echo 3; })" \
         --backplate "tcp:127.0.0.1:$bpctl_port" \
+        $FS_UI_ARGS \
         --parent $$ --cleanup "$ui_dir" < "$ui_stdin" &
     # The fake backplate (sensor) MCU on the sensor-MCU serial: answers
     # the front unit and streams bright ALS samples so nlclient lights
