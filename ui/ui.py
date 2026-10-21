@@ -47,6 +47,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fs_channel import FileChannel, LIMIT
+from gdb_session import GdbSession
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The page's wordmark typeface (Inter, SIL OFL; see fonts/OFL-Inter.txt).
@@ -508,7 +509,8 @@ def backplate_control(spec, want):
         return json.loads(f.readline() or b"{}")
 
 
-def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem=None):
+def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem=None,
+                 debugger=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -545,7 +547,9 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
                 self.usb({})
             elif self.path == "/fs":
                 self.send_body(200, "application/json", json.dumps({
-                    "mode": filesystem.mode if filesystem else None}).encode())
+                    "mode": filesystem.mode if filesystem else None,
+                    "failed": filesystem.failed if filesystem else None,
+                }).encode())
             elif urllib.parse.urlsplit(self.path).path == "/fs/file":
                 self.file_transfer(False)
             elif self.path == "/wheel":
@@ -607,6 +611,25 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
             self.send_body(200, "application/json", json.dumps(state).encode())
 
         def do_POST(self):
+            if self.path == "/gdb":
+                n = int(self.headers.get("Content-Length") or 0)
+                if n < 0 or n > 140000:
+                    self.close_connection = True
+                    self.send_body(400, "text/plain", b"GDB request too large\n")
+                    return
+                body = self.rfile.read(n)
+                if not debugger:
+                    self.send_body(503, "text/plain", b"GDB disabled: start with --ui --gdb\n")
+                    return
+                try:
+                    result = debugger.execute(json.loads(body or b"{}"))
+                except ValueError as error:
+                    self.send_body(400, "text/plain", str(error).encode())
+                except OSError as error:
+                    self.send_body(503, "text/plain", str(error).encode())
+                else:
+                    self.send_body(200, "application/json", json.dumps(result).encode())
+                return
             # The press and the release are separate so a hold lasts as
             # long as the pointer is down; the firmware times any holds
             # off the line itself.
@@ -674,7 +697,23 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
                         not isinstance(want.get("execute"), str):
                     self.send_body(400, "text/plain", b"bad command\n")
                     return
-                r = qmp.execute(want["execute"], want.get("arguments"))
+                # State changes must not interrupt a borrowed syscall context
+                # or bypass a persistent GDB session's run-state tracking.
+                guarded = want["execute"] in ("stop", "cont", "system_reset", "system_powerdown",
+                                               "quit", "human-monitor-command")
+                if debugger and guarded:
+                    if not debugger.lock.acquire(blocking=False):
+                        self.send_body(409, "text/plain", b"debugger busy; retry\n")
+                        return
+                    try:
+                        if debugger.debug:
+                            self.send_body(409, "text/plain", b"GDB session active; use GDB controls or detach\n")
+                            return
+                        r = qmp.execute(want["execute"], want.get("arguments"))
+                    finally:
+                        debugger.lock.release()
+                else:
+                    r = qmp.execute(want["execute"], want.get("arguments"))
                 self.send_body(200, "application/json", json.dumps(r).encode())
             elif self.path == "/backplate":
                 # {"temp": ..., "wires": [...], "detached": true, ...}: {}
@@ -698,6 +737,24 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
                     return
                 self.send_body(400 if "error" in r else 200, "application/json",
                                json.dumps(r).encode())
+            elif self.path == "/fs":
+                # {"reset": true}: clear the wedged-debugger latch after the
+                # task-restore failure left QEMU stopped; resume QEMU via
+                # POST /qmp {"execute": "cont"} first, then reset here.
+                if not filesystem:
+                    self.send_body(503, "text/plain",
+                                   b"filesystem channel disabled: start with --fs ro or --fs rw\n")
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    want = json.loads(self.rfile.read(n) or b"{}")
+                except ValueError:
+                    self.send_body(400, "text/plain", b"bad JSON\n")
+                    return
+                if isinstance(want, dict) and want.get("reset"):
+                    filesystem.failed = False
+                self.send_body(200, "application/json", json.dumps({
+                    "mode": filesystem.mode, "failed": filesystem.failed}).encode())
             else:
                 self.send_body(404, "text/plain", b"not found\n")
 
@@ -823,11 +880,14 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
                     data = self.rfile.read(count)
                     if len(data) != count:
                         raise ValueError("incomplete upload")
-                if qmp:
-                    status = qmp.execute("query-status")
-                    if not status.get("return", {}).get("running"):
-                        raise OSError("filesystem access needs a running Linux kernel; resume QEMU first")
-                result = filesystem.transfer(path, data, query.get("mode", [None])[0])
+                with filesystem.lock:
+                    if filesystem.debug_active:
+                        raise OSError("GDB session active; detach it before filesystem access")
+                    if qmp:
+                        status = qmp.execute("query-status")
+                        if not status.get("return", {}).get("running"):
+                            raise OSError("filesystem access needs a running Linux kernel; resume QEMU first")
+                    result = filesystem.transfer(path, data, query.get("mode", [None])[0])
                 self.send_body(200, "application/octet-stream", result)
             except ValueError as error:
                 self.send_body(400, "text/plain", str(error).encode())
@@ -1019,6 +1079,7 @@ def main():
     ap.add_argument("--console", help="the guest's serial (tcp:HOST:PORT or path)")
     ap.add_argument("--fs", help="filesystem debugger endpoint (tcp:HOST:PORT)")
     ap.add_argument("--fs-mode", choices=("ro", "rw"), default="ro")
+    ap.add_argument("--gdb", help="GDB endpoint (tcp:HOST:PORT); may share --fs")
     ap.add_argument("--echo-console", action="store_true",
                     help="also print the console on stdout (run.sh's terminal)")
     ap.add_argument("--keyboard", action="store_true",
@@ -1039,6 +1100,8 @@ def main():
     ap.add_argument("--backplate", metavar="tcp:HOST:PORT",
                     help="backplate.py's --control, for /backplate")
     args = ap.parse_args()
+    if args.gdb and args.fs and args.gdb != args.fs:
+        ap.error("--gdb and --fs must share the same debugger endpoint")
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: leave(args.cleanup))
@@ -1060,11 +1123,13 @@ def main():
     if log:
         threading.Thread(target=log.run, daemon=True).start()
 
+    filesystem = FileChannel(args.fs, args.fs_mode) if args.fs else None
+    debugger = GdbSession(args.gdb or args.fs, filesystem) if args.gdb or args.fs else None
     # Bound before the terminal goes raw: a failed bind must not leave it so.
     server = Server(("127.0.0.1", args.port),
                     make_handler(board, log, screen, qmp, parse_pins(args.pins),
                                  args.name, args.backplate,
-                                 FileChannel(args.fs, args.fs_mode) if args.fs else None))
+                                 filesystem, debugger))
     if log and args.keyboard and os.isatty(0):
         threading.Thread(target=Keyboard(log, qmp, args.parent).run,
                          daemon=True).start()
