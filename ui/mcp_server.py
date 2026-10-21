@@ -906,6 +906,10 @@ def t_qmp(a):
     return [text(json.loads(post("/qmp", body, timeout=60)))]
 
 
+def t_gdb(a):
+    return [text(json.loads(post("/gdb", a, timeout=15)))]
+
+
 def t_set_time(a):
     """The guest's clock: relative (+40m, -2h, +90s, +1d), a local time
     today (HH:MM[:SS]), a local date and time (YYYY-MM-DD HH:MM[:SS]), or
@@ -951,6 +955,31 @@ def d(base, desc):
 
 
 TOOLS = {
+    "gdb": (t_gdb, "ARM CPU debugging through ui.py. Requires --ui --gdb (also enabled by --fs). "
+            "attach pauses QEMU; detach removes session breakpoints and resumes, releasing the filesystem channel. "
+            "continue returns immediately; poll status for a breakpoint hit or use interrupt. "
+            "step, registers, memory and breakpoint operations require a stopped guest. "
+            "trace single-steps count instructions (default 32, max 256), returning PCs, ARM/Thumb "
+            "instruction bytes and registers before each step; leaves the guest stopped. "
+            "Trace complete=false reports an early stop or deadline; inspect error when present. "
+            "exec_start sets an address-only ARM sys_execve entry breakpoint, logs the C string at r0, "
+            "and auto-resumes each hit in the background. Resolve sys_execve from guest kallsyms before "
+            "attaching; do_execve may be bypassed by userspace syscalls. exec_read returns up to 512 "
+            "recent events; pass since=cursor for new events. exec_stop removes its breakpoint and pauses. "
+            "registers reads r0..r12, sp, lr, pc, cpsr; values optionally writes them (r13..r15 aliases accepted). "
+            "Memory uses virtual addresses in the current CPU context and hex byte data (64 KiB limit). "
+            "Breakpoint types: 0 software, 1 hardware, 2 write watchpoint, 3 read, 4 access; "
+            "size is instruction length (ARM 4, Thumb 2) or watchpoint width. "
+            "File transfers are rejected while attached; detach before pull_file/push_file via sidechannel.",
+            schema({"action": {"type": "string", "enum": ["status", "attach", "detach", "interrupt",
+                     "continue", "step", "trace", "registers", "read_memory", "write_memory", "breakpoint",
+                     "exec_start", "exec_read", "exec_stop"]},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 256},
+                    "since": d(INT, "exec event cursor from exec_read"),
+                    "address": {"type": ["integer", "string"]},
+                    "size": INT, "data": d(STR, "hex bytes for write_memory"),
+                    "values": {"type": "object", "additionalProperties": {"type": ["integer", "string"]}},
+                    "type": {"type": "integer", "minimum": 0, "maximum": 4}, "enabled": BOOL})),
     "status": (t_status, "Is QEMU up, the board lines (button, poweroff, ...), the wheel position and the console's last lines.", schema({})),
     "screenshot": (t_screenshot, "The unit's screen now, upright as the device shows it.",
                    schema({"settle_ms": d(INT, "first wait until the screen has not changed for this long (an animation ending)"),
@@ -1052,7 +1081,14 @@ commands as root; pull_file/push_file move files. set_time moves the
 guest's clock; backplate sets the simulated room and wiring; usb plugs or
 unplugs the host USB cable. Console tools return a
 cursor: pass it as `since` to console_read/console_wait so nothing printed
-in between is missed."""
+in between is missed. gdb provides ARM CPU debugging: attach pauses, continue
+runs asynchronously, status polls for stops, interrupt pauses, and detach
+resumes and releases the debugger for filesystem transfers. Do not use QMP
+run controls while attached. For process-launch logging, resolve sys_execve
+from /proc/kallsyms before attaching, then exec_start with its address;
+exec_read retrieves filename events while the guest auto-resumes, and
+exec_stop pauses and removes the tracing breakpoint. do_execve can be
+bypassed by userspace syscalls."""
 
 
 # ---------------------------------------------------------------- protocol

@@ -32,6 +32,7 @@
 #   ./run.sh --ssh PORT          # the unit's port 22 on 127.0.0.1:PORT
 #   ./run.sh --ui --fs ro        # live files through QEMU's debugger (gen 3)
 #   ./run.sh --ui --fs rw        # also allow atomic writes through the kernel
+#   ./run.sh --ui --gdb          # MCP ARM debugging (shares --fs when enabled)
 #   ./run.sh --stock-image FILE  # write FILE: the image as a unit that
 #                                   #   was never set up, then exit
 #   ./run.sh -d guest_log ...    # extra QEMU args pass through
@@ -86,6 +87,7 @@ mqtt=""
 nic_extra=""
 ssh_port=""
 fs_mode=""
+gdb=0
 machine_option=""
 root=""
 nand_arg=""
@@ -112,6 +114,7 @@ while [ $# -gt 0 ]; do
         --nic-extra) nic_extra="$nic_extra,$2"; shift 2 ;;
         --ssh) ssh_port="$2"; shift 2 ;;
         --fs) case "${2:-}" in ro|rw) fs_mode=$2 ;; *) echo "ERROR: --fs needs ro or rw" >&2; exit 1 ;; esac; shift 2 ;;
+        --gdb) gdb=1; shift ;;
         *) break ;;
     esac
 done
@@ -121,8 +124,14 @@ if [ -n "$fs_mode" ]; then
         echo "ERROR: --fs needs gen 3 and --ui" >&2
         exit 1
     fi
+fi
+if [ "$gdb" = 1 ] || [ -n "$fs_mode" ]; then
+    if [ "$ui" != 1 ] || [ -n "$stock_image" ]; then
+        echo "ERROR: --gdb needs --ui and a normal boot" >&2
+        exit 1
+    fi
     for arg in "$@"; do
-        case "$arg" in -s|-gdb) echo "ERROR: --fs owns QEMU's debugger; drop $arg" >&2; exit 1 ;; esac
+        case "$arg" in -s|-gdb|-gdb=*) echo "ERROR: --fs/--gdb owns QEMU's debugger; drop $arg" >&2; exit 1 ;; esac
     done
 fi
 if [ "$machine" = diamond ] && [ -n "$stock_image" ]; then
@@ -428,12 +437,13 @@ if [ "$ui" = 1 ]; then
     FS_UI_ARGS=""
     FS_QEMU_ARGS=""
     fs_endpoint=""
-    if [ -n "$fs_mode" ]; then
+    if [ -n "$fs_mode" ] || [ "$gdb" = 1 ]; then
         fs_port=$(pick_port $((bpctl_port + 1)))
         fs_bind=127.0.0.1
         [ "$use_docker" = 1 ] && fs_bind=0.0.0.0
         fs_endpoint="tcp:127.0.0.1:$fs_port"
-        FS_UI_ARGS="--fs $fs_endpoint --fs-mode $fs_mode"
+        FS_UI_ARGS="--gdb $fs_endpoint"
+        [ -n "$fs_mode" ] && FS_UI_ARGS="$FS_UI_ARGS --fs $fs_endpoint --fs-mode $fs_mode"
         FS_QEMU_ARGS="-gdb tcp:$fs_bind:$fs_port"
     fi
     http_port=$(pick_port "$ui_port")
@@ -446,7 +456,8 @@ path, pid, http, hmp, directory, nand, fs, fs_mode = sys.argv[1:]
 info = dict(pid=int(pid), ui_url=f'http://127.0.0.1:{http}',
             hmp_host='127.0.0.1', hmp_port=int(hmp),
             screendump=str(Path(directory) / 'hmp-shot.ppm'), nand=nand,
-            fs_channel=fs or None, fs_mode=fs_mode or None)
+            fs_channel=fs if fs_mode else None, fs_mode=fs_mode or None,
+            gdb_channel=fs or None)
 target = Path(path)
 target.parent.mkdir(parents=True, exist_ok=True)
 scratch = target.with_suffix('.tmp')
@@ -495,7 +506,7 @@ $FS_QEMU_ARGS $SERIAL_ARGS $BOARD_ARGS \
 -p 127.0.0.1:$hmp_port:$hmp_port \
 -p 127.0.0.1:$bp_port:$bp_port \
 -p 127.0.0.1:$ncp_port:$ncp_port"
-        [ -n "$fs_mode" ] && DOCKER_UI_PORTS="$DOCKER_UI_PORTS -p 127.0.0.1:$fs_port:$fs_port"
+        [ -n "$fs_endpoint" ] && DOCKER_UI_PORTS="$DOCKER_UI_PORTS -p 127.0.0.1:$fs_port:$fs_port"
     fi
     # The terminal is a second keyboard beside the page's (ui.py makes it
     # raw; Ctrl-] or Ctrl-A X quits). An & job's stdin is /dev/null unless

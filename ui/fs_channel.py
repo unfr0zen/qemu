@@ -79,12 +79,15 @@ class Debugger:
             self.running = False
         return result
 
-    def command(self, command):
+    def send(self, command):
         data = command.encode()
         self.remaining()
         if command in ("c", "s"):
             self.running = True
         self.sock.sendall(b"$" + data + b"#" + f"{sum(data) % 256:02x}".encode())
+
+    def command(self, command):
+        self.send(command)
         return self.receive()
 
     def expect_ok(self, command):
@@ -131,7 +134,7 @@ class Debugger:
         if self.running:
             self.deadline = time.monotonic() + 5
             self.sock.sendall(b"\x03")
-            self.receive()
+            return self.receive()
 
 
 class Syscalls:
@@ -242,8 +245,9 @@ class FileChannel:
     def __init__(self, endpoint, mode):
         self.endpoint = endpoint
         self.mode = mode
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.failed = False
+        self.debug_active = False
 
     def transfer(self, path, data=None, mode=None, timeout=300):
         if not isinstance(path, str) or not path.startswith("/") or "\0" in path:
@@ -262,6 +266,8 @@ class FileChannel:
             if permissions > 0o777:
                 raise ValueError("mode must be between 000 and 777")
         with self.lock:
+            if self.debug_active:
+                raise OSError("GDB session active; detach it before filesystem access")
             if self.failed:
                 raise OSError("filesystem debugger failed; inspect the stopped QEMU before restarting it")
             debug = Debugger(self.endpoint, timeout)

@@ -77,6 +77,9 @@ jobs:
       - name: UDC bridge
         run: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m unittest discover -s tests -p 'test_cihdrc_bridge.py'
 
+      - name: GDB protocol on virt and flintstone
+        run: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m unittest discover -s tests -p 'test_gdb*.py'
+
       # QEMU's own ARM tests: the stack changes models upstream boards share
       # (the i.MX watchdog, I2C and uSDHC among them), and qom-test and
       # test-hmp build every machine, flintstone and j49 included.
@@ -103,6 +106,9 @@ jobs:
 
       - name: Filesystem debugger and control
         run: python3 -m unittest discover -s tests -p 'test_fs*.py'
+
+      - name: GDB sessions and filesystem ownership
+        run: python3 -m unittest discover -s tests -p 'test_gdb*.py'
 
       - name: Shell
         run: for f in $(git ls-files '*.sh'); do sh -n "$f" || exit 1; done

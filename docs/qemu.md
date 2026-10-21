@@ -199,6 +199,7 @@ on its command line), and looks again when that unit stops answering;
 | `set_time` | the guest's clock and RTC: `+40m`, `-2h`, `HH:MM` today, `YYYY-MM-DD HH:MM`, or `host`. Stock treats a jump as a clock change, not as time passing: it shifts its timers, so a schedule point jumped over does not fire; for schedule tests set the time, reboot, then let points pass |
 | `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `als` (the light count), `mono` / `bsl` (firmware fields reported, to trigger an update), `wires`, and `detached` (the board's detect line, flintstone: the display off its base); with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
 | `qmp` | any QMP command: `system_reset`, `stop`/`cont`, `human-monitor-command` |
+| `gdb` | ARM CPU attach/detach, interrupt/continue, single-step, registers, virtual memory and breakpoints/watchpoints; enabled by `--ui --gdb` or `--fs` |
 
 `console_exec` sends `echo <start>; command eval '<line>'; echo <end>$?`
 with markers the shell computes, so neither the echo of the line nor a
@@ -267,6 +268,89 @@ reported without attempting filesystem operations.
 The HTTP interface is `GET /fs` for the channel mode,
 `GET /fs/file?path=ABSOLUTE_PATH` for raw file bytes and
 `POST /fs/file?path=ABSOLUTE_PATH[&mode=640]` with raw upload bytes.
+
+### MCP CPU debugging
+
+Start with `./run.sh --ui --gdb` (add `--gen2` for j49). `--fs ro` or
+`--fs rw` also enables the MCP `gdb` tool on the same endpoint; both
+features use one lock. Do not attach an external debugger to that endpoint.
+
+Call `gdb` with `{"action":"attach"}` to pause the CPU. `registers` reads
+`r0` through `r12`, `sp`, `lr`, `pc` and `cpsr`; `values` writes registers,
+for example `{"action":"registers","values":{"r0":"0x1234"}}`.
+Addresses and register values accept integers or hexadecimal strings.
+`{"action":"read_memory","address":"0xffff0008","size":16}` reads
+hex bytes; `write_memory` takes `data` as hex bytes. Memory access uses the
+current CPU's virtual address space, with a 64 KiB limit per request.
+
+`{"action":"breakpoint","address":"0xffff0008"}` sets a breakpoint;
+`enabled:false` removes it. `type` selects software (0), hardware (1),
+write watchpoint (2), read watchpoint (3) or access watchpoint (4). `size`
+defaults to 4 bytes; use 2 for Thumb instructions. Watchpoint widths are
+1, 2, 4 or 8 bytes. `status` lists the session's breakpoints and the raw
+GDB stop reply, including watchpoint details when reported by QEMU.
+
+`step` executes one instruction and waits for the stop. `continue` returns
+immediately; poll `status` to observe a breakpoint hit. `interrupt` stops
+execution. Register, memory and breakpoint operations require a stopped
+CPU. Each debugger operation has a five-second deadline.
+
+`{"action":"trace","count":32}` single-steps up to 256 instructions,
+returning each instruction's PC, ARM/Thumb bytes and registers before the
+step, plus its stop reply. The guest stays stopped. `complete:false` means
+the trace ended early; `error` describes a deadline or memory failure.
+Watchpoint stops and signals end the trace. This traces CPU instructions
+in the current context, including exception entry and task switches.
+
+`detach` removes session breakpoints and resumes the guest. File transfers
+are rejected while the session is attached, including while it is running;
+detach to release the endpoint before `pull_file` or `push_file` through
+the sidechannel. A filesystem transfer in progress rejects GDB requests
+as busy. QMP stop, continue, reset, powerdown, quit and HMP commands are
+blocked during an attached session or active transfer so they cannot
+interrupt a borrowed syscall context. A filesystem restoration failure
+must be recovered before attaching GDB.
+
+The debugger HTTP endpoint is `POST /gdb`, with the same JSON arguments
+as the MCP tool.
+
+### Logging process launches
+
+The MCP `gdb` tool can log ARM Linux `execve` entries and automatically
+resume each breakpoint hit, without a guest agent, executable or symbol
+file. Read `/proc/kallsyms` with `pull_file` before attaching and find
+`sys_execve` (also named `SyS_execve`). Use that syscall entry's address:
+
+```json
+{"action":"attach"}
+{"action":"exec_start","address":"0xc00cff2c"}
+{"action":"exec_read","since":0}
+{"action":"exec_stop"}
+{"action":"detach"}
+```
+
+The example address is kernel-specific. `exec_start` installs an ARM
+address breakpoint, reads the NUL-terminated filename at `r0` on each
+hit, single-steps past the breakpoint and resumes. Events describe exec
+attempts, including attempts that subsequently fail. `exec_read` returns
+`events` with `id`, `path` and `r0`, and a `cursor` to pass as `since` on
+the next read. The most recent 512 events are retained; `first_id` lets a
+reader detect overwritten events. A filename read failure records an
+event with `path:null` and `error`, then resumes. Another breakpoint or
+signal ends automatic tracing and sets `exec_error` for inspection.
+`exec_stop` removes the trace breakpoint and leaves the guest paused;
+`detach` resumes and releases the debugger for filesystem operations.
+
+`do_execve` is not a reliable entry for userspace launches: a compiled
+`sys_execve` can call `do_execveat_common` directly. The argument layouts
+also differ: at `sys_execve`, `r0` points to a user filename string;
+at `do_execve`, it can point to a kernel `struct filename` whose first
+word is the string pointer. For an external GDB Python callback at
+`sys_execve`, convert `$r0` with `int(value) & 0xffffffff` before passing
+it to `read_memory`; GDB can expose high ARM addresses as signed values.
+A callback returning `False` can log and auto-resume without increasing
+GDB's breakpoint hit counter. Use a plain stopping breakpoint when
+checking that counter.
 
 The API the server uses, beside what the page uses: `GET /screen.png`
 (the newest frame), `GET /state` (lines, wiring, wheel),
