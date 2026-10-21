@@ -30,7 +30,7 @@
 #                                   #   10.0.2.100:1883, and nothing else
 #   ./run.sh --nic-extra OPTS    # more -nic user options (guestfwd=...)
 #   ./run.sh --ssh PORT          # the unit's port 22 on 127.0.0.1:PORT
-#   ./run.sh --ui --fs ro        # live files over dedicated UART2 (gen 3)
+#   ./run.sh --ui --fs ro        # live files through QEMU's debugger (gen 3)
 #   ./run.sh --ui --fs rw        # also allow atomic writes through the kernel
 #   ./run.sh --stock-image FILE  # write FILE: the image as a unit that
 #                                   #   was never set up, then exit
@@ -86,7 +86,6 @@ mqtt=""
 nic_extra=""
 ssh_port=""
 fs_mode=""
-fs_agent=""
 machine_option=""
 root=""
 nand_arg=""
@@ -118,11 +117,13 @@ while [ $# -gt 0 ]; do
 done
 machine=${machine_option:-flintstone}
 if [ -n "$fs_mode" ]; then
-    if [ "$machine" != flintstone ] || [ "$ui" != 1 ] || [ "$provision" != 1 ] || [ -n "$stock_image" ]; then
-        echo "ERROR: --fs needs gen 3, --ui and provisioning (drop --no-provision)" >&2
+    if [ "$machine" != flintstone ] || [ "$ui" != 1 ] || [ -n "$stock_image" ]; then
+        echo "ERROR: --fs needs gen 3 and --ui" >&2
         exit 1
     fi
-    fs_agent=$(python3 "$script_path/ui/build_fs_agent.py")
+    for arg in "$@"; do
+        case "$arg" in -s|-gdb) echo "ERROR: --fs owns QEMU's debugger; drop $arg" >&2; exit 1 ;; esac
+    done
 fi
 if [ "$machine" = diamond ] && [ -n "$stock_image" ]; then
     echo "ERROR: --stock-image needs a validated Diamond NAND image" >&2
@@ -352,7 +353,6 @@ fi
 # nothing is kept on the host, so any checkout and any NAND boot the same.
 PROVISION_QEMU="$MACHINE_ARGS -nographic -nic none"
 run_provision() {
-    [ -n "$fs_mode" ] && set -- --fs "$fs_mode" --fs-agent "$fs_agent" "$@"
     [ "$machine" = j49 ] && set -- --gen2 "$NAND" "$@"
     [ "$machine" != j49 ] && [ -n "$root" ] && set -- --root "$root" "$@"
     [ "$sleep" = 1 ] && set -- --sleep "$@"
@@ -395,13 +395,7 @@ if [ -n "$stock_image" ]; then
          "./run.sh$([ "$machine" = j49 ] && echo " --gen2") --no-provision)" >&2
     exit 0
 elif [ "$provision" = 1 ]; then
-    if ! run_provision; then
-        if [ -n "$fs_mode" ]; then
-            echo "ERROR: filesystem helper provisioning failed" >&2
-            exit 1
-        fi
-        echo "provision: booting the unit as it is" >&2
-    fi
+    run_provision || echo "provision: booting the unit as it is" >&2
 fi
 
 # The board around the SoC, as a web page (--ui): the round display, the
@@ -440,7 +434,7 @@ if [ "$ui" = 1 ]; then
         [ "$use_docker" = 1 ] && fs_bind=0.0.0.0
         fs_endpoint="tcp:127.0.0.1:$fs_port"
         FS_UI_ARGS="--fs $fs_endpoint --fs-mode $fs_mode"
-        FS_QEMU_ARGS="-chardev socket,id=fs,host=$fs_bind,port=$fs_port,server=on,wait=off,nodelay=on"
+        FS_QEMU_ARGS="-gdb tcp:$fs_bind:$fs_port"
     fi
     http_port=$(pick_port "$ui_port")
     if [ -n "$QEMU_UI_INFO" ]; then
@@ -481,9 +475,6 @@ PY
         PINS="button=HU-BUTTON,poweroff=POWEROFF,wifi_enable=WIFI-ENABLE,beeper_en=BEEPER-EN"
     else
         SERIAL_ARGS="-serial chardev:con -serial null -serial null -serial null -serial null -serial chardev:bp"
-        if [ -n "$fs_mode" ]; then
-            SERIAL_ARGS="-serial chardev:con -serial chardev:fs -serial null -serial null -serial null -serial chardev:bp"
-        fi
         BOARD_ARGS="-global driver=flintstone.board,property=chardev,value=boardui \
 -chardev socket,id=ncp,host=$bind,port=$ncp_port,server=on,wait=off,nodelay=on \
 -global driver=em35x-ncp,property=chardev,value=ncp \

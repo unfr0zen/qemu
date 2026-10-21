@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check live MCP file access through a UI with no console, QMP or SSH.
 
-Start an isolated gen 3 unit with --ui --fs rw, then pass its filesystem
-chardev endpoint (from ui.py's --fs argument). Do not use that unit's file
-API concurrently: QEMU permits one client per chardev.
+Start an isolated stock gen 3 unit with --ui --no-provision --fs rw, then
+pass its filesystem debugger endpoint (from ui.py's --fs argument).
+Do not use another debugger or that unit's file API concurrently.
 
     python3 tests/check_fs_channel.py --channel tcp:127.0.0.1:8108 --mode rw
 
@@ -12,7 +12,6 @@ repeat with --mode ro and --sha256 from the rw result to check persistence
 and read-only enforcement. Observations are JSON lines on stdout.
 """
 import argparse
-import errno
 import hashlib
 import json
 import os
@@ -77,8 +76,14 @@ def main():
                 return result["content"][0]["text"]
 
             request("initialize", {"protocolVersion": "2025-06-18"})
+            missing = tool("pull_file", {"path": "/usr/sbin/mcp-fs"}, fails=True)
+            assert "HTTP 404" in missing, missing
+            inittab = tool("pull_file", {"path": "/etc/inittab"})
+            assert "mcp-fs" not in inittab, inittab
+            print(json.dumps({"guest_helper_present": False, "init_entry_present": False}), flush=True)
             print(json.dumps({"mode": args.mode, "pid1": tool("pull_file", {
                 "path": "/proc/1/comm", "via": "sidechannel"}).strip()}), flush=True)
+            print(json.dumps({"borrowed_task": tool("pull_file", {"path": "/proc/self/comm"}).strip()}), flush=True)
             present = tool("pull_file", {"path": "/sys/devices/soc0/soc/2100000.aips-bus/"
                                        "2184000.usb/power_supply/imx_usb_charger/present"}).strip()
             assert present in ("0", "1"), present
@@ -100,15 +105,6 @@ def main():
                 failure = tool("push_file", {"path": args.path, "content": "forbidden"}, fails=True)
                 assert "read-only" in failure, failure
                 print(json.dumps({"host_ro_rejected": failure}), flush=True)
-                channel.mode = "rw"
-                try:
-                    channel.transfer(args.path, b"forbidden")
-                    raise AssertionError("helper accepted a write in ro mode")
-                except OSError as error:
-                    assert error.errno == errno.EROFS, error
-                    print(json.dumps({"helper_ro_errno": error.errno}), flush=True)
-                finally:
-                    channel.mode = "ro"
             target = Path(directory) / "received.bin"
             tool("pull_file", {"path": args.path, "local_path": str(target)})
             digest = hashlib.sha256(target.read_bytes()).hexdigest()
@@ -122,7 +118,6 @@ def main():
         server.shutdown()
         thread.join(5)
         server.server_close()
-        channel.close()
 
 
 if __name__ == "__main__":

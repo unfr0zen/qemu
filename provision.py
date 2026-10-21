@@ -70,9 +70,6 @@ Usage: provision.py [--ssid QEMU | --factory] [--gen2 NAND]
        writable: its serial console is driven over stdin/stdout)
 """
 import argparse
-import base64
-import gzip
-import hashlib
 import importlib.util
 import os
 import re
@@ -467,32 +464,6 @@ def factory(con):
     return f"factory: emptied {', '.join(FACTORY_WIPE)}"
 
 
-def filesystem(con, agent, mode):
-    """Install the dedicated UART2 helper through the guest kernel."""
-    with open(agent, "rb") as f:
-        data = f.read()
-    digest = hashlib.md5(data).hexdigest()
-    if con.run(f"test \"$(md5sum /usr/sbin/mcp-fs 2>/dev/null | cut -d' ' -f1)\" = {digest}") != 0:
-        encoded = base64.b64encode(gzip.compress(data)).decode()
-        if con.run("rm -f /tmp/mcp-fs.b64") != 0:
-            raise RuntimeError("could not stage filesystem helper")
-        lines = [encoded[i:i + 64] for i in range(0, len(encoded), 64)]
-        for offset in range(0, len(lines), 24):
-            batch = " ".join(lines[offset:offset + 24])
-            if con.run(f"printf '%s\\n' {batch} >> /tmp/mcp-fs.b64") != 0:
-                raise RuntimeError("could not transfer filesystem helper")
-        if con.run("openssl base64 -d -in /tmp/mcp-fs.b64 2>/dev/null | "
-                   "gzip -dc > /usr/sbin/mcp-fs.new && "
-                   f"test \"$(md5sum /usr/sbin/mcp-fs.new | cut -d' ' -f1)\" = {digest} && "
-                   "chmod 755 /usr/sbin/mcp-fs.new && "
-                   "mv /usr/sbin/mcp-fs.new /usr/sbin/mcp-fs && rm /tmp/mcp-fs.b64") != 0:
-            raise RuntimeError("filesystem helper failed verification")
-    if con.run("sed -i '/::respawn:.*mcp-fs /d' /etc/inittab && "
-               f"echo 'null::respawn:/usr/sbin/mcp-fs {mode}' >> /etc/inittab") != 0:
-        raise RuntimeError("could not enable filesystem helper")
-    return f"filesystem: {mode} over UART2 (0x021e8000)"
-
-
 GEN2_FACTORY_FILES = ("wl1271-nvs.bin",)   # system-config's, from the factory
 
 
@@ -537,13 +508,9 @@ def main():
     ap.add_argument("--gen2", metavar="NAND",
                     help="the gen 2 (j49) whose NAND image this is")
     ap.add_argument("--transcript", help="save the console session here")
-    ap.add_argument("--fs", choices=("ro", "rw"), help="dedicated UART2 filesystem access")
-    ap.add_argument("--fs-agent", help="static ARM filesystem helper")
     ap.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- then the QEMU command line")
     args = ap.parse_args()
-    if args.fs and (not args.fs_agent or args.gen2 or args.factory):
-        ap.error("--fs needs --fs-agent and a gen 3 normal provision")
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     if not cmd:
         ap.error("no QEMU command given")
@@ -575,8 +542,6 @@ def main():
             done.append(wiring(con))
             done.append(nestlocal(con))
             done.append(resolv(con))
-            if args.fs:
-                done.append(filesystem(con, args.fs_agent, args.fs))
             # Unmounting commits the UBIFS journals before we pull the plug.
             if con.run("sync; umount /media/user-config") != 0:
                 raise RuntimeError("user-config did not unmount cleanly")

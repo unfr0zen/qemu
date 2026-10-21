@@ -823,11 +823,17 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
                     data = self.rfile.read(count)
                     if len(data) != count:
                         raise ValueError("incomplete upload")
+                if qmp:
+                    status = qmp.execute("query-status")
+                    if not status.get("return", {}).get("running"):
+                        raise OSError("filesystem access needs a running Linux kernel; resume QEMU first")
                 result = filesystem.transfer(path, data, query.get("mode", [None])[0])
                 self.send_body(200, "application/octet-stream", result)
             except ValueError as error:
                 self.send_body(400, "text/plain", str(error).encode())
             except OSError as error:
+                if filesystem.failed and qmp:
+                    qmp.execute("stop")
                 status = (404 if error.errno == errno.ENOENT else
                           403 if isinstance(error, PermissionError) or error.errno == errno.EROFS else 503)
                 self.send_body(status, "text/plain", str(error).encode())
@@ -1011,7 +1017,7 @@ def main():
                     help="flintstone.board chardev (tcp:HOST:PORT or path)")
     ap.add_argument("--qmp", help="QEMU's QMP (tcp:HOST:PORT or path)")
     ap.add_argument("--console", help="the guest's serial (tcp:HOST:PORT or path)")
-    ap.add_argument("--fs", help="dedicated filesystem UART (tcp:HOST:PORT)")
+    ap.add_argument("--fs", help="filesystem debugger endpoint (tcp:HOST:PORT)")
     ap.add_argument("--fs-mode", choices=("ro", "rw"), default="ro")
     ap.add_argument("--echo-console", action="store_true",
                     help="also print the console on stdout (run.sh's terminal)")
