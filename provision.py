@@ -180,7 +180,10 @@ def shell(con, root_rw=True, root=None):
     if not root or " && bootm " not in boot:
         raise RuntimeError(f"no root file system in U-Boot's bootcmd "
                            f"({m.group(1) if m else 'bootcmd'}: {boot})")
-    con.send(boot.replace(" && bootm ", " init=/bin/sh && bootm ", 1) + "\n")
+    # The saved environment can disable the console with /dev/null. The
+    # provisioning shell needs UART1; leave the saved environment alone.
+    con.send("setenv console ttymxc0; " +
+             boot.replace(" && bootm ", " init=/bin/sh && bootm ", 1) + "\n")
     deadline = time.time() + 120
     while time.time() < deadline:
         con.send("echo RDY$((6*7))\n")
