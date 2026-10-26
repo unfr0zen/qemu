@@ -1,0 +1,71 @@
+From ce1745370337f5d2357c4a7e71a6e6d9687e22c9 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 55/91] include/hw/i2c: OMAP3 I2C controller state
+
+---
+ include/hw/i2c/omap3_i2c.h | 52 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+ create mode 100644 include/hw/i2c/omap3_i2c.h
+
+diff --git a/include/hw/i2c/omap3_i2c.h b/include/hw/i2c/omap3_i2c.h
+new file mode 100644
+index 0000000..32d908c
+--- /dev/null
++++ b/include/hw/i2c/omap3_i2c.h
+@@ -0,0 +1,52 @@
++/*
++ * OMAP3 I2C controller (master mode, with the FIFO)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_I2C_OMAP3_I2C_H
++#define HW_I2C_OMAP3_I2C_H
++
++#include "hw/core/sysbus.h"
++#include "hw/i2c/i2c.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_I2C "omap3-i2c"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3I2cState, OMAP3_I2C)
++
++#define OMAP3_I2C_FIFO 64
++
++struct Omap3I2cState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    I2CBus *bus;
++    qemu_irq irq;
++    uint8_t fifo_depth;         /* property: FIFODEPTH field, 0 = 8 bytes */
++
++    uint16_t ie;
++    uint16_t stat;
++    uint16_t we;
++    uint16_t buf;
++    uint16_t cnt;
++    uint16_t sysc;
++    uint16_t con;
++    uint16_t oa[4];
++    uint16_t sa;
++    uint16_t psc;
++    uint16_t scll;
++    uint16_t sclh;
++    uint16_t systest;
++
++    /* the transfer in progress */
++    bool active;                /* addressed, not yet stopped (BB) */
++    bool receiving;
++    uint32_t remaining;         /* bytes still to move on the bus */
++    uint8_t rx_fifo[OMAP3_I2C_FIFO];
++    uint32_t rx_head;
++    uint32_t rx_count;
++};
++
++#endif
+-- 
+2.55.0
+

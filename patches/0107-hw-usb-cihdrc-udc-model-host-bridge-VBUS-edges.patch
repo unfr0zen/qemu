@@ -1,0 +1,87 @@
+From 9e61446db0d2cde44b71e044c80f7ca9219aafeb Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:37:46 -0400
+Subject: [PATCH 107/109] hw/usb: cihdrc-udc: model host bridge VBUS edges
+
+Latch B-session-valid changes on host socket open and close. Drive the
+shared IRQ from pending status and the guest-controlled BSV enable,
+using the OTGSC write-one-to-clear status semantics. Sample the backend
+connection on controller reset without synthesizing a cable edge.
+---
+ hw/usb/cihdrc-udc.c | 33 +++++++++++++++++++++++++++++----
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/hw/usb/cihdrc-udc.c b/hw/usb/cihdrc-udc.c
+index 590b13c..a8a774b 100644
+--- a/hw/usb/cihdrc-udc.c
++++ b/hw/usb/cihdrc-udc.c
+@@ -20,6 +20,9 @@
+ #define ENDPTLISTADDR   0x158
+ #define PORTSC          0x184
+ #define OTGSC           0x1a4
++#define OTGSC_BSV       BIT(11)
++#define OTGSC_BSVIS     BIT(19)
++#define OTGSC_BSVIE     BIT(27)
+ #define USBMODE         0x1a8
+ #define SETUPSTAT       0x1ac
+ #define PRIME           0x1b0
+@@ -61,7 +64,11 @@ typedef struct CIOutPacket {
+ 
+ static void ci_irq(CIHDRCUDCState *s)
+ {
+-    qemu_set_irq(s->irq, !!(REG(s, USBSTS) & REG(s, USBINTR) & STS_MASK));
++    bool otg = (REG(s, OTGSC) & OTGSC_BSVIS) &&
++               (REG(s, OTGSC) & OTGSC_BSVIE);
++
++    qemu_set_irq(s->irq,
++                 !!(REG(s, USBSTS) & REG(s, USBINTR) & STS_MASK) || otg);
+ }
+ 
+ static void ci_send(CIHDRCUDCState *s, const char *text)
+@@ -127,7 +134,10 @@ static void ci_reset(DeviceState *dev)
+ 
+     memset(s->regs, 0, sizeof(s->regs));
+     REG(s, PORTSC) = BIT(12) | BIT(0);
+-    REG(s, OTGSC) = BIT(8) | BIT(11);
++    REG(s, OTGSC) = BIT(8);
++    if (qemu_chr_fe_backend_open(&s->chr)) {
++        REG(s, OTGSC) |= OTGSC_BSV;
++    }
+     REG(s, EPCTRL) = BIT(7) | BIT(23);
+     s->setup_pending = false;
+     s->status_pending = false;
+@@ -505,14 +515,29 @@ static void ci_receive(void *opaque, const uint8_t *buf, int size)
+     }
+ }
+ 
++/* Cable edges latch status independently of the guest's interrupt mask. */
++static void ci_vbus_edge(CIHDRCUDCState *s, bool present)
++{
++    if (!!(REG(s, OTGSC) & OTGSC_BSV) == present) {
++        return;
++    }
++    REG(s, OTGSC) ^= OTGSC_BSV;
++    REG(s, OTGSC) |= OTGSC_BSVIS;
++    ci_irq(s);
++}
++
+ static void ci_event(void *opaque, QEMUChrEvent event)
+ {
+     CIHDRCUDCState *s = opaque;
+ 
+-    if (event == CHR_EVENT_OPENED && s->connected) {
+-        ci_send(s, "CONNECT\n");
++    if (event == CHR_EVENT_OPENED) {
++        ci_vbus_edge(s, true);
++        if (s->connected) {
++            ci_send(s, "CONNECT\n");
++        }
+     }
+     if (event == CHR_EVENT_CLOSED) {
++        ci_vbus_edge(s, false);
+         s->line_len = 0;
+         s->discard_line = false;
+         s->status_pending = false;
+-- 
+2.56.0
+

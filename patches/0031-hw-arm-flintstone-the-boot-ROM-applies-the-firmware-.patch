@@ -1,0 +1,263 @@
+From e7b217cde0bf2c71847b08fef9a298a665c011bb Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:24:12 -0400
+Subject: [PATCH 31/36] hw/arm: flintstone: the boot ROM applies the firmware's
+ DCD
+
+The i.MX boot ROM runs the image's Device Configuration Data before it
+loads the image: the stock one ungates CCGR0-7, sets CBCDR, and programs
+the IOMUXC and MMDC. run.sh replayed six of those writes (CCGR0-5) with
+-device loader, which was just enough for the vendor U-Boot's timer.
+
+Read the DCD fw1's IVT points at and interpret it like the ROM: WRITE
+(plain, mask-clear, mask-set, 1/2/4 bytes), CHECK (evaluated once: the
+models settle immediately), NOP. -bios boots get it too, standing in for
+the repo's SPL, which replays the unit's own DCD before U-Boot.
+---
+ hw/arm/flintstone.c | 185 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 165 insertions(+), 20 deletions(-)
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 641c1be..bece530 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -41,6 +41,7 @@
+ #include "system/system.h"
+ #include "qom/object.h"
+ #include "qemu/error-report.h"
++#include "qemu/log.h"
+ #include "qemu/units.h"
+ 
+ #define FLINTSTONE_RAM_ADDR     FSL_IMX6SX_DRAM_ADDR
+@@ -63,12 +64,162 @@ struct FlintstoneRomBoot {
+     const char *bios;   /* -bios: a RAM U-Boot to start instead of fw1 */
+ };
+ 
++/* DCD: a header (tag, big-endian length, version), then commands, each
++ * tag, length, parameter: WRITE's parameter is the access width (1, 2, 4)
++ * plus flags - mask: clear the value's bits, mask|set: set them, neither:
++ * write it; its body is address/value pairs. CHECK polls until an address
++ * has a mask's bits clear or set (flags as WRITE), NOP does nothing. */
++#define DCD_TAG                 0xd2
++#define DCD_CMD_WRITE           0xcc
++#define DCD_CMD_CHECK           0xcf
++#define DCD_CMD_NOP             0xc0
++#define DCD_FLAG_MASK           0x08
++#define DCD_FLAG_SET            0x10
++#define DCD_MAX_LEN             1768    /* the i.MX6 ROM's limit */
++
++static uint32_t flintstone_dcd_load(hwaddr addr, unsigned width)
++{
++    AddressSpace *as = &address_space_memory;
++
++    switch (width) {
++    case 1:
++        return address_space_ldub(as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
++    case 2:
++        return address_space_lduw_le(as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
++    default:
++        return address_space_ldl_le(as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
++    }
++}
++
++static void flintstone_dcd_store(hwaddr addr, unsigned width, uint32_t val)
++{
++    AddressSpace *as = &address_space_memory;
++
++    switch (width) {
++    case 1:
++        address_space_stb(as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
++        break;
++    case 2:
++        address_space_stw_le(as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
++        break;
++    default:
++        address_space_stl_le(as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
++    }
++}
++
++static void flintstone_apply_dcd(const uint8_t *dcd, uint32_t len)
++{
++    uint32_t p = 4;
++
++    while (p + 4 <= len) {
++        uint8_t tag = dcd[p], par = dcd[p + 3];
++        uint32_t clen = lduw_be_p(dcd + p + 1), q;
++        unsigned width = par & 7;
++        bool mask = par & DCD_FLAG_MASK, set = par & DCD_FLAG_SET;
++
++        if (clen < 4 || clen > len - p) {
++            error_report("flintstone: DCD command at +%u is cut short", p);
++            return;
++        }
++        switch (tag) {
++        case DCD_CMD_WRITE:
++            for (q = p + 4; q + 8 <= p + clen; q += 8) {
++                hwaddr addr = ldl_be_p(dcd + q);
++                uint32_t val = ldl_be_p(dcd + q + 4);
++
++                if (mask) {
++                    uint32_t cur = flintstone_dcd_load(addr, width);
++                    val = set ? cur | val : cur & ~val;
++                }
++                flintstone_dcd_store(addr, width, val);
++            }
++            break;
++        case DCD_CMD_CHECK:
++            /* The ROM polls; the models settle at once, so one look. */
++            if (clen >= 12) {
++                hwaddr addr = ldl_be_p(dcd + p + 4);
++                uint32_t m = ldl_be_p(dcd + p + 8);
++                uint32_t cur = flintstone_dcd_load(addr, width) & m;
++
++                if (set ? cur != m : cur != 0) {
++                    qemu_log_mask(LOG_UNIMP, "flintstone: DCD check of "
++                                  "0x%" HWADDR_PRIx " not met\n", addr);
++                }
++            }
++            break;
++        case DCD_CMD_NOP:
++            break;
++        default:
++            qemu_log_mask(LOG_UNIMP, "flintstone: DCD command 0x%02x "
++                          "ignored, the rest skipped\n", tag);
++            return;
++        }
++        p += clen;
++    }
++}
++
++/*
++ * fw1's IVT (entry, dcd, boot_data, self, as addresses in the image) and
++ * boot data (start: the image's load address, size); false if there is
++ * none.
++ */
++static bool flintstone_read_ivt(BlockBackend *blk, uint32_t ivt[8],
++                                uint32_t boot_data[2])
++{
++    int i;
++
++    if (blk_pread(blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF,
++                  8 * sizeof(uint32_t), ivt, 0) < 0) {
++        return false;
++    }
++    for (i = 0; i < 8; i++) {
++        ivt[i] = le32_to_cpu(ivt[i]);
++    }
++    if ((ivt[0] & 0xff) != FLINTSTONE_IVT_TAG ||
++        blk_pread(blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF +
++                  (ivt[4] - ivt[5]), 2 * sizeof(uint32_t), boot_data, 0) < 0) {
++        return false;
++    }
++    boot_data[0] = le32_to_cpu(boot_data[0]);
++    boot_data[1] = le32_to_cpu(boot_data[1]);
++    return true;
++}
++
++/* Apply fw1's DCD, as the ROM does before it loads the image into DDR. */
++static void flintstone_fw_dcd(BlockBackend *blk, const uint32_t ivt[8])
++{
++    uint64_t off = FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF +
++                   (ivt[3] - ivt[5]);
++    g_autofree uint8_t *dcd = NULL;
++    uint8_t hdr[4];
++    uint32_t len;
++
++    if (!ivt[3]) {
++        return;                         /* no DCD */
++    }
++    if (blk_pread(blk, off, sizeof(hdr), hdr, 0) < 0 || hdr[0] != DCD_TAG) {
++        error_report("flintstone: the NAND firmware's DCD is missing");
++        return;
++    }
++    len = lduw_be_p(hdr + 1);
++    if (len < sizeof(hdr) || len > DCD_MAX_LEN) {
++        error_report("flintstone: the NAND firmware's DCD is %u bytes", len);
++        return;
++    }
++    dcd = g_malloc(len);
++    if (blk_pread(blk, off, len, dcd, 0) < 0) {
++        error_report("flintstone: ROM could not read the DCD");
++        return;
++    }
++    flintstone_apply_dcd(dcd, len);
++}
++
+ static void flintstone_rom_boot(void *opaque)
+ {
+     struct FlintstoneRomBoot *rom = opaque;
+     g_autofree uint8_t *buf = NULL;
+-    uint32_t ivt[8], boot_data[2];
+-    uint32_t entry, self, start, size;
++    uint32_t ivt[8], boot_data[2], start, size;
++    bool have_ivt = flintstone_read_ivt(rom->blk, ivt, boot_data);
+ 
+     /* Nothing else resets the CPU (no arm_load_kernel), so a watchdog
+      * reboot would otherwise resume with the MMU and caches still on. */
+@@ -76,8 +227,10 @@ static void flintstone_rom_boot(void *opaque)
+ 
+     if (rom->bios) {
+         /* A raw U-Boot image linked at the entry point (the repo's
+-         * build/u-boot-recovery.bin), as SPL would leave it in DDR. Read
+-         * at every reset, so a rebuilt file boots on the next reboot. */
++         * build/u-boot-recovery.bin), as SPL would leave it in DDR, with
++         * the clocks, pads and DDR set up the way SPL does it: by
++         * replaying the unit's own DCD. Read at every reset, so a rebuilt
++         * file boots on the next reboot. */
+         g_autofree char *img = NULL;
+         gsize len;
+ 
+@@ -86,42 +239,34 @@ static void flintstone_rom_boot(void *opaque)
+             error_report("flintstone: cannot load -bios %s", rom->bios);
+             exit(1);
+         }
++        if (have_ivt) {
++            flintstone_fw_dcd(rom->blk, ivt);
++        }
+         cpu_physical_memory_write(FLINTSTONE_FW_ENTRY, img, len);
+         cpu_set_pc(first_cpu, FLINTSTONE_FW_ENTRY);
+         return;
+     }
+ 
+-    /* IVT: header, entry, reserved, dcd, boot_data, self, csf, reserved;
+-     * boot_data: start (the image's load address), size, plugin. */
+-    if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF,
+-                  sizeof(ivt), ivt, 0) < 0) {
+-        error_report("flintstone: ROM could not read the NAND firmware IVT");
+-        exit(1);
+-    }
+-    entry = le32_to_cpu(ivt[1]);
+-    self = le32_to_cpu(ivt[5]);
+-    if ((le32_to_cpu(ivt[0]) & 0xff) != FLINTSTONE_IVT_TAG ||
+-        blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF + FLINTSTONE_FW_IVT_OFF +
+-                  (le32_to_cpu(ivt[4]) - self), sizeof(boot_data),
+-                  boot_data, 0) < 0) {
++    if (!have_ivt) {
+         error_report("flintstone: ROM found no IVT in the NAND firmware");
+         exit(1);
+     }
+-    start = le32_to_cpu(boot_data[0]);
+-    size = le32_to_cpu(boot_data[1]);
++    start = boot_data[0];
++    size = boot_data[1];
+     if (start < FLINTSTONE_RAM_ADDR ||
+         size > FLINTSTONE_RAM_ADDR + FLINTSTONE_RAM_SIZE - start) {
+         error_report("flintstone: NAND firmware loads outside DRAM "
+                      "(0x%" PRIx32 " + 0x%" PRIx32 ")", start, size);
+         exit(1);
+     }
++    flintstone_fw_dcd(rom->blk, ivt);
+     buf = g_malloc(size);
+     if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF, size, buf, 0) < 0) {
+         error_report("flintstone: ROM could not read NAND firmware");
+         exit(1);
+     }
+     cpu_physical_memory_write(start, buf, size);
+-    cpu_set_pc(first_cpu, entry);
++    cpu_set_pc(first_cpu, ivt[1]);
+ }
+ 
+ /* /machine/wheel-position: the adc's signed detent count, either way round. */
+-- 
+2.55.0
+

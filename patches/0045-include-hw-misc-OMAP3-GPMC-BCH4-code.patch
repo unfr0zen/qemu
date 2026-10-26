@@ -1,0 +1,39 @@
+From 4f7b0e7cb86b6b0b0b79a9e5ceb6a1e852dd575a Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 45/91] include/hw/misc: OMAP3 GPMC BCH4 code
+
+---
+ include/hw/misc/omap3_bch.h | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+ create mode 100644 include/hw/misc/omap3_bch.h
+
+diff --git a/include/hw/misc/omap3_bch.h b/include/hw/misc/omap3_bch.h
+new file mode 100644
+index 0000000..e18a28e
+--- /dev/null
++++ b/include/hw/misc/omap3_bch.h
+@@ -0,0 +1,20 @@
++/*
++ * BCH parity for the OMAP3 GPMC ECC engine
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_OMAP3_BCH_H
++#define HW_MISC_OMAP3_BCH_H
++
++#define OMAP3_BCH4_BITS 52
++
++/* The 52-bit BCH4 parity of `len` bytes (512 for a GPMC sector). */
++uint64_t omap3_bch4_parity(const uint8_t *data, size_t len);
++
++/* r(x) * x^52 modulo the BCH4 generator */
++uint64_t omap3_bch4_mulx52(uint64_t r);
++
++#endif
+-- 
+2.55.0
+

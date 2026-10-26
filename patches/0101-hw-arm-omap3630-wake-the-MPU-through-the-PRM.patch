@@ -1,0 +1,300 @@
+From ef5d5e34be6ea92939bb2d1cd992c745ab01e76f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 07:05:05 -0400
+Subject: [PATCH] hw/arm: omap3630: wake the MPU through the PRM
+
+GPIO and UART wake-up requests are latched in PM_WKST and raise the PRM
+interrupt, so a suspended guest wakes on the button, ring or backplate.
+---
+ hw/arm/omap3630.c            |  8 +++++
+ hw/char/omap3_uart.c         | 10 ++++++
+ hw/gpio/omap3_gpio.c         |  8 +++++
+ hw/misc/omap3_prcm.c         | 59 ++++++++++++++++++++++++++++++++++++
+ include/hw/char/omap3_uart.h |  3 ++
+ include/hw/gpio/omap3_gpio.h |  4 +++
+ include/hw/misc/omap3_prcm.h | 13 ++++++++
+ 7 files changed, 105 insertions(+)
+
+diff --git a/hw/arm/omap3630.c b/hw/arm/omap3630.c
+index 8c520bd..9874870 100644
+--- a/hw/arm/omap3630.c
++++ b/hw/arm/omap3630.c
+@@ -281,6 +281,11 @@ static void omap3630_realize(DeviceState *dev, Error **errp)
+         omap3630_map(SYS_BUS_DEVICE(&s->uart[i]), 0, omap3630_uart_addr[i]);
+         sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart[i]), 0,
+                            qdev_get_gpio_in(intc, omap3630_uart_irq[i]));
++        if (i < 3) {
++            qdev_connect_gpio_out_named(DEVICE(&s->uart[i]), OMAP3_UART_WAKEUP, 0,
++                qdev_get_gpio_in_named(DEVICE(&s->prm), OMAP3_PRM_WAKEUP,
++                                       OMAP3_WAKE_UART1 + i));
++        }
+     }
+     for (int i = 0; i < OMAP3630_NUM_I2C; i++) {
+         if (!sysbus_realize(SYS_BUS_DEVICE(&s->i2c[i]), errp)) {
+@@ -297,6 +302,9 @@ static void omap3630_realize(DeviceState *dev, Error **errp)
+         omap3630_map(SYS_BUS_DEVICE(&s->gpio[i]), 0, omap3630_gpio_addr[i]);
+         sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio[i]), 0,
+                            qdev_get_gpio_in(intc, omap3630_gpio_irq[i]));
++        qdev_connect_gpio_out_named(DEVICE(&s->gpio[i]), OMAP3_GPIO_WAKEUP, 0,
++            qdev_get_gpio_in_named(DEVICE(&s->prm), OMAP3_PRM_WAKEUP,
++                                   OMAP3_WAKE_GPIO1 + i));
+     }
+     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdma), errp)) {
+         return;
+diff --git a/hw/char/omap3_uart.c b/hw/char/omap3_uart.c
+index 13222ee..7048ad2 100644
+--- a/hw/char/omap3_uart.c
++++ b/hw/char/omap3_uart.c
+@@ -11,6 +11,10 @@
+  * Transmission is immediate, so the transmitter is always empty. Received
+  * bytes queue in a 64-byte FIFO.
+  *
++ * A byte received while the receive interrupt is off, with SYSC.ENAWAKEUP
++ * and WER's RX activity set, pulses the "wakeup" output to the PRM: how
++ * an idle port wakes the unit.
++ *
+  * Copyright (c) 2026
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+@@ -55,6 +59,8 @@
+ #define UART_ISR2       0x70
+ #define UART_MDR3       0x80
+ 
++#define SYSC_ENAWAKEUP  0x04
++#define WER_RX          0x10
+ #define IER_RHR         0x01
+ #define IER_THR         0x02
+ #define IER_LINE        0x04
+@@ -379,6 +385,9 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
+         s->rx_fifo[(s->rx_head + s->rx_count++) % OMAP3_UART_FIFO] = buf[i];
+     }
+     uart_update_irq(s);
++    if (!(s->ier & IER_RHR) && (s->sysc & SYSC_ENAWAKEUP) && (s->wer & WER_RX)) {
++        qemu_irq_pulse(s->wakeup);
++    }
+ }
+ 
+ static void uart_realize(DeviceState *dev, Error **errp)
+@@ -396,6 +405,7 @@ static void uart_init(Object *obj)
+     memory_region_init_io(&s->iomem, obj, &uart_ops, s, "omap3-uart", 0x1000);
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->wakeup, OMAP3_UART_WAKEUP, 1);
+ }
+ 
+ static const Property uart_properties[] = {
+diff --git a/hw/gpio/omap3_gpio.c b/hw/gpio/omap3_gpio.c
+index 4dc4c54..55e54e9 100644
+--- a/hw/gpio/omap3_gpio.c
++++ b/hw/gpio/omap3_gpio.c
+@@ -5,6 +5,8 @@
+  * line and reads it back in DATAIN; an input reads the level driven onto
+  * its input line. Edge detection compares DATAIN before and after every
+  * change; level detection keeps the status set while the level holds.
++ * An event on a pin in WAKEUPENABLE whose interrupt is off pulses the
++ * "wakeup" output to the PRM, with SYSCONFIG.ENAWAKEUP set.
+  *
+  * Copyright (c) 2026
+  *
+@@ -20,6 +22,7 @@
+ 
+ #define GPIO_REVISION           0x00
+ #define GPIO_SYSCONFIG          0x10
++#define SYSCONFIG_ENAWAKEUP     (1 << 2)
+ #define GPIO_SYSSTATUS          0x14
+ #define GPIO_IRQSTATUS1         0x18
+ #define GPIO_IRQENABLE1         0x1c
+@@ -63,6 +66,10 @@ static void gpio_update(Omap3GpioState *s)
+         s->irqstatus[i] |= events & s->irqenable[i];
+         qemu_set_irq(s->irq[i], !!(s->irqstatus[i] & s->irqenable[i]));
+     }
++    if ((s->sysconfig & SYSCONFIG_ENAWAKEUP) &&
++        (events & s->wakeupenable & ~s->irqenable[0])) {
++        qemu_irq_pulse(s->wakeup);
++    }
+ }
+ 
+ static void gpio_drive_outputs(Omap3GpioState *s, uint32_t old_out, uint32_t old_oe)
+@@ -276,6 +283,7 @@ static void gpio_init(Object *obj)
+     sysbus_init_irq(sbd, &s->irq[1]);
+     qdev_init_gpio_in(DEVICE(obj), gpio_set_input, 32);
+     qdev_init_gpio_out(DEVICE(obj), s->out, 32);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->wakeup, OMAP3_GPIO_WAKEUP, 1);
+ }
+ 
+ static const VMStateDescription gpio_vmstate = {
+diff --git a/hw/misc/omap3_prcm.c b/hw/misc/omap3_prcm.c
+index df425ad..00856ae 100644
+--- a/hw/misc/omap3_prcm.c
++++ b/hw/misc/omap3_prcm.c
+@@ -10,6 +10,12 @@
+  * PRM resets the system on RST_DPLL3/RST_GS, and the CM drives each GP
+  * timer's clock-source selection.
+  *
++ * Wake-up: a module's wake-up request (GPIO1-6, UART1-3) enabled in its
++ * domain's PM_WKEN is latched in PM_WKST; one also in PM_MPUGRPSEL sets
++ * PRM_IRQSTATUS_MPU.WKUP_ST, and the PRM interrupt is IRQSTATUS_MPU &
++ * IRQENABLE_MPU. That is what ends a suspend's WFI with every module's own
++ * interrupt off.
++ *
+  * Copyright (c) 2026
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+@@ -217,6 +223,8 @@ static void cm_class_init(ObjectClass *klass, const void *data)
+ /* PRM */
+ #define PRM_REVISION            0x0804
+ #define PRM_IRQSTATUS_MPU       0x0818
++#define PRM_IRQENABLE_MPU       0x081c
++#define IRQ_WKUP_ST             (1 << 0)
+ #define PRM_CLKSEL              0x0d40
+ #define PRM_VC_BYPASS_VAL       0x123c
+ #define PRM_RSTCTRL             0x1250
+@@ -233,14 +241,58 @@ static void cm_class_init(ObjectClass *klass, const void *data)
+ #define PM_PWSTST               0xe4
+ #define PM_PREPWSTST            0xe8
+ #define RM_RSTST                0x58
++#define PM_WKEN1                0xa0
++#define PM_MPUGRPSEL1           0xa4
+ #define PM_WKST1                0xb0
+ #define PM_WKST3                0xb8
+ 
++#define PRM_CORE                0x0a00
++#define PRM_WKUP                0x0c00
++#define PRM_PER                 0x1000
++
++/* Each wake-up request's domain and bit in its PM_WKEN1/PM_WKST1 */
++static const struct {
++    hwaddr domain;
++    int bit;
++} prm_wake[OMAP3_NUM_WAKE] = {
++    [OMAP3_WAKE_GPIO1]     = { PRM_WKUP, 3 },
++    [OMAP3_WAKE_GPIO1 + 1] = { PRM_PER, 13 },
++    [OMAP3_WAKE_GPIO1 + 2] = { PRM_PER, 14 },
++    [OMAP3_WAKE_GPIO1 + 3] = { PRM_PER, 15 },
++    [OMAP3_WAKE_GPIO1 + 4] = { PRM_PER, 16 },
++    [OMAP3_WAKE_GPIO1 + 5] = { PRM_PER, 17 },
++    [OMAP3_WAKE_UART1]     = { PRM_CORE, 13 },
++    [OMAP3_WAKE_UART2]     = { PRM_CORE, 14 },
++    [OMAP3_WAKE_UART3]     = { PRM_PER, 11 },
++};
++
+ #define PRM_CLKSEL_19M2         2
+ #define VC_BYPASS_VALID         (1 << 24)
+ #define RSTCTRL_RST_DPLL3       (1 << 2)
+ #define RSTCTRL_RST_GS          (1 << 1)
+ 
++static void prm_update_irq(Omap3PrmState *s)
++{
++    qemu_set_irq(s->irq, !!(s->regs[PRM_IRQSTATUS_MPU / 4] &
++                            s->regs[PRM_IRQENABLE_MPU / 4]));
++}
++
++static void prm_wakeup(void *opaque, int n, int level)
++{
++    Omap3PrmState *s = opaque;
++    hwaddr domain = prm_wake[n].domain;
++    uint32_t bit = 1u << prm_wake[n].bit;
++
++    if (!level || !(s->regs[(domain + PM_WKEN1) / 4] & bit)) {
++        return;
++    }
++    s->regs[(domain + PM_WKST1) / 4] |= bit;
++    if (s->regs[(domain + PM_MPUGRPSEL1) / 4] & bit) {
++        s->regs[PRM_IRQSTATUS_MPU / 4] |= IRQ_WKUP_ST;
++        prm_update_irq(s);
++    }
++}
++
+ static uint64_t prm_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     Omap3PrmState *s = opaque;
+@@ -270,6 +322,11 @@ static void prm_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+     case PRM_IRQSTATUS_MPU:
+     case PRM_RSTST:
+         s->regs[addr / 4] &= ~val;
++        prm_update_irq(s);
++        return;
++    case PRM_IRQENABLE_MPU:
++        s->regs[addr / 4] = val;
++        prm_update_irq(s);
+         return;
+     case PRM_VC_BYPASS_VAL:
+         s->regs[addr / 4] = val & ~VC_BYPASS_VALID;   /* sent at once */
+@@ -333,6 +390,8 @@ static void prm_init(Object *obj)
+                           OMAP3_PRM_SIZE);
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++    qdev_init_gpio_in_named(DEVICE(obj), prm_wakeup, OMAP3_PRM_WAKEUP,
++                            OMAP3_NUM_WAKE);
+ }
+ 
+ static const VMStateDescription prm_vmstate = {
+diff --git a/include/hw/char/omap3_uart.h b/include/hw/char/omap3_uart.h
+index a533805..3859acf 100644
+--- a/include/hw/char/omap3_uart.h
++++ b/include/hw/char/omap3_uart.h
+@@ -17,6 +17,8 @@
+ OBJECT_DECLARE_SIMPLE_TYPE(Omap3UartState, OMAP3_UART)
+ 
+ #define OMAP3_UART_FIFO 64
++/* Named output: a pulse when received data asks the PRM to wake the unit */
++#define OMAP3_UART_WAKEUP "wakeup"
+ 
+ struct Omap3UartState {
+     SysBusDevice parent_obj;
+@@ -24,6 +26,7 @@ struct Omap3UartState {
+     MemoryRegion iomem;
+     CharFrontend chr;
+     qemu_irq irq;
++    qemu_irq wakeup;
+ 
+     uint8_t rx_fifo[OMAP3_UART_FIFO];
+     uint32_t rx_head;
+diff --git a/include/hw/gpio/omap3_gpio.h b/include/hw/gpio/omap3_gpio.h
+index 9d5430a..315aaa6 100644
+--- a/include/hw/gpio/omap3_gpio.h
++++ b/include/hw/gpio/omap3_gpio.h
+@@ -15,12 +15,16 @@
+ #define TYPE_OMAP3_GPIO "omap3-gpio"
+ OBJECT_DECLARE_SIMPLE_TYPE(Omap3GpioState, OMAP3_GPIO)
+ 
++/* Named output: a pulse when a wake-up enabled pin's event asks the PRM */
++#define OMAP3_GPIO_WAKEUP "wakeup"
++
+ struct Omap3GpioState {
+     SysBusDevice parent_obj;
+ 
+     MemoryRegion iomem;
+     qemu_irq irq[2];            /* MPU and IVA2 interrupt lines */
+     qemu_irq out[32];
++    qemu_irq wakeup;            /* OMAP3_GPIO_WAKEUP, to the PRM */
+ 
+     uint32_t inputs;            /* levels driven onto the pins */
+     uint32_t sysconfig;
+diff --git a/include/hw/misc/omap3_prcm.h b/include/hw/misc/omap3_prcm.h
+index 8182750..f6adf96 100644
+--- a/include/hw/misc/omap3_prcm.h
++++ b/include/hw/misc/omap3_prcm.h
+@@ -41,6 +41,19 @@ struct Omap3CmState {
+     qemu_irq gpt_clksel[OMAP3_NUM_GPT];
+ };
+ 
++/*
++ * PRM named inputs: "wakeup"[n] is a module's wake-up request, n one of
++ * OMAP3_WAKE_*; a rising edge is latched in its domain's PM_WKST.
++ */
++#define OMAP3_PRM_WAKEUP    "wakeup"
++enum {
++    OMAP3_WAKE_GPIO1,           /* .. OMAP3_WAKE_GPIO1 + 5: GPIO1-6 */
++    OMAP3_WAKE_UART1 = OMAP3_WAKE_GPIO1 + 6,
++    OMAP3_WAKE_UART2,
++    OMAP3_WAKE_UART3,
++    OMAP3_NUM_WAKE,
++};
++
+ struct Omap3PrmState {
+     SysBusDevice parent_obj;
+ 
+-- 
+2.56.0
+

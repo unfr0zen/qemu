@@ -1,0 +1,370 @@
+From 08142c4b4bfe7b3a5ecf66bbfd2a788cc75e8425 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:36:15 -0400
+Subject: [PATCH 12/20] hw/display: add an i.MX LCDIF scanout model
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+lcdif@02220000 drives the board's hx8357 panel (480x640 RGB888 over a
+24 bit bus; the panel's own init commands go over ECSPI1). The model
+tracks the register state the 4.1.15 mxsfb driver programs — CTRL
+RUN/DOTCLK/WORD_LENGTH, CTRL1 BYTE_PACKAGING, TRANSFER_COUNT geometry,
+CUR_BUF/NEXT_BUF with the frame-end flip — and copies the current frame
+from guest memory into a QEMU graphic console on every update. The panel
+timing is not simulated; a repaint just reads the freshest frame. The
+4.1.15 driver enables no interrupts, so the IRQ line stays quiet.
+
+Both formats the driver uses copy straight from guest memory: WORD_LENGTH
+3 (RGB888 unpacked, one u32 per pixel) is QEMU's x8r8g8b8, WORD_LENGTH 0
+(RGB565) is r5g6b5. Verified on boot: mxsfb initializes, U-Boot's splash
+reaches the console, and the running guest's 480x640 framebuffer (CMA at
+0x92300000) scans out.
+---
+ hw/display/Kconfig             |   3 +
+ hw/display/imx_lcdif.c         | 267 +++++++++++++++++++++++++++++++++
+ hw/display/meson.build         |   1 +
+ include/hw/display/imx_lcdif.h |  31 ++++
+ 4 files changed, 302 insertions(+)
+ create mode 100644 hw/display/imx_lcdif.c
+ create mode 100644 include/hw/display/imx_lcdif.h
+
+diff --git a/hw/display/Kconfig b/hw/display/Kconfig
+index 1e95ab2..a0b0352 100644
+--- a/hw/display/Kconfig
++++ b/hw/display/Kconfig
+@@ -21,6 +21,9 @@ config G364FB
+ config JAZZ_LED
+     bool
+ 
++config IMX_LCDIF
++    bool
++
+ config PL110
+     bool
+     select FRAMEBUFFER
+diff --git a/hw/display/imx_lcdif.c b/hw/display/imx_lcdif.c
+new file mode 100644
+index 0000000..7607556
+--- /dev/null
++++ b/hw/display/imx_lcdif.c
+@@ -0,0 +1,267 @@
++/*
++ * i.MX6SX LCDIF (eLCDIF / i.MX28-style display controller) emulation.
++ *
++ * lcdif@02220000 drives the board's HX8357 panel — 480x640, RGB888 over a
++ * 24 bit bus, panel init commands going over ECSPI1 (modeled elsewhere).
++ * Only the scanout side lives here: once the driver sets CTRL.RUN, the
++ * hardware DMAs the frame from CUR_BUF every dotclock period, so the model
++ * tracks the register state the 4.1.15 mxsfb driver programs and copies the
++ * current frame into a QEMU graphic console on every update. The panel
++ * timing is not simulated; a screendump (or any repaint) just reads the
++ * freshest frame.
++ *
++ * What the driver touches, from drivers/video/fbdev/mxsfb.c v4.1:
++ *   - CTRL (+0x00, set/clear aliases at +4/+8): SFTRST, CLKGATE,
++ *     WORD_LENGTH, BUS_WIDTH, DOTCLK_MODE, RUN.
++ *   - CTRL1 (+0x10): BYTE_PACKAGING, FIFO_CLEAR.
++ *   - TRANSFER_COUNT (+0x30): VCOUNT << 16 | HCOUNT — the frame geometry.
++ *   - CUR_BUF (+0x40) / NEXT_BUF (+0x50): the DMA addresses; the driver
++ *     only ever writes NEXT_BUF (pan), the hardware flips it at frame end.
++ *   - TIMING, VDCTRL0..4, DVICTRL*, DEBUG0: stored, nothing reads them.
++ * The 4.1.15 driver enables no interrupts, so the IRQ line stays quiet.
++ *
++ * Pixel formats: WORD_LENGTH 3 = 32 bpp RGB888 unpacked (one u32 per
++ * pixel, B in byte 0, G in 1, R in 2 — QEMU's x8r8g8b8), WORD_LENGTH 0 =
++ * 16 bpp RGB565 (QEMU's r5g6b5). Both copy straight from guest memory.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "ui/console.h"
++#include "ui/surface.h"
++#include "hw/display/imx_lcdif.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "system/address-spaces.h"
++
++/* Register offsets (mxsfb.c v4.1, LCDC_*) */
++#define LCDC_CTRL           0x00
++#define LCDC_CTRL_SET       0x04
++#define LCDC_CTRL_CLR       0x08
++#define LCDC_CTRL1          0x10
++#define LCDC_CTRL1_SET      0x14
++#define LCDC_CTRL1_CLR      0x18
++#define LCDC_CTRL2          0x20
++#define LCDC_CTRL2_SET      0x24
++#define LCDC_CTRL2_CLR      0x28
++#define LCDC_TRANSFER_COUNT 0x30
++#define LCDC_CUR_BUF        0x40
++#define LCDC_NEXT_BUF       0x50
++#define LCDC_TIMING         0x60
++#define LCDC_VDCTRL0        0x70
++#define LCDC_VDCTRL1        0x80
++#define LCDC_VDCTRL2        0x90
++#define LCDC_VDCTRL3        0xa0
++#define LCDC_VDCTRL4        0xb0
++#define LCDC_DVICTRL0       0xc0    /* ..0xf0 */
++
++/* CTRL bits (mxsfb.h) */
++#define CTRL_SFTRST         (1u << 31)
++#define CTRL_CLKGATE        (1u << 30)
++#define CTRL_GET_WORD_LENGTH(x) (((x) >> 8) & 0x3)
++#define CTRL_DOTCLK_MODE    (1u << 17)
++#define CTRL_RUN            (1u << 0)
++
++#define VDCTRL4_SYNC_SIGNALS_ON (1u << 18)
++
++/* Bounds sanity: the panel is 480x640, anything past 2048 is a lost guest. */
++#define LCDIF_MAX_DIM   2048
++
++static bool lcdif_running(ImxLcdifState *s)
++{
++    uint32_t ctrl = s->regs[LCDC_CTRL / 4];
++
++    return (ctrl & CTRL_RUN) && (ctrl & CTRL_DOTCLK_MODE) &&
++           !(ctrl & (CTRL_SFTRST | CTRL_CLKGATE));
++}
++
++static void lcdif_invalidate(void *opaque)
++{
++    ImxLcdifState *s = opaque;
++
++    s->invalidate = true;
++}
++
++/*
++ * Copy the current frame into the console surface. The geometry and format
++ * come from the registers the driver programmed; the frame is read from the
++ * guest in one go (its byte layout matches the surface's for both formats
++ * we support, so the copy is direct).
++ */
++static void lcdif_update_display(void *opaque)
++{
++    ImxLcdifState *s = opaque;
++    DisplaySurface *surface;
++    uint32_t tc = s->regs[LCDC_TRANSFER_COUNT / 4];
++    int width = tc & 0xffff;
++    int height = tc >> 16;
++    int bpp;
++    hwaddr frame;
++
++    if (!lcdif_running(s)) {
++        return;
++    }
++
++    switch (CTRL_GET_WORD_LENGTH(s->regs[LCDC_CTRL / 4])) {
++    case 3:
++        bpp = 4;                    /* RGB888 unpacked -> x8r8g8b8 */
++        break;
++    case 0:
++        bpp = 2;                    /* RGB565 -> r5g6b5 */
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "imx.lcdif: unsupported word length %u\n",
++                      CTRL_GET_WORD_LENGTH(s->regs[LCDC_CTRL / 4]));
++        return;
++    }
++
++    if (width == 0 || height == 0 ||
++        width > LCDIF_MAX_DIM || height > LCDIF_MAX_DIM) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "imx.lcdif: bogus transfer count 0x%08x\n", tc);
++        return;
++    }
++
++    /* The hardware moves NEXT_BUF into CUR_BUF at the frame boundary. */
++    if (s->regs[LCDC_NEXT_BUF / 4]) {
++        s->regs[LCDC_CUR_BUF / 4] = s->regs[LCDC_NEXT_BUF / 4];
++    }
++    frame = s->regs[LCDC_CUR_BUF / 4];
++    if (!frame) {
++        return;
++    }
++
++    qemu_console_resize(s->con, width, height);
++    surface = qemu_console_surface(s->con);
++    if (!surface || surface_bits_per_pixel(surface) != bpp * 8) {
++        return;
++    }
++
++    address_space_read(&address_space_memory, frame,
++                       MEMTXATTRS_UNSPECIFIED, surface_data(surface),
++                       (size_t)width * height * bpp);
++    dpy_gfx_update(s->con, 0, 0, width, height);
++}
++
++static const GraphicHwOps imx_lcdif_gfx_ops = {
++    .invalidate = lcdif_invalidate,
++    .gfx_update = lcdif_update_display,
++};
++
++static uint64_t imx_lcdif_read(void *opaque, hwaddr off, unsigned size)
++{
++    ImxLcdifState *s = IMX_LCDIF(opaque);
++    uint32_t val = 0;
++
++    if (off < sizeof(s->regs)) {
++        /* The set/clear aliases read back the same register. */
++        val = s->regs[(off & ~0xc) / 4];
++    }
++    return val;
++}
++
++static void imx_lcdif_write(void *opaque, hwaddr off, uint64_t val,
++                            unsigned size)
++{
++    ImxLcdifState *s = IMX_LCDIF(opaque);
++    bool was_running = lcdif_running(s);
++
++    if (off >= sizeof(s->regs)) {
++        return;
++    }
++    switch (off) {
++    case LCDC_CTRL_SET:
++    case LCDC_CTRL1_SET:
++    case LCDC_CTRL2_SET:
++        s->regs[(off - 4) / 4] |= val;
++        break;
++
++    case LCDC_CTRL_CLR:
++    case LCDC_CTRL1_CLR:
++    case LCDC_CTRL2_CLR:
++        s->regs[(off - 8) / 4] &= ~val;
++        break;
++
++    default:
++        s->regs[off / 4] = val;
++        break;
++    }
++
++    if (off == LCDC_CTRL_SET && (val & CTRL_RUN)) {
++        /* Starting from reset, the frame comes out of NEXT_BUF. */
++        if (!s->regs[LCDC_CUR_BUF / 4]) {
++            s->regs[LCDC_CUR_BUF / 4] = s->regs[LCDC_NEXT_BUF / 4];
++        }
++    }
++    if (was_running != lcdif_running(s)) {
++        s->invalidate = true;
++    }
++}
++
++static const MemoryRegionOps imx_lcdif_ops = {
++    .read = imx_lcdif_read,
++    .write = imx_lcdif_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static const VMStateDescription vmstate_imx_lcdif = {
++    .name = TYPE_IMX_LCDIF,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, ImxLcdifState, IMX_LCDIF_REG_SIZE / 4),
++        VMSTATE_BOOL(invalidate, ImxLcdifState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx_lcdif_reset(DeviceState *dev)
++{
++    ImxLcdifState *s = IMX_LCDIF(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->invalidate = true;
++}
++
++static void imx_lcdif_realize(DeviceState *dev, Error **errp)
++{
++    ImxLcdifState *s = IMX_LCDIF(dev);
++
++    memory_region_init_io(&s->iomem, OBJECT(dev), &imx_lcdif_ops, s,
++                          TYPE_IMX_LCDIF, IMX_LCDIF_REG_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++
++    s->con = graphic_console_init(dev, 0, &imx_lcdif_gfx_ops, s);
++}
++
++static void imx_lcdif_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = imx_lcdif_realize;
++    device_class_set_legacy_reset(dc, imx_lcdif_reset);
++    dc->vmsd = &vmstate_imx_lcdif;
++    dc->desc = "i.MX LCDIF display controller";
++}
++
++static const TypeInfo imx_lcdif_info = {
++    .name = TYPE_IMX_LCDIF,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ImxLcdifState),
++    .class_init = imx_lcdif_class_init,
++};
++
++static void imx_lcdif_register_types(void)
++{
++    type_register_static(&imx_lcdif_info);
++}
++
++type_init(imx_lcdif_register_types)
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index e730c28..e53f110 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -24,6 +24,7 @@ system_ss.add(when: 'CONFIG_VMWARE_VGA', if_true: files('vmware_vga.c'))
+ system_ss.add(when: 'CONFIG_BOCHS_DISPLAY', if_true: files('bochs-display.c'))
+ 
+ system_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4210_fimd.c'))
++system_ss.add(when: 'CONFIG_IMX_LCDIF', if_true: files('imx_lcdif.c'))
+ system_ss.add(when: 'CONFIG_FRAMEBUFFER', if_true: files('framebuffer.c'))
+ 
+ system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_fb.c'))
+diff --git a/include/hw/display/imx_lcdif.h b/include/hw/display/imx_lcdif.h
+new file mode 100644
+index 0000000..db79a70
+--- /dev/null
++++ b/include/hw/display/imx_lcdif.h
+@@ -0,0 +1,31 @@
++/*
++ * i.MX LCDIF display controller — see imx_lcdif.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_DISPLAY_IMX_LCDIF_H
++#define HW_DISPLAY_IMX_LCDIF_H
++
++#include "system/memory.h"
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++#include "ui/console.h"
++
++#define TYPE_IMX_LCDIF "imx.lcdif"
++OBJECT_DECLARE_SIMPLE_TYPE(ImxLcdifState, IMX_LCDIF)
++
++#define IMX_LCDIF_REG_SIZE  0x4000
++
++struct ImxLcdifState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    QemuConsole *con;
++
++    bool invalidate;
++
++    uint32_t regs[IMX_LCDIF_REG_SIZE / 4];
++};
++
++#endif /* HW_DISPLAY_IMX_LCDIF_H */
+-- 
+2.55.0
+

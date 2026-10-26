@@ -1,0 +1,273 @@
+From 1220ccfe884df2a82f5bbda7d46c9667998525ae Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:22:07 -0400
+Subject: [PATCH 01/20] hw/arm: add i.MX6SX SoC container header
+
+Address map and IRQ numbers for the Nest Display-3.4 board (i.MX6SX),
+taken from the board's own stock Device Tree rather than the i.MX6Q
+map: UART2-5 sit on AIPS2, a third bus lives at 0x02200000, the
+GPMI/BCH/APBH block at 0x0180xxxx, and there is no PCIe.
+---
+ include/hw/arm/fsl-imx6sx.h | 250 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 250 insertions(+)
+ create mode 100644 include/hw/arm/fsl-imx6sx.h
+
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+new file mode 100644
+index 0000000..3419540
+--- /dev/null
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -0,0 +1,250 @@
++/*
++ * i.MX6SX SoC emulation (Nest Display-3.4 / "Flintstone" board)
++ *
++ * Address map and IRQ numbers are taken from the board's own Device Tree
++ * blob (stock firmware `fdt@3`, compatible "nestlabs,diamond3-dvt",
++ * "fsl,imx6sx"), NOT from the i.MX6 Quad map — the 6SX differs in several
++ * places (UART2-5 sit on AIPS2, there is a third AIPS bus at 0x02200000,
++ * the GPMI/BCH/APBH block lives at 0x01800000, and there is no PCIe).
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef FSL_IMX6SX_H
++#define FSL_IMX6SX_H
++
++#include "cpu.h"
++#include "hw/char/imx_serial.h"
++#include "hw/cpu/a9mpcore.h"
++#include "hw/gpio/imx_gpio.h"
++#include "hw/i2c/imx_i2c.h"
++#include "hw/ssi/imx_spi.h"
++#include "hw/misc/imx6_ccm.h"
++#include "hw/misc/imx6_src.h"
++#include "hw/misc/imx7_snvs.h"
++#include "hw/net/imx_fec.h"
++#include "hw/sd/sdhci.h"
++#include "hw/timer/imx_epit.h"
++#include "hw/timer/imx_gpt.h"
++#include "hw/usb/chipidea.h"
++#include "hw/usb/imx-usb-phy.h"
++#include "hw/watchdog/wdt_imx2.h"
++
++#define TYPE_FSL_IMX6SX "fsl-imx6sx"
++typedef struct FslIMX6SXState FslIMX6SXState;
++DECLARE_INSTANCE_CHECKER(FslIMX6SXState, FSL_IMX6SX, TYPE_FSL_IMX6SX)
++
++#define FSL_IMX6SX_NUM_CPUS     1
++#define FSL_IMX6SX_NUM_UARTS    6
++#define FSL_IMX6SX_NUM_EPITS    2
++#define FSL_IMX6SX_NUM_I2CS     4
++#define FSL_IMX6SX_NUM_ECSPIS   4
++#define FSL_IMX6SX_NUM_GPIOS    7
++#define FSL_IMX6SX_NUM_USDHCS   4
++#define FSL_IMX6SX_NUM_USBS     3
++#define FSL_IMX6SX_NUM_USB_PHYS 2
++#define FSL_IMX6SX_NUM_ETHS     2
++#define FSL_IMX6SX_NUM_WDTS     3
++/* Highest GIC SPI used on the 6SX (FEC1 1588 = 119); keep room to spare. */
++#define FSL_IMX6SX_MAX_IRQ      128
++
++/* Cortex A9 MPCore (identical to i.MX6Q) */
++#define FSL_IMX6SX_A9MPCORE_ADDR    0x00A00000
++#define FSL_IMX6SX_A9MPCORE_SIZE    0x2000
++#define FSL_IMX6SX_PL310_ADDR       0x00A02000
++#define FSL_IMX6SX_PL310_SIZE       0x1000
++
++/* Internal memories */
++#define FSL_IMX6SX_ROM_ADDR         0x00000000
++#define FSL_IMX6SX_ROM_SIZE         0x18000
++#define FSL_IMX6SX_CAAM_MEM_ADDR    0x00100000
++#define FSL_IMX6SX_CAAM_MEM_SIZE    0x8000
++#define FSL_IMX6SX_LPM_SRAM_ADDR    0x008F8000
++#define FSL_IMX6SX_LPM_SRAM_SIZE    0x4000
++#define FSL_IMX6SX_OCRAM_ADDR       0x00900000
++#define FSL_IMX6SX_OCRAM_SIZE       0x20000    /* 128 KiB mega-fast SRAM */
++
++/* Vivante GC400T GPU3D register block (register stub only) */
++#define FSL_IMX6SX_GPU_ADDR         0x01800000
++#define FSL_IMX6SX_GPU_SIZE         0x4000
++
++/* GPMI NAND subsystem on its own bus segment (modeled in a later phase) */
++#define FSL_IMX6SX_APBH_ADDR        0x01804000
++#define FSL_IMX6SX_APBH_SIZE        0x2000
++#define FSL_IMX6SX_GPMI_ADDR        0x01806000
++#define FSL_IMX6SX_GPMI_SIZE        0x2000
++#define FSL_IMX6SX_BCH_ADDR         0x01808000
++#define FSL_IMX6SX_BCH_SIZE         0x4000
++
++/* AIPS1 / SPBA1 */
++#define FSL_IMX6SX_UART1_ADDR       0x02020000
++#define FSL_IMX6SX_UART1_IRQ        26
++#define FSL_IMX6SX_PWM1_ADDR        0x02080000
++#define FSL_IMX6SX_PWM2_ADDR        0x02084000
++#define FSL_IMX6SX_PWM3_ADDR        0x02088000
++#define FSL_IMX6SX_PWM4_ADDR        0x0208C000
++#define FSL_IMX6SX_CAN1_ADDR        0x02090000
++#define FSL_IMX6SX_CAN2_ADDR        0x02094000
++#define FSL_IMX6SX_GPT_ADDR         0x02098000
++#define FSL_IMX6SX_GPT_IRQ          55
++#define FSL_IMX6SX_GPIO1_ADDR       0x0209C000
++#define FSL_IMX6SX_GPIO1_LOW_IRQ    66
++#define FSL_IMX6SX_GPIO1_HIGH_IRQ   67
++#define FSL_IMX6SX_GPIO2_ADDR       0x020A0000
++#define FSL_IMX6SX_GPIO2_LOW_IRQ    68
++#define FSL_IMX6SX_GPIO2_HIGH_IRQ   69
++#define FSL_IMX6SX_GPIO3_ADDR       0x020A4000
++#define FSL_IMX6SX_GPIO3_LOW_IRQ    70
++#define FSL_IMX6SX_GPIO3_HIGH_IRQ   71
++#define FSL_IMX6SX_GPIO4_ADDR       0x020A8000
++#define FSL_IMX6SX_GPIO4_LOW_IRQ    72
++#define FSL_IMX6SX_GPIO4_HIGH_IRQ   73
++#define FSL_IMX6SX_GPIO5_ADDR       0x020AC000
++#define FSL_IMX6SX_GPIO5_LOW_IRQ    74
++#define FSL_IMX6SX_GPIO5_HIGH_IRQ   75
++#define FSL_IMX6SX_GPIO6_ADDR       0x020B0000
++#define FSL_IMX6SX_GPIO6_LOW_IRQ    76
++#define FSL_IMX6SX_GPIO6_HIGH_IRQ   77
++#define FSL_IMX6SX_GPIO7_ADDR       0x020B4000
++#define FSL_IMX6SX_GPIO7_LOW_IRQ    78
++#define FSL_IMX6SX_GPIO7_HIGH_IRQ   79
++#define FSL_IMX6SX_WDOG1_ADDR       0x020BC000
++#define FSL_IMX6SX_WDOG1_IRQ        80
++#define FSL_IMX6SX_WDOG2_ADDR       0x020C0000
++#define FSL_IMX6SX_WDOG2_IRQ        81
++#define FSL_IMX6SX_CCM_ADDR         0x020C4000
++#define FSL_IMX6SX_ANATOP_ADDR      0x020C8000
++#define FSL_IMX6SX_ANATOP_SIZE      0x1000
++#define FSL_IMX6SX_USBPHY1_ADDR     0x020C9000
++#define FSL_IMX6SX_USBPHY1_IRQ      44
++#define FSL_IMX6SX_USBPHY2_ADDR     0x020CA000
++#define FSL_IMX6SX_USBPHY2_IRQ      45
++#define FSL_IMX6SX_SNVSHP_ADDR      0x020CC000
++#define FSL_IMX6SX_EPIT1_ADDR       0x020D0000
++#define FSL_IMX6SX_EPIT1_IRQ        56
++#define FSL_IMX6SX_EPIT2_ADDR       0x020D4000
++#define FSL_IMX6SX_EPIT2_IRQ        57
++#define FSL_IMX6SX_SRC_ADDR         0x020D8000
++#define FSL_IMX6SX_GPC_ADDR         0x020DC000
++#define FSL_IMX6SX_IOMUXC_ADDR      0x020E0000
++#define FSL_IMX6SX_IOMUXC_GPR_ADDR  0x020E4000
++#define FSL_IMX6SX_SDMA_ADDR        0x020EC000
++
++/* AIPS2 */
++#define FSL_IMX6SX_CAAM_ADDR        0x02100000
++#define FSL_IMX6SX_CAAM_SIZE        0x40000
++#define FSL_IMX6SX_USBOH3_USB_ADDR  0x02184000
++#define FSL_IMX6SX_USB_OTG_IRQ      43
++#define FSL_IMX6SX_USB_HOST1_IRQ    42
++#define FSL_IMX6SX_USB_HOST2_IRQ    40
++#define FSL_IMX6SX_ENET1_ADDR       0x02188000
++#define FSL_IMX6SX_ENET1_IRQ        118
++#define FSL_IMX6SX_ENET1_1588_IRQ   119
++#define FSL_IMX6SX_MLB_ADDR         0x0218C000
++#define FSL_IMX6SX_uSDHC1_ADDR      0x02190000
++#define FSL_IMX6SX_uSDHC1_IRQ       22
++#define FSL_IMX6SX_uSDHC2_ADDR      0x02194000
++#define FSL_IMX6SX_uSDHC2_IRQ       23
++#define FSL_IMX6SX_uSDHC3_ADDR      0x02198000
++#define FSL_IMX6SX_uSDHC3_IRQ       24
++#define FSL_IMX6SX_uSDHC4_ADDR      0x0219C000
++#define FSL_IMX6SX_uSDHC4_IRQ       25
++/* ECSPI1-4 on the SPBA (ECSPI5 is on AIPS3, still unimplemented) */
++#define FSL_IMX6SX_ECSPI1_ADDR      0x02008000
++#define FSL_IMX6SX_ECSPI1_IRQ       31
++#define FSL_IMX6SX_I2C1_ADDR        0x021A0000
++#define FSL_IMX6SX_I2C1_IRQ         36
++#define FSL_IMX6SX_I2C2_ADDR        0x021A4000
++#define FSL_IMX6SX_I2C2_IRQ         37
++#define FSL_IMX6SX_I2C3_ADDR        0x021A8000
++#define FSL_IMX6SX_I2C3_IRQ         38
++#define FSL_IMX6SX_ROMCP_ADDR       0x021AC000
++#define FSL_IMX6SX_MMDC_ADDR        0x021B0000
++#define FSL_IMX6SX_ENET2_ADDR       0x021B4000
++#define FSL_IMX6SX_ENET2_IRQ        102
++#define FSL_IMX6SX_ENET2_1588_IRQ   103
++#define FSL_IMX6SX_WEIM_ADDR        0x021B8000
++#define FSL_IMX6SX_OCOTP_ADDR       0x021BC000
++#define FSL_IMX6SX_SAI1_ADDR        0x021D4000
++#define FSL_IMX6SX_AUDMUX_ADDR      0x021D8000
++#define FSL_IMX6SX_SAI2_ADDR        0x021DC000
++#define FSL_IMX6SX_QSPI1_ADDR       0x021E0000
++#define FSL_IMX6SX_QSPI1_MEM_ADDR   0x60000000
++#define FSL_IMX6SX_QSPI1_MEM_SIZE   0x10000000
++#define FSL_IMX6SX_QSPI2_ADDR       0x021E4000
++#define FSL_IMX6SX_QSPI2_MEM_ADDR   0x70000000
++#define FSL_IMX6SX_QSPI2_MEM_SIZE   0x10000000
++#define FSL_IMX6SX_UART2_ADDR       0x021E8000
++#define FSL_IMX6SX_UART2_IRQ        27
++#define FSL_IMX6SX_UART3_ADDR       0x021EC000
++#define FSL_IMX6SX_UART3_IRQ        28
++#define FSL_IMX6SX_UART4_ADDR       0x021F0000
++#define FSL_IMX6SX_UART4_IRQ        29
++#define FSL_IMX6SX_UART5_ADDR       0x021F4000
++#define FSL_IMX6SX_UART5_IRQ        30
++#define FSL_IMX6SX_I2C4_ADDR        0x021F8000
++#define FSL_IMX6SX_I2C4_IRQ         35
++#define FSL_IMX6SX_QOSC_ADDR        0x021FC000
++
++/* AIPS3 (the 6SX-only third bus) */
++#define FSL_IMX6SX_ADC1_ADDR        0x02280000
++#define FSL_IMX6SX_ADC2_ADDR        0x02284000
++#define FSL_IMX6SX_WDOG3_ADDR       0x02288000
++#define FSL_IMX6SX_WDOG3_IRQ        11
++#define FSL_IMX6SX_ECSPI4_ADDR      0x0228C000
++#define FSL_IMX6SX_SEMA4_ADDR       0x02290000
++#define FSL_IMX6SX_MU_ADDR          0x02294000
++#define FSL_IMX6SX_UART6_ADDR       0x022A0000
++#define FSL_IMX6SX_UART6_IRQ        17
++
++/* 2 GiB DRAM window, board ships with 512 MiB (DTB: 0x80000000 + 0x20000000) */
++#define FSL_IMX6SX_DRAM_ADDR        0x80000000
++#define FSL_IMX6SX_DRAM_MAX_SIZE    (2 * 1024 * 1024 * 1024ULL)
++
++struct FslIMX6SXState {
++    DeviceState parent_obj;
++
++    ARMCPU cpu;
++    A9MPPrivState a9mpcore;
++
++    IMX6CCMState ccm;
++    IMX6SRCState src;
++    IMX7SNVSState snvs;
++
++    IMXSerialState uart[FSL_IMX6SX_NUM_UARTS];
++    IMXGPTState gpt;
++    IMXEPITState epit[FSL_IMX6SX_NUM_EPITS];
++    IMXI2CState i2c[FSL_IMX6SX_NUM_I2CS];
++    IMXSPIState spi[FSL_IMX6SX_NUM_ECSPIS];
++    IMXGPIOState gpio[FSL_IMX6SX_NUM_GPIOS];
++    SDHCIState usdhc[FSL_IMX6SX_NUM_USDHCS];
++
++    IMXUSBPHYState usbphy[FSL_IMX6SX_NUM_USB_PHYS];
++    ChipideaState usb[FSL_IMX6SX_NUM_USBS];
++
++    IMXFECState eth[FSL_IMX6SX_NUM_ETHS];
++    IMX2WdtState wdt[FSL_IMX6SX_NUM_WDTS];
++
++    MemoryRegion rom;
++    MemoryRegion caam;
++    MemoryRegion ocram;
++    MemoryRegion gpu;
++    uint32_t gpu_clock_ctrl;
++
++    uint32_t phy_num;
++};
++
++#endif /* FSL_IMX6SX_H */
+-- 
+2.55.0
+

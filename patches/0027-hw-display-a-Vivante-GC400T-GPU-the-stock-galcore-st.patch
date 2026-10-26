@@ -1,0 +1,3507 @@
+From 3e6601d66332eb10ae58c0478d8f39c3f2351758 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 16:17:51 -0400
+Subject: [PATCH 27/36] hw/display: a Vivante GC400T GPU the stock galcore
+ stack draws with
+
+The i.MX6SX GPU3D was a register stub that only reported an idle core, so
+the flintstone's nlclient could not draw with its own libGAL/libEGL/
+libGLESv2 and needed a replacement GL library in the guest. Model the GPU
+instead, far enough for the vendor galcore 5.0.11 driver and its user
+space to run unmodified:
+
+- identity: the GC400T's model, revision and feature words;
+- front end: galcore's END-terminated submissions and LINK/WAIT/CALL, with
+  the fetch address galcore's idle check expects after an END; events
+  raise the interrupt through AQIntrAcknowledge;
+- MMU v1 and the memory base; tile status takes physical addresses;
+- resolve engine: fills and copies between linear, tiled and supertiled
+  surfaces with format conversion (frames reach the framebuffer this way,
+  and libGAL's fences are small resolves);
+- fast clear: tile status is resolved into the surfaces that are read;
+- 3D: vertex fetch, a Vivante shader ISA interpreter (quads in lockstep,
+  so derivatives and texture LOD work), clipping, the viewport, a
+  top-left rasteriser over the scissor, perspective-correct varyings,
+  texturing (the 8/16/32-bit formats, DXT, ETC1; linear, tiled and
+  supertiled; nearest/linear/mipmaps), alpha test, depth/stencil,
+  blending and the colour mask, with masked state writes as libGAL
+  makes them. Rasterisation is split across host threads in bands of
+  rows.
+
+nlclient's screens render as on the device at ~50 frames a second while
+animating. -global vivante-gc.trace=on logs register accesses, commands
+and resolves; anything unmodelled is reported once under -d unimp.
+---
+ hw/arm/Kconfig                  |    1 +
+ hw/arm/fsl-imx6sx.c             |   52 +-
+ hw/display/Kconfig              |    3 +
+ hw/display/meson.build          |    1 +
+ hw/display/vivante_3d.c         | 2259 +++++++++++++++++++++++++++++++
+ hw/display/vivante_gc.c         |  879 ++++++++++++
+ hw/display/vivante_gc_int.h     |  145 ++
+ include/hw/arm/fsl-imx6sx.h     |    6 +-
+ include/hw/display/vivante_gc.h |   11 +
+ 9 files changed, 3311 insertions(+), 46 deletions(-)
+ create mode 100644 hw/display/vivante_3d.c
+ create mode 100644 hw/display/vivante_gc.c
+ create mode 100644 hw/display/vivante_gc_int.h
+ create mode 100644 include/hw/display/vivante_gc.h
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 2246ce6..70d54b0 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -544,6 +544,7 @@ config FSL_IMX6SX
+     select IMX_LCDIF  # display scanout (hx8357 panel on the Display-3.4)
+     select IMX_USBPHY
+     select PFUZE200   # the board's PMIC (i2c4 @ 0x08)
++    select VIVANTE_GC # the GC400T GPU3D
+     select SPLIT_IRQ
+     select WDT_IMX2
+     select PL310  # cache controller
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index d0e810e..f04fc90 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -23,6 +23,7 @@
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
+ #include "hw/arm/fsl-imx6sx.h"
++#include "hw/display/vivante_gc.h"
+ #include "hw/i2c/i2c.h"
+ #include "hw/i2c/pfuze200.h"
+ #include "hw/misc/unimp.h"
+@@ -179,44 +180,6 @@ static Notifier fsl_imx6sx_ccm_notifier = {
+     .notify = fsl_imx6sx_ccm_init_done,
+ };
+ 
+-/*
+- * GPU3D register stub. The vendor galcore driver's _ResetGPU loops (with a
+- * 1 ms sleep) until AQHiIdle (+0x04) reports the front end idle and
+- * AQHiClockControl (+0x00) reports IDLE_2D/IDLE_3D (bits 16/17). Report an
+- * idle core; everything else, including the chip ID, reads as zero.
+- */
+-static uint64_t fsl_imx6sx_gpu_read(void *opaque, hwaddr off, unsigned size)
+-{
+-    FslIMX6SXState *s = opaque;
+-
+-    switch (off) {
+-    case 0x00:
+-        return s->gpu_clock_ctrl | (3u << 16);
+-    case 0x04:
+-        return 0x7fffffff;
+-    default:
+-        return 0;
+-    }
+-}
+-
+-static void fsl_imx6sx_gpu_write(void *opaque, hwaddr off, uint64_t val,
+-                                 unsigned size)
+-{
+-    FslIMX6SXState *s = opaque;
+-
+-    if (off == 0x00) {
+-        s->gpu_clock_ctrl = val;
+-    }
+-}
+-
+-static const MemoryRegionOps fsl_imx6sx_gpu_ops = {
+-    .read = fsl_imx6sx_gpu_read,
+-    .write = fsl_imx6sx_gpu_write,
+-    .endianness = DEVICE_LITTLE_ENDIAN,
+-    .valid.min_access_size = 4,
+-    .valid.max_access_size = 4,
+-};
+-
+ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+ {
+     MachineState *ms = MACHINE(qdev_get_machine());
+@@ -584,10 +547,15 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_CAAM_MEM_ADDR,
+                                 &s->caam);
+ 
+-    memory_region_init_io(&s->gpu, OBJECT(dev), &fsl_imx6sx_gpu_ops, s,
+-                          "imx6sx.gpu3d", FSL_IMX6SX_GPU_SIZE);
+-    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_GPU_ADDR,
+-                                &s->gpu);
++    /* The GC400T GPU3D (see hw/display/vivante_gc.c). */
++    {
++        DeviceState *gpu = qdev_new(TYPE_VIVANTE_GC);
++
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, FSL_IMX6SX_GPU_ADDR);
++        sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0,
++                           qdev_get_gpio_in(gic, FSL_IMX6SX_GPU_IRQ));
++    }
+ 
+     /* Regions the boot software touches but we do not (yet) model */
+     for (i = 0; i < ARRAY_SIZE(fsl_imx6sx_unimplemented); i++) {
+diff --git a/hw/display/Kconfig b/hw/display/Kconfig
+index 480e17c..27e2e02 100644
+--- a/hw/display/Kconfig
++++ b/hw/display/Kconfig
+@@ -156,3 +156,6 @@ config MAC_PVG_PCI
+ config LM3695
+     bool
+     depends on I2C
++
++config VIVANTE_GC
++    bool
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index cf80533..3213c5e 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -15,6 +15,7 @@ system_ss.add(when: 'CONFIG_PL110', if_true: files('pl110.c'))
+ system_ss.add(when: 'CONFIG_SII9022', if_true: files('sii9022.c'))
+ system_ss.add(when: 'CONFIG_SSD0303', if_true: files('ssd0303.c'))
+ system_ss.add(when: 'CONFIG_LM3695', if_true: files('lm3695.c'))
++system_ss.add(when: 'CONFIG_VIVANTE_GC', if_true: files('vivante_gc.c', 'vivante_3d.c'))
+ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
+ system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
+ 
+diff --git a/hw/display/vivante_3d.c b/hw/display/vivante_3d.c
+new file mode 100644
+index 0000000..4938c90
+--- /dev/null
++++ b/hw/display/vivante_3d.c
+@@ -0,0 +1,2259 @@
++/*
++ * Vivante GC400T GPU model: the 3D pipeline, in software.
++ *
++ * A draw runs the way the hardware's is documented (etnaviv's rules-ng
++ * register database and ISA description, Mesa's etnaviv driver), with the
++ * state the vendor libGAL leaves:
++ *
++ * - vertex fetch: up to 16 elements (FE_VERTEX_ELEMENT_CONFIG) from the
++ *   vertex streams, an element per vertex shader input;
++ * - vertex shader: the program in VS_INST_MEM from VS_START_PC to
++ *   VS_END_PC, inputs in the temporaries VS_INPUT names, outputs read from
++ *   those VS_OUTPUT names, output 0 the clip-space position;
++ * - primitive assembly: near-plane clipping, perspective divide, the
++ *   PA viewport (16.16 fixed point x/y, float z), face culling;
++ * - rasterisation: pixel centres (PA_SYSTEM_MODE), top-left fill, the
++ *   SE scissor, in 2x2 quads so shader derivatives and texture LOD work;
++ * - pixel shader: PS_INST_MEM, t0 = window position, t1.. = the vertex
++ *   shader's outputs 1.. interpolated perspective-correct, the colour
++ *   read from PS_OUTPUT_REG;
++ * - pixel engine: alpha test, depth and stencil, blending, the colour
++ *   mask, into a linear, tiled or supertiled render target;
++ * - fast clear: tile status is resolved into the surfaces a draw touches.
++ *
++ * A draw's triangles are rasterised by a few threads at once, each taking
++ * every Nth band of 32 rows, so each pixel is still written in draw order.
++ *
++ * The shader interpreter runs a quad's four lanes in lockstep; a branch
++ * the lanes disagree on splits them and each part runs on to the end.
++ * Uniforms are the GC400's unified ones (SH_UNIFORMS, from VS/PS
++ * UNIFORM_BASE). Anything the model does not know is reported once
++ * (-d unimp) and skipped.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qemu/bswap.h"
++#include "qemu/rcu.h"
++#include "qemu/thread.h"
++#include "qemu/units.h"
++#include "system/address-spaces.h"
++#include "vivante_gc_int.h"
++
++/* States (register byte address / 4) */
++#define ST_FE_VERTEX_ELEMENT_CONFIG     0x0180
++#define   VE_TYPE(v)                    ((v) & 0xf)
++#define   VE_STREAM(v)                  (((v) >> 8) & 0xf)
++#define   VE_NUM(v)                     (((v) >> 12) & 3)
++#define   VE_NORMALIZE(v)               (((v) >> 14) & 3)
++#define   VE_START(v)                   (((v) >> 16) & 0xff)
++#define   VE_END(v)                     ((v) >> 24)
++#define ST_FE_INDEX_STREAM_BASE_ADDR    0x0191
++#define ST_FE_INDEX_STREAM_CONTROL      0x0192
++#define ST_FE_VERTEX_STREAM_BASE_ADDR   0x0193
++#define ST_FE_VERTEX_STREAM_CONTROL     0x0194
++#define ST_FE_VERTEX_STREAMS_BASE_ADDR  0x01a0
++#define ST_FE_VERTEX_STREAMS_CONTROL    0x01a8
++#define ST_VS_END_PC                    0x0200
++#define ST_VS_OUTPUT_COUNT              0x0201
++#define ST_VS_INPUT_COUNT               0x0202
++#define ST_VS_OUTPUT                    0x0204
++#define ST_VS_INPUT                     0x0208
++#define ST_VS_START_PC                  0x020e
++#define ST_VS_UNIFORM_BASE              0x0219
++#define ST_PA_VIEWPORT_SCALE_X          0x0280
++#define ST_PA_VIEWPORT_SCALE_Y          0x0281
++#define ST_PA_VIEWPORT_SCALE_Z          0x0282
++#define ST_PA_VIEWPORT_OFFSET_X         0x0283
++#define ST_PA_VIEWPORT_OFFSET_Y         0x0284
++#define ST_PA_VIEWPORT_OFFSET_Z         0x0285
++#define ST_PA_LINE_WIDTH                0x0286
++#define ST_PA_POINT_SIZE                0x0287
++#define ST_PA_SYSTEM_MODE               0x028a
++#define   PA_HALF_PIXEL_CENTER          (1u << 4)
++#define ST_PA_CONFIG                    0x028d
++#define   PA_CULL(v)                    (((v) >> 8) & 3)
++#define ST_PA_SHADER_ATTRIBUTES         0x0290
++#define ST_SE_SCISSOR_LEFT              0x0300
++#define ST_SE_SCISSOR_TOP               0x0301
++#define ST_SE_SCISSOR_RIGHT             0x0302
++#define ST_SE_SCISSOR_BOTTOM            0x0303
++#define ST_SE_DEPTH_SCALE               0x0304
++#define ST_SE_DEPTH_BIAS                0x0305
++#define ST_SE_CLIP_RIGHT                0x0308
++#define ST_SE_CLIP_BOTTOM               0x0309
++#define ST_PS_END_PC                    0x0400
++#define ST_PS_OUTPUT_REG                0x0401
++#define ST_PS_INPUT_COUNT               0x0402
++#define ST_PS_CONTROL                   0x0404
++#define   PS_SATURATE_RT0               (1u << 1)
++#define ST_PS_START_PC                  0x0406
++#define ST_PS_UNIFORM_BASE              0x0409
++#define ST_PE_DEPTH_CONFIG              0x0500
++#define   PE_DEPTH_MODE(v)              ((v) & 3)
++#define   PE_DEPTH_D24S8                (1u << 4)
++#define   PE_DEPTH_FUNC(v)              (((v) >> 8) & 7)
++#define   PE_DEPTH_WRITE                (1u << 12)
++#define   PE_DEPTH_DISABLE_ZS           (1u << 24)
++#define   PE_DEPTH_SUPER_TILED          (1u << 26)
++#define ST_PE_DEPTH_NORMALIZE           0x0503
++#define ST_PE_DEPTH_ADDR                0x0504
++#define ST_PE_DEPTH_STRIDE              0x0505
++#define ST_PE_STENCIL_OP                0x0506
++#define ST_PE_STENCIL_CONFIG            0x0507
++#define ST_PE_ALPHA_OP                  0x0508
++#define ST_PE_ALPHA_BLEND_COLOR         0x0509
++#define ST_PE_ALPHA_CONFIG              0x050a
++#define ST_PE_COLOR_FORMAT              0x050b
++#define   PE_COLOR_SUPER_TILED          (1u << 20)
++#define ST_PE_COLOR_ADDR                0x050c
++#define ST_PE_COLOR_STRIDE              0x050d
++#define ST_PE_STENCIL_CONFIG_EXT        0x0528
++#define ST_PE_STENCIL_CONFIG_EXT2       0x052e
++#define ST_TE_SAMPLER_CONFIG0           0x0800
++#define ST_TE_SAMPLER_SIZE              0x0810
++#define ST_TE_SAMPLER_LOG_SIZE          0x0820
++#define ST_TE_SAMPLER_LOD_CONFIG        0x0830
++#define ST_TE_SAMPLER_CONFIG1           0x0870
++#define ST_TE_SAMPLER_LOD_ADDR          0x0900  /* + sampler + 16 * level */
++#define ST_TE_SAMPLER_LINEAR_STRIDE     0x0b00  /* + sampler + 16 * level */
++#define ST_VS_INST_MEM                  0x1000
++#define ST_PS_INST_MEM                  0x1800
++#define ST_SH_UNIFORMS                  0xc000
++
++#define VIV_INST_MAX            256     /* per shader instruction memory */
++#define VIV_TEMPS               64
++#define VIV_OUTPUTS             16
++#define VIV_SAMPLERS            12
++#define VIV_LEVELS              14
++#define VIV_MAX_VERTICES        65536
++#define VIV_BAND_SHIFT          5       /* bands of 32 rows per thread */
++#define VIV_MAX_THREADS         8
++/* Draws covering fewer pixels than this are not worth the threads. */
++#define VIV_THREAD_MIN_PIXELS   16384
++
++/* Opcodes */
++enum {
++    OP_NOP = 0x00, OP_ADD = 0x01, OP_MAD = 0x02, OP_MUL = 0x03,
++    OP_DP3 = 0x05, OP_DP4 = 0x06, OP_DSX = 0x07, OP_DSY = 0x08,
++    OP_MOV = 0x09, OP_MOVAR = 0x0a, OP_RCP = 0x0c, OP_RSQ = 0x0d,
++    OP_SELECT = 0x0f, OP_SET = 0x10, OP_EXP = 0x11, OP_LOG = 0x12,
++    OP_FRC = 0x13, OP_CALL = 0x14, OP_RET = 0x15, OP_BRANCH = 0x16,
++    OP_TEXKILL = 0x17, OP_TEXLD = 0x18, OP_TEXLDB = 0x19, OP_TEXLDD = 0x1a,
++    OP_TEXLDL = 0x1b, OP_SQRT = 0x21, OP_SIN = 0x22, OP_COS = 0x23,
++    OP_BRANCH_ANY = 0x24, OP_FLOOR = 0x25, OP_CEIL = 0x26, OP_SIGN = 0x27,
++    OP_I2F = 0x2d, OP_F2I = 0x2e, OP_F2IRND = 0x2f, OP_CMP = 0x31,
++    OP_IMULLO0 = 0x3c, OP_LSHIFT = 0x59, OP_RSHIFT = 0x5a, OP_OR = 0x5c,
++    OP_AND = 0x5d, OP_XOR = 0x5e, OP_NOT = 0x5f, OP_DIV = 0x64,
++    OP_DP2 = 0x73,
++};
++
++/* Register groups */
++enum { RG_TEMP = 0, RG_INTERNAL = 1, RG_UNIFORM0 = 2, RG_UNIFORM1 = 3,
++       RG_IMMEDIATE = 7 };
++
++/* Instruction types (only f32 and the 32-bit integers matter here) */
++enum { TYPE_F32 = 0, TYPE_S32 = 1, TYPE_U32 = 6 };
++
++typedef union VivVec {
++    float f[4];
++    uint32_t u[4];
++    int32_t i[4];
++} VivVec;
++
++typedef struct VivSrc {
++    bool use;
++    uint8_t rgroup;
++    uint8_t amode;
++    bool neg, abs;
++    uint16_t reg;
++    uint8_t swz[4];
++    uint32_t imm;
++} VivSrc;
++
++typedef struct VivInst {
++    uint8_t op, cond, type;
++    bool sat;
++    bool dst_use;
++    uint8_t dst_reg, dst_amode, dst_mask;
++    uint8_t tex_id;
++    uint8_t tex_swz[4];
++    uint16_t target;
++    VivSrc src[3];
++} VivInst;
++
++typedef struct VivProg {
++    VivInst inst[VIV_INST_MAX];
++    uint32_t start, end;
++    uint32_t ubase;             /* uniform base, in vec4s */
++} VivProg;
++
++typedef struct VivLevel {
++    uint32_t addr, w, h, stride;
++    VivSurf surf;
++    bool mapped;
++} VivLevel;
++
++typedef struct VivSampler {
++    bool used;
++    uint32_t cfg0, cfg1, lod_cfg;
++    uint32_t fmt, ext;
++    unsigned bpp, block;        /* bytes per texel, or per 4x4 block */
++    int layout;
++    uint32_t w, h;
++    VivLevel level[VIV_LEVELS];
++} VivSampler;
++
++typedef struct VivWin VivWin;
++
++typedef struct VivTri {
++    uint32_t v[3];
++} VivTri;
++
++typedef struct VivDraw {
++    VivGCState *s;
++    uint32_t *st;
++    VivProg vs, ps;
++    unsigned vs_inputs, vs_outputs, ps_inputs;
++    uint8_t vs_in_reg[16], vs_out_reg[VIV_OUTPUTS];
++    uint8_t ps_out_reg;
++    float vp_scale[3], vp_offset[3];
++    float centre;
++    int xmin, ymin, xmax, ymax;         /* scissor, max exclusive */
++    uint32_t cull;
++
++    /* render target */
++    VivSurf rt;
++    uint32_t rt_fmt, rt_stride, rt_mask;
++    unsigned rt_bpp;
++    int rt_layout;
++    /* depth / stencil */
++    bool zs;
++    VivSurf zb;
++    uint32_t z_cfg, z_stride;
++    int z_layout;
++    unsigned z_bpp;
++    float z_scale;
++
++    VivSampler smp[VIV_SAMPLERS];
++
++    /* the draw's triangles, in window space, for the rasteriser */
++    VivWin *win;
++    unsigned nwin, wincap;
++    VivTri *tri;
++    unsigned ntri, tricap;
++    uint64_t pixels;            /* bounding box area, roughly */
++} VivDraw;
++
++typedef struct VivVertex {
++    VivVec out[VIV_OUTPUTS];
++} VivVertex;
++
++/* A vertex in window space, varyings already divided by w. */
++struct VivWin {
++    float x, y, z, invw;
++    VivVec var[VIV_OUTPUTS];
++};
++
++typedef struct VivExec {
++    VivDraw *d;
++    const VivProg *p;
++    VivVec t[4][VIV_TEMPS];
++    int32_t a0[4][4];
++    uint8_t killed;
++} VivExec;
++
++static inline float fu(uint32_t u)
++{
++    union { uint32_t u; float f; } v = { .u = u };
++    return v.f;
++}
++
++static inline uint32_t uf(float f)
++{
++    union { float f; uint32_t u; } v = { .f = f };
++    return v.u;
++}
++
++static inline float fixp16(uint32_t v)
++{
++    return (int32_t)v / 65536.0f;
++}
++
++static inline float clampf(float v, float lo, float hi)
++{
++    return v < lo ? lo : v > hi ? hi : v;
++}
++
++static inline float sat(float v)
++{
++    return v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f;  /* NaN -> 0 */
++}
++
++/* ------------------------------------------------------------------ */
++/* Shader decode                                                      */
++
++static inline uint32_t ibits(const uint32_t w[4], unsigned lo, unsigned hi)
++{
++    uint64_t v;
++    unsigned word = lo / 32, n = hi - lo + 1;
++
++    v = w[word] | (word < 3 ? (uint64_t)w[word + 1] << 32 : 0);
++    return (v >> (lo % 32)) & ((1ull << n) - 1);
++}
++
++static float viv_half(uint16_t h)
++{
++    unsigned e = (h >> 10) & 31, m = h & 1023;
++    float v;
++
++    if (e == 0) {
++        v = ldexpf(m, -24);
++    } else if (e == 31) {
++        v = m ? NAN : INFINITY;
++    } else {
++        v = ldexpf(m | 1024, e - 25);
++    }
++    return h & 0x8000 ? -v : v;
++}
++
++static void viv_decode_src(const uint32_t w[4], unsigned n, VivSrc *src)
++{
++    static const unsigned use[3] = { 43, 70, 99 };
++    static const unsigned swz[3] = { 54, 81, 110 };
++    static const unsigned amode[3] = { 64, 91, 121 };
++    static const unsigned rgroup[3] = { 67, 96, 124 };
++    uint32_t sw;
++
++    src->use = ibits(w, use[n], use[n]);
++    src->reg = ibits(w, use[n] + 1, use[n] + 9);
++    sw = ibits(w, swz[n], swz[n] + 7);
++    src->neg = ibits(w, swz[n] + 8, swz[n] + 8);
++    src->abs = ibits(w, swz[n] + 9, swz[n] + 9);
++    src->amode = ibits(w, amode[n], amode[n] + 2);
++    src->rgroup = ibits(w, rgroup[n], rgroup[n] + 2);
++    for (int c = 0; c < 4; c++) {
++        src->swz[c] = (sw >> (2 * c)) & 3;
++    }
++    if (src->rgroup == RG_IMMEDIATE) {
++        uint32_t imm = (src->amode & 1) << 19 | src->abs << 18 |
++                       src->neg << 17 | sw << 9 | src->reg;
++
++        switch (src->amode >> 1) {
++        case 0:
++            src->imm = imm << 12;                   /* f20 */
++            break;
++        case 1:
++            src->imm = (uint32_t)((int32_t)(imm << 12) >> 12);   /* s20 */
++            break;
++        case 2:
++            src->imm = imm;                         /* u20 */
++            break;
++        default:
++            src->imm = uf(viv_half(imm));           /* f16 */
++            break;
++        }
++        src->neg = src->abs = false;
++    }
++}
++
++static void viv_decode(VivGCState *s, VivProg *p, uint32_t code,
++                       uint32_t start, uint32_t end, uint32_t ubase)
++{
++    p->start = MIN(start, VIV_INST_MAX);
++    p->end = MIN(end, VIV_INST_MAX);
++    p->ubase = ubase;
++    for (uint32_t pc = p->start; pc < p->end; pc++) {
++        const uint32_t *w = &s->states[code + pc * 4];
++        VivInst *in = &p->inst[pc];
++        uint32_t sw;
++
++        in->op = ibits(w, 0, 5) | ibits(w, 80, 80) << 6;
++        in->cond = ibits(w, 6, 10);
++        in->sat = ibits(w, 11, 11);
++        in->dst_use = ibits(w, 12, 12);
++        in->dst_amode = ibits(w, 13, 15);
++        in->dst_reg = ibits(w, 16, 22);
++        in->dst_mask = ibits(w, 23, 26);
++        in->tex_id = ibits(w, 27, 31);
++        sw = ibits(w, 35, 42);
++        for (int c = 0; c < 4; c++) {
++            in->tex_swz[c] = (sw >> (2 * c)) & 3;
++        }
++        in->type = ibits(w, 53, 53) << 2 | ibits(w, 94, 95);
++        in->target = ibits(w, 103, 117);
++        for (unsigned n = 0; n < 3; n++) {
++            viv_decode_src(w, n, &in->src[n]);
++        }
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Textures                                                           */
++
++static void viv_sampler_setup(VivDraw *d, unsigned unit)
++{
++    VivSampler *sm = &d->smp[unit];
++    uint32_t *st = d->st;
++    uint32_t halign;
++
++    sm->cfg0 = st[ST_TE_SAMPLER_CONFIG0 + unit];
++    sm->cfg1 = st[ST_TE_SAMPLER_CONFIG1 + unit];
++    sm->lod_cfg = st[ST_TE_SAMPLER_LOD_CONFIG + unit];
++    sm->fmt = (sm->cfg0 >> 13) & 0x1f;
++    sm->ext = sm->cfg1 & 0x3f;
++    sm->w = st[ST_TE_SAMPLER_SIZE + unit] & 0xffff;
++    sm->h = st[ST_TE_SAMPLER_SIZE + unit] >> 16;
++    sm->block = 0;
++    switch (sm->fmt) {
++    case 0x01 ... 0x03:                 /* A8, L8, I8 */
++        sm->bpp = 1;
++        break;
++    case 0x04 ... 0x06:                 /* A8L8, A4R4G4B4, X4R4G4B4 */
++    case 0x0b ... 0x10:                 /* 565, 1555, YUY2, UYVY, D16 */
++        sm->bpp = 2;
++        break;
++    case 0x13:                          /* DXT1 */
++    case 0x1e:                          /* ETC1 */
++        sm->bpp = 0;
++        sm->block = 8;
++        break;
++    case 0x14:
++    case 0x15:                          /* DXT3, DXT5 */
++        sm->bpp = 0;
++        sm->block = 16;
++        break;
++    default:
++        sm->bpp = 4;
++        break;
++    }
++    if (sm->ext) {
++        VIV_UNIMP(d->s, 1, "texture format ext 0x%x", sm->ext);
++    }
++    halign = (sm->cfg1 >> 26) & 7;
++    if (((sm->cfg0 >> 20) & 3) == 3) {
++        sm->layout = VIV_LINEAR;
++    } else if (halign == 2) {
++        sm->layout = VIV_SUPERTILED;
++    } else {
++        sm->layout = VIV_TILED;
++    }
++    for (unsigned l = 0; l < VIV_LEVELS; l++) {
++        VivLevel *lv = &sm->level[l];
++        uint32_t aw;
++
++        lv->w = MAX(sm->w >> l, 1);
++        lv->h = MAX(sm->h >> l, 1);
++        lv->addr = st[ST_TE_SAMPLER_LOD_ADDR + unit + 16 * l];
++        if (sm->block) {
++            lv->stride = DIV_ROUND_UP(lv->w, 4) * sm->block;
++        } else if (sm->layout == VIV_LINEAR) {
++            lv->stride = st[ST_TE_SAMPLER_LINEAR_STRIDE + unit + 16 * l];
++        } else {
++            aw = ROUND_UP(lv->w, sm->layout == VIV_SUPERTILED ? 64 :
++                                 halign == 1 ? 16 : 4);
++            lv->stride = aw * sm->bpp;
++        }
++        lv->mapped = false;
++    }
++    sm->used = true;
++}
++
++static VivLevel *viv_level(VivDraw *d, VivSampler *sm, unsigned l)
++{
++    VivLevel *lv = &sm->level[l];
++
++    if (!lv->mapped) {
++        uint32_t size;
++
++        if (sm->block) {
++            size = DIV_ROUND_UP(lv->h, 4) * lv->stride;
++        } else if (sm->layout == VIV_SUPERTILED) {
++            size = ROUND_UP(lv->h, 64) * lv->stride;
++        } else if (sm->layout == VIV_TILED) {
++            size = ROUND_UP(lv->h, 4) * lv->stride;
++        } else {
++            size = lv->h * lv->stride;
++        }
++        viv_surf_init(&lv->surf, d->s, lv->addr, MIN(size, 64 * MiB),
++                      false, false);
++        lv->mapped = true;
++    }
++    return lv;
++}
++
++static inline float u8f(uint32_t v)
++{
++    return (v & 0xff) * (1.0f / 255.0f);
++}
++
++/* ETC1: two 2x4 (or 4x2, flipped) halves, a base colour and table each. */
++static void viv_etc1_texel(const uint8_t *b, unsigned px, unsigned py,
++                           float out[4])
++{
++    static const int mod[8][2] = {
++        { 2, 8 }, { 5, 17 }, { 9, 29 }, { 13, 42 },
++        { 18, 60 }, { 24, 80 }, { 33, 106 }, { 47, 183 },
++    };
++    uint64_t v = ldq_be_p(b);
++    bool diff = v >> 33 & 1, flip = v >> 32 & 1;
++    unsigned sub = flip ? py >= 2 : px >= 2;
++    unsigned table = (v >> (sub ? 34 : 37)) & 7;
++    unsigned bit = px * 4 + py;
++    unsigned idx = (v >> bit & 1) | (v >> (bit + 16) & 1) << 1;
++    int m = idx & 1 ? mod[table][1] : mod[table][0];
++
++    if (idx & 2) {
++        m = -m;
++    }
++    for (int c = 0; c < 3; c++) {
++        unsigned shift = 59 - c * 8;
++        int base;
++
++        if (diff) {
++            int b5 = (v >> shift) & 31;
++            int d3 = (v >> (shift - 3)) & 7;
++
++            if (sub) {
++                b5 += d3 & 4 ? d3 - 8 : d3;
++            }
++            base = (b5 << 3) | (b5 >> 2);
++        } else {
++            base = ((v >> (sub ? shift - 4 + 1 : shift + 1)) & 15) * 17;
++        }
++        out[c] = clampf(base + m, 0, 255) * (1.0f / 255.0f);
++    }
++    out[3] = 1.0f;
++}
++
++static void viv_dxt_colour(const uint8_t *b, unsigned px, unsigned py,
++                           bool dxt1, float out[4])
++{
++    uint16_t c0 = lduw_le_p(b), c1 = lduw_le_p(b + 2);
++    unsigned idx = (ldl_le_p(b + 4) >> ((py * 4 + px) * 2)) & 3;
++    float c[4][4];
++
++    for (int i = 0; i < 2; i++) {
++        uint16_t v = i ? c1 : c0;
++        c[i][0] = ((v >> 11) & 31) / 31.0f;
++        c[i][1] = ((v >> 5) & 63) / 63.0f;
++        c[i][2] = (v & 31) / 31.0f;
++        c[i][3] = 1.0f;
++    }
++    for (int k = 0; k < 4; k++) {
++        if (c0 > c1 || !dxt1) {
++            c[2][k] = (2 * c[0][k] + c[1][k]) / 3;
++            c[3][k] = (c[0][k] + 2 * c[1][k]) / 3;
++        } else {
++            c[2][k] = (c[0][k] + c[1][k]) / 2;
++            c[3][k] = 0.0f;
++        }
++    }
++    memcpy(out, c[idx], sizeof(c[idx]));
++}
++
++/* One texel of a level, as RGBA. */
++static void viv_texel(VivDraw *d, VivSampler *sm, VivLevel *lv, int x, int y,
++                      float out[4])
++{
++    uint32_t off, v;
++    const uint8_t *p;
++
++    if (sm->block) {
++        off = (y / 4) * lv->stride + (x / 4) * sm->block;
++    } else {
++        off = viv_pixel_offset(sm->layout, lv->stride, sm->bpp, x, y);
++    }
++    p = viv_surf_ptr(&lv->surf, off);
++    if (!p) {
++        out[0] = out[1] = out[2] = out[3] = 0.0f;
++        return;
++    }
++    switch (sm->fmt) {
++    case 0x01:                                  /* A8 */
++        out[0] = out[1] = out[2] = 0.0f;
++        out[3] = u8f(p[0]);
++        return;
++    case 0x02:                                  /* L8 */
++        out[0] = out[1] = out[2] = u8f(p[0]);
++        out[3] = 1.0f;
++        return;
++    case 0x03:                                  /* I8 */
++        out[0] = out[1] = out[2] = out[3] = u8f(p[0]);
++        return;
++    case 0x04:                                  /* A8L8 */
++        out[0] = out[1] = out[2] = u8f(p[0]);
++        out[3] = u8f(p[1]);
++        return;
++    case 0x05:
++    case 0x06:                                  /* A4R4G4B4, X4R4G4B4 */
++        v = lduw_le_p(p);
++        out[0] = ((v >> 8) & 15) / 15.0f;
++        out[1] = ((v >> 4) & 15) / 15.0f;
++        out[2] = (v & 15) / 15.0f;
++        out[3] = sm->fmt == 0x05 ? (v >> 12) / 15.0f : 1.0f;
++        return;
++    case 0x07:
++    case 0x08:                                  /* A8R8G8B8, X8R8G8B8 */
++        v = ldl_le_p(p);
++        out[0] = u8f(v >> 16);
++        out[1] = u8f(v >> 8);
++        out[2] = u8f(v);
++        out[3] = sm->fmt == 0x07 ? u8f(v >> 24) : 1.0f;
++        return;
++    case 0x09:
++    case 0x0a:                                  /* A8B8G8R8, X8B8G8R8 */
++        v = ldl_le_p(p);
++        out[0] = u8f(v);
++        out[1] = u8f(v >> 8);
++        out[2] = u8f(v >> 16);
++        out[3] = sm->fmt == 0x09 ? u8f(v >> 24) : 1.0f;
++        return;
++    case 0x0b:                                  /* R5G6B5 */
++        v = lduw_le_p(p);
++        out[0] = (v >> 11) / 31.0f;
++        out[1] = ((v >> 5) & 63) / 63.0f;
++        out[2] = (v & 31) / 31.0f;
++        out[3] = 1.0f;
++        return;
++    case 0x0c:
++    case 0x0d:                                  /* A1R5G5B5, X1R5G5B5 */
++        v = lduw_le_p(p);
++        out[0] = ((v >> 10) & 31) / 31.0f;
++        out[1] = ((v >> 5) & 31) / 31.0f;
++        out[2] = (v & 31) / 31.0f;
++        out[3] = sm->fmt == 0x0c ? (float)(v >> 15) : 1.0f;
++        return;
++    case 0x10:                                  /* D16 */
++        out[0] = out[1] = out[2] = lduw_le_p(p) / 65535.0f;
++        out[3] = 1.0f;
++        return;
++    case 0x11:                                  /* D24X8 */
++        out[0] = out[1] = out[2] = (ldl_le_p(p) >> 8) / 16777215.0f;
++        out[3] = 1.0f;
++        return;
++    case 0x13:                                  /* DXT1 */
++        viv_dxt_colour(p, x & 3, y & 3, true, out);
++        return;
++    case 0x14:                                  /* DXT3 */
++        viv_dxt_colour(p + 8, x & 3, y & 3, false, out);
++        out[3] = ((lduw_le_p(p + (y & 3) * 2) >> ((x & 3) * 4)) & 15) / 15.0f;
++        return;
++    case 0x15: {                                /* DXT5 */
++        uint64_t a = ldq_le_p(p);
++        unsigned a0 = a & 0xff, a1 = (a >> 8) & 0xff;
++        unsigned i = (a >> (16 + ((y & 3) * 4 + (x & 3)) * 3)) & 7;
++        float al;
++
++        viv_dxt_colour(p + 8, x & 3, y & 3, false, out);
++        if (i == 0) {
++            al = a0;
++        } else if (i == 1) {
++            al = a1;
++        } else if (a0 > a1) {
++            al = ((8 - i) * a0 + (i - 1) * a1) / 7.0f;
++        } else if (i < 6) {
++            al = ((6 - i) * a0 + (i - 1) * a1) / 5.0f;
++        } else {
++            al = i == 6 ? 0 : 255;
++        }
++        out[3] = al / 255.0f;
++        return;
++    }
++    case 0x1e:                                  /* ETC1 */
++        viv_etc1_texel(p, x & 3, y & 3, out);
++        return;
++    default:
++        VIV_UNIMP(d->s, 2, "texture format 0x%x", sm->fmt);
++        out[0] = out[1] = out[2] = 0.5f;
++        out[3] = 1.0f;
++        return;
++    }
++}
++
++/* A texel coordinate wrapped as the sampler says; -1 = the border. */
++static int viv_wrap(unsigned mode, int i, int n)
++{
++    switch (mode) {
++    case 0:                                     /* repeat */
++        i %= n;
++        return i < 0 ? i + n : i;
++    case 1: {                                   /* mirrored repeat */
++        int p = 2 * n;
++        i %= p;
++        if (i < 0) {
++            i += p;
++        }
++        return i < n ? i : p - 1 - i;
++    }
++    case 3:                                     /* border */
++        return i < 0 || i >= n ? -1 : i;
++    default:                                    /* clamp to edge */
++        return i < 0 ? 0 : i >= n ? n - 1 : i;
++    }
++}
++
++static void viv_fetch_wrapped(VivDraw *d, VivSampler *sm, VivLevel *lv,
++                              int x, int y, float out[4])
++{
++    x = viv_wrap((sm->cfg0 >> 3) & 3, x, lv->w);
++    y = viv_wrap((sm->cfg0 >> 5) & 3, y, lv->h);
++    if (x < 0 || y < 0) {
++        out[0] = out[1] = out[2] = out[3] = 0.0f;
++        return;
++    }
++    viv_texel(d, sm, lv, x, y, out);
++}
++
++static void viv_sample_level(VivDraw *d, VivSampler *sm, unsigned l,
++                             bool linear, float u, float v, float out[4])
++{
++    VivLevel *lv = viv_level(d, sm, l);
++    float x = u * lv->w, y = v * lv->h;
++
++    if (!linear) {
++        viv_fetch_wrapped(d, sm, lv, (int)floorf(x), (int)floorf(y), out);
++        return;
++    }
++    x -= 0.5f;
++    y -= 0.5f;
++    {
++        int x0 = (int)floorf(x), y0 = (int)floorf(y);
++        float fx = x - x0, fy = y - y0;
++        float t[4][4];
++
++        viv_fetch_wrapped(d, sm, lv, x0, y0, t[0]);
++        viv_fetch_wrapped(d, sm, lv, x0 + 1, y0, t[1]);
++        viv_fetch_wrapped(d, sm, lv, x0, y0 + 1, t[2]);
++        viv_fetch_wrapped(d, sm, lv, x0 + 1, y0 + 1, t[3]);
++        for (int c = 0; c < 4; c++) {
++            float a = t[0][c] + (t[1][c] - t[0][c]) * fx;
++            float b = t[2][c] + (t[3][c] - t[2][c]) * fx;
++            out[c] = a + (b - a) * fy;
++        }
++    }
++}
++
++/*
++ * Sample texture unit @unit at (u, v) with level of detail @lod (log2 of
++ * texels per pixel), as its filters, mip mode and LOD clamps say.
++ */
++static void viv_sample(VivDraw *d, unsigned unit, float u, float v, float lod,
++                       float out[4])
++{
++    VivSampler *sm;
++    uint32_t cfg;
++    unsigned min, mip, mag, maxl;
++    float lmin, lmax;
++
++    if (unit >= VIV_SAMPLERS) {
++        out[0] = out[1] = out[2] = 0.0f;
++        out[3] = 1.0f;
++        return;
++    }
++    sm = &d->smp[unit];
++    if (!sm->used) {
++        viv_sampler_setup(d, unit);
++    }
++    cfg = sm->cfg0;
++    min = (cfg >> 7) & 3;
++    mip = (cfg >> 9) & 3;
++    mag = (cfg >> 11) & 3;
++    if (!sm->w || !sm->h || !sm->level[0].addr) {
++        out[0] = out[1] = out[2] = 0.0f;
++        out[3] = 1.0f;
++        return;
++    }
++    if (sm->lod_cfg & 1) {
++        lod += ((int32_t)(sm->lod_cfg << 1) >> 22) / 32.0f; /* bias, s5.5 */
++    }
++    if (lod <= 0.0f || mip == 0) {
++        viv_sample_level(d, sm, 0, (lod <= 0.0f ? mag : min) == 2, u, v, out);
++        return;
++    }
++    lmax = ((sm->lod_cfg >> 1) & 0x3ff) / 32.0f;
++    lmin = ((sm->lod_cfg >> 11) & 0x3ff) / 32.0f;
++    lod = clampf(lod, lmin, lmax);
++    maxl = VIV_LEVELS - 1;
++    while (maxl && !sm->level[maxl].addr) {
++        maxl--;
++    }
++    if (mip == 1) {                             /* nearest level */
++        unsigned l = MIN((unsigned)(lod + 0.5f), maxl);
++        viv_sample_level(d, sm, l, min == 2, u, v, out);
++    } else {                                    /* between two levels */
++        unsigned l0 = MIN((unsigned)lod, maxl), l1 = MIN(l0 + 1, maxl);
++        float f = lod - (unsigned)lod, o1[4];
++
++        viv_sample_level(d, sm, l0, min == 2, u, v, out);
++        viv_sample_level(d, sm, l1, min == 2, u, v, o1);
++        for (int c = 0; c < 4; c++) {
++            out[c] += (o1[c] - out[c]) * f;
++        }
++    }
++}
++
++static void viv_samplers_release(VivDraw *d)
++{
++    for (unsigned i = 0; i < VIV_SAMPLERS; i++) {
++        for (unsigned l = 0; l < VIV_LEVELS; l++) {
++            if (d->smp[i].level[l].mapped) {
++                viv_surf_release(&d->smp[i].level[l].surf);
++                d->smp[i].level[l].mapped = false;
++            }
++        }
++        d->smp[i].used = false;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Shader interpreter                                                 */
++
++static void viv_read_src(VivExec *e, const VivSrc *src, bool is_float,
++                         int lane, VivVec *out)
++{
++    VivDraw *d = e->d;
++    VivVec v;
++    int32_t idx = src->reg;
++
++    if (src->rgroup == RG_IMMEDIATE) {
++        for (int c = 0; c < 4; c++) {
++            out->u[c] = src->imm;
++        }
++        return;
++    }
++    if (src->amode) {
++        idx += e->a0[lane][src->amode - 1];
++    }
++    switch (src->rgroup) {
++    case RG_TEMP:
++        v = e->t[lane][idx & (VIV_TEMPS - 1)];
++        break;
++    case RG_UNIFORM0:
++    case RG_UNIFORM1: {
++        uint32_t u = (e->p->ubase + (uint32_t)idx +
++                      (src->rgroup == RG_UNIFORM1 ? 128 : 0)) & 0x3ff;
++        memcpy(v.u, &d->st[ST_SH_UNIFORMS + u * 4], sizeof(v.u));
++        break;
++    }
++    case RG_INTERNAL:
++        /* i0: front facing */
++        v.f[0] = v.f[1] = v.f[2] = v.f[3] = 1.0f;
++        break;
++    default:
++        VIV_UNIMP(d->s, 3, "shader register group %u", src->rgroup);
++        memset(&v, 0, sizeof(v));
++        break;
++    }
++    for (int c = 0; c < 4; c++) {
++        out->u[c] = v.u[src->swz[c]];
++        if (is_float) {
++            if (src->abs) {
++                out->u[c] &= 0x7fffffffu;
++            }
++            if (src->neg) {
++                out->u[c] ^= 0x80000000u;
++            }
++        } else {
++            if (src->abs && out->i[c] < 0) {
++                out->i[c] = -out->i[c];
++            }
++            if (src->neg) {
++                out->i[c] = -out->i[c];
++            }
++        }
++    }
++}
++
++static bool viv_cond_f(unsigned cond, float a, float b)
++{
++    switch (cond) {
++    case 0:  return true;
++    case 1:  return a > b;
++    case 2:  return a < b;
++    case 3:  return a >= b;
++    case 4:  return a <= b;
++    case 5:  return a == b;
++    case 6:  return a != b;
++    case 7:  return a != 0.0f && b != 0.0f;
++    case 8:  return a != 0.0f || b != 0.0f;
++    case 9:  return (a != 0.0f) != (b != 0.0f);
++    case 10: return a == 0.0f;
++    case 11: return a != 0.0f;
++    case 12: return a >= 0.0f;
++    case 13: return a > 0.0f;
++    case 14: return a <= 0.0f;
++    case 15: return a < 0.0f;
++    default: return false;
++    }
++}
++
++static bool viv_cond_i(unsigned cond, bool is_signed, uint32_t a, uint32_t b)
++{
++    int64_t x = is_signed ? (int64_t)(int32_t)a : a;
++    int64_t y = is_signed ? (int64_t)(int32_t)b : b;
++
++    switch (cond) {
++    case 0:  return true;
++    case 1:  return x > y;
++    case 2:  return x < y;
++    case 3:  return x >= y;
++    case 4:  return x <= y;
++    case 5:  return x == y;
++    case 6:  return x != y;
++    case 7:  return a && b;
++    case 8:  return a || b;
++    case 9:  return !a != !b;
++    case 10: return !a;
++    case 11: return a != 0;
++    case 12: return x >= 0;
++    case 13: return x > 0;
++    case 14: return x <= 0;
++    case 15: return x < 0;
++    default: return false;
++    }
++}
++
++static inline bool viv_is_float(const VivInst *in)
++{
++    return in->type == TYPE_F32 || in->type == 4;   /* f32, f16 */
++}
++
++static bool viv_cond(const VivInst *in, const VivVec *a, const VivVec *b,
++                     int c)
++{
++    if (viv_is_float(in)) {
++        return viv_cond_f(in->cond, a->f[c], b->f[c]);
++    }
++    return viv_cond_i(in->cond, in->type != 6 && in->type != 3 &&
++                      in->type != 7, a->u[c], b->u[c]);
++}
++
++/* Texture instruction, all lanes at once (the LOD needs the quad). */
++static void viv_exec_tex(VivExec *e, const VivInst *in, VivVec src[4][3],
++                         VivVec res[4])
++{
++    VivSampler *sm = &e->d->smp[MIN(in->tex_id, VIV_SAMPLERS - 1)];
++    float lod = 0.0f;
++
++    if (in->tex_id < VIV_SAMPLERS && !sm->used) {
++        viv_sampler_setup(e->d, in->tex_id);
++    }
++    if (in->op == OP_TEXLDL) {
++        lod = src[0][0].f[3];
++    } else {
++        /* From the quad's spread in texels: lanes 0 1 / 2 3. */
++        float w = sm->w, h = sm->h;
++        float dux = (src[1][0].f[0] - src[0][0].f[0]) * w;
++        float dvx = (src[1][0].f[1] - src[0][0].f[1]) * h;
++        float duy = (src[2][0].f[0] - src[0][0].f[0]) * w;
++        float dvy = (src[2][0].f[1] - src[0][0].f[1]) * h;
++        float rho = MAX(dux * dux + dvx * dvx, duy * duy + dvy * dvy);
++
++        lod = rho > 0.0f ? 0.5f * log2f(rho) : -16.0f;
++        if (in->op == OP_TEXLDB) {
++            lod += src[0][0].f[3];
++        }
++    }
++    for (int l = 0; l < 4; l++) {
++        float t[4];
++
++        viv_sample(e->d, in->tex_id, src[l][0].f[0], src[l][0].f[1], lod, t);
++        for (int c = 0; c < 4; c++) {
++            res[l].f[c] = t[in->tex_swz[c]];
++        }
++    }
++}
++
++static void viv_exec_alu(VivExec *e, const VivInst *in, uint8_t mask)
++{
++    VivVec src[4][3], res[4];
++    bool isf = viv_is_float(in);
++    bool sgn = in->type != TYPE_U32;
++
++    for (int l = 0; l < 4; l++) {
++        for (int n = 0; n < 3; n++) {
++            if (in->src[n].use) {
++                viv_read_src(e, &in->src[n], isf, l, &src[l][n]);
++            } else {
++                memset(&src[l][n], 0, sizeof(VivVec));
++            }
++        }
++    }
++
++    switch (in->op) {
++    case OP_TEXLD:
++    case OP_TEXLDB:
++    case OP_TEXLDL:
++    case OP_TEXLDD:
++        viv_exec_tex(e, in, src, res);
++        goto write;
++    case OP_TEXKILL:
++        for (int l = 0; l < 4; l++) {
++            if (!(mask & (1 << l))) {
++                continue;
++            }
++            if (!in->src[0].use) {
++                e->killed |= 1 << l;
++                continue;
++            }
++            for (int c = 0; c < 4; c++) {
++                if (viv_cond(in, &src[l][0], &src[l][1], c)) {
++                    e->killed |= 1 << l;
++                }
++            }
++        }
++        return;
++    case OP_DSX:
++    case OP_DSY:
++        for (int l = 0; l < 4; l++) {
++            int a = in->op == OP_DSX ? l & ~1 : l & ~2;
++            int b = in->op == OP_DSX ? l | 1 : l | 2;
++            for (int c = 0; c < 4; c++) {
++                res[l].f[c] = src[b][0].f[c] - src[a][0].f[c];
++            }
++        }
++        goto write;
++    default:
++        break;
++    }
++
++    for (int l = 0; l < 4; l++) {
++        VivVec *a = &src[l][0], *b = &src[l][1], *c2 = &src[l][2];
++        VivVec *r = &res[l];
++        float x;
++
++        if (!(mask & (1 << l))) {
++            continue;
++        }
++        switch (in->op) {
++        case OP_NOP:
++            continue;
++        case OP_ADD:
++            for (int c = 0; c < 4; c++) {
++                if (isf) {
++                    r->f[c] = a->f[c] + c2->f[c];
++                } else {
++                    r->u[c] = a->u[c] + c2->u[c];
++                }
++            }
++            break;
++        case OP_MAD:
++            for (int c = 0; c < 4; c++) {
++                if (isf) {
++                    r->f[c] = a->f[c] * b->f[c] + c2->f[c];
++                } else {
++                    r->u[c] = a->u[c] * b->u[c] + c2->u[c];
++                }
++            }
++            break;
++        case OP_MUL:
++        case OP_IMULLO0:
++            for (int c = 0; c < 4; c++) {
++                if (isf && in->op == OP_MUL) {
++                    r->f[c] = a->f[c] * b->f[c];
++                } else {
++                    r->u[c] = a->u[c] * b->u[c];
++                }
++            }
++            break;
++        case OP_DP2:
++        case OP_DP3:
++        case OP_DP4:
++            x = a->f[0] * b->f[0] + a->f[1] * b->f[1];
++            if (in->op != OP_DP2) {
++                x += a->f[2] * b->f[2];
++            }
++            if (in->op == OP_DP4) {
++                x += a->f[3] * b->f[3];
++            }
++            r->f[0] = r->f[1] = r->f[2] = r->f[3] = x;
++            break;
++        case OP_MOV:
++            *r = *c2;
++            break;
++        case OP_MOVAR:
++            for (int c = 0; c < 4; c++) {
++                if (in->dst_mask & (1 << c)) {
++                    e->a0[l][c] = isf ? (int32_t)c2->f[c] : c2->i[c];
++                }
++            }
++            continue;
++        case OP_RCP:
++            x = 1.0f / c2->f[0];
++            goto scalar;
++        case OP_RSQ:
++            x = 1.0f / sqrtf(c2->f[0]);
++            goto scalar;
++        case OP_SQRT:
++            x = sqrtf(c2->f[0]);
++            goto scalar;
++        case OP_EXP:
++            x = exp2f(c2->f[0]);
++            goto scalar;
++        case OP_LOG:
++            x = log2f(c2->f[0]);
++            goto scalar;
++        case OP_SIN:
++            x = sinf(c2->f[0] * (float)M_PI_2);
++            goto scalar;
++        case OP_COS:
++            x = cosf(c2->f[0] * (float)M_PI_2);
++            goto scalar;
++        case OP_DIV:
++            x = b->f[0] / c2->f[0];
++        scalar:
++            r->f[0] = r->f[1] = r->f[2] = r->f[3] = x;
++            break;
++        case OP_SELECT:
++            for (int c = 0; c < 4; c++) {
++                r->u[c] = viv_cond(in, a, b, c) ? b->u[c] : c2->u[c];
++            }
++            break;
++        case OP_SET:
++            for (int c = 0; c < 4; c++) {
++                bool t = viv_cond(in, a, b, c);
++                r->u[c] = isf ? uf(t ? 1.0f : 0.0f) : (t ? 1 : 0);
++            }
++            break;
++        case OP_CMP:
++            for (int c = 0; c < 4; c++) {
++                r->u[c] = viv_cond(in, a, b, c) ? c2->u[c] : 0;
++            }
++            break;
++        case OP_FRC:
++            for (int c = 0; c < 4; c++) {
++                r->f[c] = c2->f[c] - floorf(c2->f[c]);
++            }
++            break;
++        case OP_FLOOR:
++            for (int c = 0; c < 4; c++) {
++                r->f[c] = floorf(c2->f[c]);
++            }
++            break;
++        case OP_CEIL:
++            for (int c = 0; c < 4; c++) {
++                r->f[c] = ceilf(c2->f[c]);
++            }
++            break;
++        case OP_SIGN:
++            for (int c = 0; c < 4; c++) {
++                if (isf) {
++                    r->f[c] = c2->f[c] > 0 ? 1.0f : c2->f[c] < 0 ? -1.0f : 0;
++                } else {
++                    r->i[c] = c2->i[c] > 0 ? 1 : c2->i[c] < 0 ? -1 : 0;
++                }
++            }
++            break;
++        case OP_I2F:
++            for (int c = 0; c < 4; c++) {
++                r->f[c] = sgn ? (float)a->i[c] : (float)a->u[c];
++            }
++            break;
++        case OP_F2I:
++        case OP_F2IRND:
++            for (int c = 0; c < 4; c++) {
++                float f = in->op == OP_F2IRND ? rintf(a->f[c]) : a->f[c];
++                if (sgn) {
++                    r->i[c] = (int32_t)clampf(f, -2147483648.0f,
++                                              2147483520.0f);
++                } else {
++                    r->u[c] = (uint32_t)clampf(f, 0.0f, 4294967040.0f);
++                }
++            }
++            break;
++        case OP_AND:
++        case OP_OR:
++        case OP_XOR:
++        case OP_LSHIFT:
++        case OP_RSHIFT:
++            for (int c = 0; c < 4; c++) {
++                uint32_t p = a->u[c], q = c2->u[c];
++                switch (in->op) {
++                case OP_AND: r->u[c] = p & q; break;
++                case OP_OR: r->u[c] = p | q; break;
++                case OP_XOR: r->u[c] = p ^ q; break;
++                case OP_LSHIFT: r->u[c] = p << (q & 31); break;
++                default:
++                    r->u[c] = sgn ? (uint32_t)(a->i[c] >> (q & 31))
++                                  : p >> (q & 31);
++                    break;
++                }
++            }
++            break;
++        case OP_NOT:
++            for (int c = 0; c < 4; c++) {
++                r->u[c] = ~c2->u[c];
++            }
++            break;
++        default:
++            VIV_UNIMP(e->d->s, 4, "shader opcode 0x%02x", in->op);
++            memset(r, 0, sizeof(*r));
++            break;
++        }
++    }
++
++write:
++    if (!in->dst_use || in->op == OP_MOVAR || in->op == OP_NOP) {
++        return;
++    }
++    for (int l = 0; l < 4; l++) {
++        int reg = in->dst_reg;
++        VivVec *t;
++
++        if (!(mask & (1 << l))) {
++            continue;
++        }
++        if (in->dst_amode) {
++            reg += e->a0[l][in->dst_amode - 1];
++        }
++        t = &e->t[l][reg & (VIV_TEMPS - 1)];
++        for (int c = 0; c < 4; c++) {
++            if (in->dst_mask & (1 << c)) {
++                t->u[c] = res[l].u[c];
++                if (in->sat && isf) {
++                    t->f[c] = sat(t->f[c]);
++                }
++            }
++        }
++    }
++}
++
++/* Lanes of @mask for which a control-flow instruction's condition holds. */
++static uint8_t viv_cf_lanes(VivExec *e, const VivInst *in, uint8_t mask)
++{
++    uint8_t taken = 0;
++
++    if (!in->cond) {
++        return mask;
++    }
++    for (int l = 0; l < 4; l++) {
++        VivVec a = {}, b = {};
++
++        if (!(mask & (1 << l))) {
++            continue;
++        }
++        if (in->src[0].use) {
++            viv_read_src(e, &in->src[0], viv_is_float(in), l, &a);
++        }
++        if (in->src[1].use) {
++            viv_read_src(e, &in->src[1], viv_is_float(in), l, &b);
++        }
++        if (viv_cond(in, &a, &b, 0)) {
++            taken |= 1 << l;
++        }
++    }
++    return taken;
++}
++
++#define VIV_CALL_DEPTH 8
++
++static void viv_exec(VivExec *e, uint32_t pc, uint8_t mask,
++                     const uint16_t *stack_in, int sp)
++{
++    const VivProg *p = e->p;
++    uint16_t stack[VIV_CALL_DEPTH];
++    unsigned steps = 0;
++
++    memcpy(stack, stack_in, sizeof(stack));
++    while (pc >= p->start && pc < p->end && steps++ < 65536) {
++        const VivInst *in = &p->inst[pc];
++        uint8_t taken;
++
++        mask &= ~e->killed;
++        if (!mask) {
++            return;
++        }
++        switch (in->op) {
++        case OP_BRANCH:
++            taken = viv_cf_lanes(e, in, mask);
++            if (taken == mask) {
++                pc = in->target;
++                continue;
++            }
++            if (taken) {
++                viv_exec(e, in->target, taken, stack, sp);
++                mask &= ~taken;
++            }
++            pc++;
++            continue;
++        case OP_CALL:
++            if (sp == VIV_CALL_DEPTH) {
++                return;
++            }
++            stack[sp++] = pc + 1;
++            pc = in->target;
++            continue;
++        case OP_RET:
++            if (!sp) {
++                return;
++            }
++            pc = stack[--sp];
++            continue;
++        default:
++            viv_exec_alu(e, in, mask);
++            pc++;
++            continue;
++        }
++    }
++}
++
++static void viv_run(VivExec *e, const VivProg *p, uint8_t mask)
++{
++    static const uint16_t stack[VIV_CALL_DEPTH];
++
++    e->p = p;
++    e->killed = 0;
++    memset(e->a0, 0, sizeof(e->a0));
++    viv_exec(e, p->start, mask, stack, 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* Vertex fetch and shading                                           */
++
++static float viv_attr(uint32_t type, bool norm, const uint8_t *p, int c)
++{
++    switch (type) {
++    case 0x0:                                   /* byte */
++        return norm ? MAX((int8_t)p[c] / 127.0f, -1.0f) : (int8_t)p[c];
++    case 0x1:                                   /* unsigned byte */
++        return norm ? p[c] / 255.0f : p[c];
++    case 0x2: {                                 /* short */
++        int16_t v = lduw_le_p(p + 2 * c);
++        return norm ? MAX(v / 32767.0f, -1.0f) : v;
++    }
++    case 0x3: {                                 /* unsigned short */
++        uint16_t v = lduw_le_p(p + 2 * c);
++        return norm ? v / 65535.0f : v;
++    }
++    case 0x4: {                                 /* int */
++        int32_t v = ldl_le_p(p + 4 * c);
++        return norm ? MAX(v / 2147483647.0f, -1.0f) : v;
++    }
++    case 0x5: {                                 /* unsigned int */
++        uint32_t v = ldl_le_p(p + 4 * c);
++        return norm ? v / 4294967295.0f : v;
++    }
++    case 0x9:                                   /* half float */
++        return viv_half(lduw_le_p(p + 2 * c));
++    case 0xb:                                   /* 16.16 fixed */
++        return (int32_t)ldl_le_p(p + 4 * c) / 65536.0f;
++    default:                                    /* float */
++        return fu(ldl_le_p(p + 4 * c));
++    }
++}
++
++static void viv_fetch_vertex(VivDraw *d, uint32_t index, VivVec *temps)
++{
++    uint32_t *st = d->st;
++
++    for (unsigned i = 0; i < d->vs_inputs; i++) {
++        uint32_t cfg = st[ST_FE_VERTEX_ELEMENT_CONFIG + i];
++        uint32_t stream = VE_STREAM(cfg), base, stride;
++        unsigned n = VE_NUM(cfg) ? VE_NUM(cfg) : 4;
++        unsigned size = MIN(VE_END(cfg) - VE_START(cfg), 16u);
++        uint32_t type = VE_TYPE(cfg);
++        bool norm = VE_NORMALIZE(cfg) == 2;
++        uint8_t buf[16] = {};
++        VivVec *t = &temps[d->vs_in_reg[i] & (VIV_TEMPS - 1)];
++
++        if (stream == 0) {
++            base = st[ST_FE_VERTEX_STREAM_BASE_ADDR];
++            stride = st[ST_FE_VERTEX_STREAM_CONTROL] & 0xff;
++        } else {
++            base = st[ST_FE_VERTEX_STREAMS_BASE_ADDR + (stream & 7)];
++            stride = st[ST_FE_VERTEX_STREAMS_CONTROL + (stream & 7)] & 0xff;
++        }
++        viv_dma(d->s, base + index * stride + VE_START(cfg), buf, size, false);
++        t->f[0] = t->f[1] = t->f[2] = 0.0f;
++        t->f[3] = 1.0f;
++        for (unsigned c = 0; c < n; c++) {
++            t->f[c] = viv_attr(type, norm, buf, c);
++        }
++    }
++}
++
++static uint32_t viv_index(VivDraw *d, bool indexed, uint32_t first,
++                          uint32_t i, uint32_t offset)
++{
++    uint32_t ctl = d->st[ST_FE_INDEX_STREAM_CONTROL];
++    uint32_t base = d->st[ST_FE_INDEX_STREAM_BASE_ADDR];
++    uint8_t b[4] = {};
++
++    if (!indexed) {
++        return first + i;
++    }
++    switch (ctl & 3) {
++    case 0:
++        viv_dma(d->s, base + first + i, b, 1, false);
++        return b[0] + offset;
++    case 1:
++        viv_dma(d->s, base + (first + i) * 2, b, 2, false);
++        return lduw_le_p(b) + offset;
++    default:
++        viv_dma(d->s, base + (first + i) * 4, b, 4, false);
++        return ldl_le_p(b) + offset;
++    }
++}
++
++/* Run the vertex shader on up to four vertices at once. */
++static void viv_shade_vertices(VivDraw *d, VivExec *e, const uint32_t *index,
++                               unsigned n, VivVertex *out)
++{
++    memset(e->t, 0, sizeof(e->t));
++    for (unsigned l = 0; l < n; l++) {
++        viv_fetch_vertex(d, index[l], e->t[l]);
++    }
++    viv_run(e, &d->vs, (1 << n) - 1);
++    for (unsigned l = 0; l < n; l++) {
++        for (unsigned o = 0; o < d->vs_outputs; o++) {
++            out[l].out[o] = e->t[l][d->vs_out_reg[o] & (VIV_TEMPS - 1)];
++        }
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Pixel engine                                                       */
++
++static void viv_rt_read(VivDraw *d, const uint8_t *p, float c[4])
++{
++    uint32_t v;
++
++    switch (d->rt_fmt) {
++    case 0x0:
++    case 0x1:
++        v = lduw_le_p(p);
++        c[0] = ((v >> 8) & 15) / 15.0f;
++        c[1] = ((v >> 4) & 15) / 15.0f;
++        c[2] = (v & 15) / 15.0f;
++        c[3] = d->rt_fmt ? (v >> 12) / 15.0f : 1.0f;
++        break;
++    case 0x2:
++    case 0x3:
++        v = lduw_le_p(p);
++        c[0] = ((v >> 10) & 31) / 31.0f;
++        c[1] = ((v >> 5) & 31) / 31.0f;
++        c[2] = (v & 31) / 31.0f;
++        c[3] = d->rt_fmt == 3 ? (float)(v >> 15) : 1.0f;
++        break;
++    case 0x4:
++        v = lduw_le_p(p);
++        c[0] = (v >> 11) / 31.0f;
++        c[1] = ((v >> 5) & 63) / 63.0f;
++        c[2] = (v & 31) / 31.0f;
++        c[3] = 1.0f;
++        break;
++    case 0x10:
++        c[0] = c[1] = c[2] = 0.0f;
++        c[3] = u8f(p[0]);
++        break;
++    default:
++        v = ldl_le_p(p);
++        c[0] = u8f(v >> 16);
++        c[1] = u8f(v >> 8);
++        c[2] = u8f(v);
++        c[3] = d->rt_fmt == 0x5 ? 1.0f : u8f(v >> 24);
++        break;
++    }
++}
++
++static inline uint32_t viv_q(float v, unsigned max)
++{
++    return (uint32_t)(sat(v) * max + 0.5f);
++}
++
++static void viv_rt_write(VivDraw *d, uint8_t *p, const float c[4],
++                         const float old[4])
++{
++    float o[4];
++
++    /* colour mask: bit 0 red .. bit 3 alpha */
++    for (int i = 0; i < 4; i++) {
++        o[i] = d->rt_mask & (1 << i) ? c[i] : old[i];
++    }
++    switch (d->rt_fmt) {
++    case 0x0:
++    case 0x1:
++        stw_le_p(p, viv_q(o[3], 15) << 12 | viv_q(o[0], 15) << 8 |
++                    viv_q(o[1], 15) << 4 | viv_q(o[2], 15));
++        break;
++    case 0x2:
++    case 0x3:
++        stw_le_p(p, viv_q(o[3], 1) << 15 | viv_q(o[0], 31) << 10 |
++                    viv_q(o[1], 31) << 5 | viv_q(o[2], 31));
++        break;
++    case 0x4:
++        stw_le_p(p, viv_q(o[0], 31) << 11 | viv_q(o[1], 63) << 5 |
++                    viv_q(o[2], 31));
++        break;
++    case 0x10:
++        p[0] = viv_q(o[3], 255);
++        break;
++    default:
++        stl_le_p(p, viv_q(o[3], 255) << 24 | viv_q(o[0], 255) << 16 |
++                    viv_q(o[1], 255) << 8 | viv_q(o[2], 255));
++        break;
++    }
++}
++
++static float viv_blend_factor(unsigned f, const float src[4],
++                              const float dst[4], const float k[4], int c)
++{
++    switch (f) {
++    case 0x0: return 0.0f;
++    case 0x1: return 1.0f;
++    case 0x2: return src[c];
++    case 0x3: return 1.0f - src[c];
++    case 0x4: return src[3];
++    case 0x5: return 1.0f - src[3];
++    case 0x6: return dst[3];
++    case 0x7: return 1.0f - dst[3];
++    case 0x8: return dst[c];
++    case 0x9: return 1.0f - dst[c];
++    case 0xa: return c == 3 ? 1.0f : MIN(src[3], 1.0f - dst[3]);
++    case 0xb: return k[3];
++    case 0xc: return 1.0f - k[3];
++    case 0xd: return k[c];
++    case 0xe: return 1.0f - k[c];
++    default: return 1.0f;
++    }
++}
++
++static float viv_blend_eq(unsigned eq, float s, float d)
++{
++    switch (eq) {
++    case 1: return s - d;
++    case 2: return d - s;
++    case 3: return MIN(s, d);
++    case 4: return MAX(s, d);
++    default: return s + d;
++    }
++}
++
++static bool viv_compare(unsigned func, uint32_t a, uint32_t b)
++{
++    switch (func) {
++    case 0: return false;
++    case 1: return a < b;
++    case 2: return a == b;
++    case 3: return a <= b;
++    case 4: return a > b;
++    case 5: return a != b;
++    case 6: return a >= b;
++    default: return true;
++    }
++}
++
++static uint8_t viv_stencil_op(unsigned op, uint8_t v, uint8_t ref)
++{
++    switch (op) {
++    case 1: return 0;
++    case 2: return ref;
++    case 3: return v == 255 ? 255 : v + 1;
++    case 4: return v == 0 ? 0 : v - 1;
++    case 5: return ~v;
++    case 6: return v + 1;
++    case 7: return v - 1;
++    default: return v;
++    }
++}
++
++/*
++ * Depth and stencil for one pixel: whether it survives, updating the
++ * buffer as the tests say.
++ */
++static bool viv_depth_stencil(VivDraw *d, int x, int y, float z, bool front)
++{
++    uint32_t *st = d->st;
++    uint32_t cfg = d->z_cfg;
++    uint8_t *p = viv_surf_ptr(&d->zb, viv_pixel_offset(d->z_layout,
++                                   d->z_stride, d->z_bpp, x, y));
++    uint32_t v, zv, zmax = d->z_bpp == 2 ? 0xffff : 0xffffff;
++    uint32_t sop = st[ST_PE_STENCIL_OP], scfg = st[ST_PE_STENCIL_CONFIG];
++    unsigned smode = scfg & 3;
++    bool zpass, spass = true;
++    uint8_t s = 0, ref = 0, mask = 0, wmask = 0;
++    unsigned sfunc = 7, fail = 0, zfail = 0, pass = 0;
++
++    if (!p) {
++        return true;
++    }
++    v = d->z_bpp == 2 ? lduw_le_p(p) : ldl_le_p(p);
++    zv = (uint32_t)(clampf(z, 0.0f, 1.0f) * d->z_scale + 0.5f);
++    zv = MIN(zv, zmax);
++    if (PE_DEPTH_MODE(cfg)) {
++        zpass = viv_compare(PE_DEPTH_FUNC(cfg), zv,
++                            d->z_bpp == 2 ? v : v >> 8);
++    } else {
++        zpass = true;
++    }
++    if (smode && d->z_bpp == 4) {
++        bool back = smode == 2 && !front;
++
++        s = v & 0xff;
++        ref = back ? st[ST_PE_STENCIL_CONFIG_EXT] & 0xff : scfg >> 8;
++        mask = back ? st[ST_PE_STENCIL_CONFIG_EXT2] & 0xff : scfg >> 16;
++        wmask = back ? st[ST_PE_STENCIL_CONFIG_EXT2] >> 8 : scfg >> 24;
++        sop >>= back ? 16 : 0;
++        sfunc = sop & 7;
++        pass = (sop >> 4) & 7;
++        fail = (sop >> 8) & 7;
++        zfail = (sop >> 12) & 7;
++        spass = viv_compare(sfunc, ref & mask, s & mask);
++        {
++            unsigned op = !spass ? fail : !zpass ? zfail : pass;
++            uint8_t ns = viv_stencil_op(op, s, ref);
++            s = (s & ~wmask) | (ns & wmask);
++        }
++    }
++    if (d->z_bpp == 2) {
++        if (zpass && spass && (cfg & PE_DEPTH_WRITE) && PE_DEPTH_MODE(cfg)) {
++            stw_le_p(p, zv);
++        }
++    } else {
++        uint32_t nz = zpass && spass && (cfg & PE_DEPTH_WRITE) &&
++                      PE_DEPTH_MODE(cfg) ? zv : v >> 8;
++        stl_le_p(p, nz << 8 | (smode ? s : (v & 0xff)));
++    }
++    return zpass && spass;
++}
++
++static void viv_pe(VivDraw *d, int x, int y, float z, bool front,
++                   const float colour[4])
++{
++    uint32_t *st = d->st;
++    uint32_t aop = st[ST_PE_ALPHA_OP], acfg = st[ST_PE_ALPHA_CONFIG];
++    float c[4], old[4], out[4], k[4];
++    uint8_t *p;
++
++    if (aop & 1) {
++        uint32_t a = viv_q(colour[3], 255);
++        if (!viv_compare((aop >> 4) & 7, a, (aop >> 8) & 0xff)) {
++            return;
++        }
++    }
++    if (d->zs && !viv_depth_stencil(d, x, y, z, front)) {
++        return;
++    }
++    p = viv_surf_ptr(&d->rt, viv_pixel_offset(d->rt_layout, d->rt_stride,
++                                              d->rt_bpp, x, y));
++    if (!p) {
++        return;
++    }
++    memcpy(c, colour, sizeof(c));
++    if (!(acfg & 1) && d->rt_mask == 0xf) {
++        viv_rt_write(d, p, c, c);
++        return;
++    }
++    viv_rt_read(d, p, old);
++    if (!(acfg & 1)) {
++        viv_rt_write(d, p, c, old);
++        return;
++    }
++    {
++        uint32_t kc = st[ST_PE_ALPHA_BLEND_COLOR];
++        bool sep = acfg & (1u << 16);
++        unsigned sf = (acfg >> 4) & 15, df = (acfg >> 8) & 15;
++        unsigned eq = (acfg >> 12) & 7;
++        unsigned saf = sep ? (acfg >> 20) & 15 : sf;
++        unsigned daf = sep ? (acfg >> 24) & 15 : df;
++        unsigned aeq = sep ? (acfg >> 28) & 7 : eq;
++
++        k[0] = u8f(kc >> 16);
++        k[1] = u8f(kc >> 8);
++        k[2] = u8f(kc);
++        k[3] = u8f(kc >> 24);
++        for (int i = 0; i < 4; i++) {
++            c[i] = sat(c[i]);
++        }
++        for (int i = 0; i < 3; i++) {
++            out[i] = viv_blend_eq(eq, c[i] * viv_blend_factor(sf, c, old, k, i),
++                                  old[i] * viv_blend_factor(df, c, old, k, i));
++        }
++        out[3] = viv_blend_eq(aeq, c[3] * viv_blend_factor(saf, c, old, k, 3),
++                              old[3] * viv_blend_factor(daf, c, old, k, 3));
++        viv_rt_write(d, p, out, old);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Rasterisation                                                      */
++
++static void viv_to_window(VivDraw *d, const VivVertex *v, VivWin *w)
++{
++    const VivVec *pos = &v->out[0];
++    float invw = pos->f[3] != 0.0f ? 1.0f / pos->f[3] : 0.0f;
++
++    w->x = pos->f[0] * invw * d->vp_scale[0] + d->vp_offset[0];
++    w->y = pos->f[1] * invw * d->vp_scale[1] + d->vp_offset[1];
++    w->z = pos->f[2] * invw * d->vp_scale[2] + d->vp_offset[2];
++    w->invw = invw;
++    for (unsigned o = 1; o < d->ps_inputs && o < VIV_OUTPUTS; o++) {
++        for (int c = 0; c < 4; c++) {
++            w->var[o].f[c] = v->out[o].f[c] * invw;
++        }
++    }
++}
++
++static inline bool viv_top_left(float ax, float ay, float bx, float by)
++{
++    /* edges of a triangle wound with positive area (y down) */
++    return (ay == by && bx < ax) || by < ay;
++}
++
++/*
++ * Rasterise and shade a triangle, the rows of bands @band (of @nbands)
++ * only: band i holds rows [32 i, 32 i + 32).
++ */
++static void viv_raster_triangle(VivDraw *d, VivExec *e, const VivWin *a,
++                                const VivWin *b, const VivWin *c,
++                                unsigned band, unsigned nbands)
++{
++    float area = (b->x - a->x) * (c->y - a->y) - (c->x - a->x) * (b->y - a->y);
++    const VivWin *v[3] = { a, b, c };
++    bool front, tl[3];
++    float ex[3], ey[3], e0[3];
++    int x0, y0, x1, y1;
++    uint32_t flat_mask = 0;
++
++    if (!(area != 0.0f) || !isfinite(area)) {
++        return;
++    }
++    /* positive area with y down: clockwise on screen */
++    front = area < 0.0f;
++    if ((d->cull == 1 && area > 0.0f) || (d->cull == 2 && area < 0.0f)) {
++        return;
++    }
++    if (area < 0.0f) {
++        v[1] = c;
++        v[2] = b;
++        area = -area;
++    }
++    for (int i = 0; i < 3; i++) {
++        const VivWin *p = v[(i + 1) % 3], *q = v[(i + 2) % 3];
++        /* edge function of p->q, positive inside */
++        ex[i] = -(q->y - p->y);
++        ey[i] = q->x - p->x;
++        e0[i] = -(ex[i] * p->x + ey[i] * p->y);
++        tl[i] = viv_top_left(p->x, p->y, q->x, q->y);
++    }
++    x0 = MAX((int)floorf(MIN(MIN(a->x, b->x), c->x)), d->xmin) & ~1;
++    y0 = MAX((int)floorf(MIN(MIN(a->y, b->y), c->y)), d->ymin) & ~1;
++    x1 = MIN((int)ceilf(MAX(MAX(a->x, b->x), c->x)) + 1, d->xmax);
++    y1 = MIN((int)ceilf(MAX(MAX(a->y, b->y), c->y)) + 1, d->ymax);
++    for (unsigned i = 1; i < d->ps_inputs && i - 1 < 10; i++) {
++        if (d->st[ST_PA_SHADER_ATTRIBUTES + i - 1] & 1) {
++            flat_mask |= 1u << i;
++        }
++    }
++
++    for (int y = y0; y < y1; y += 2) {
++        if (((unsigned)y >> VIV_BAND_SHIFT) % nbands != band) {
++            continue;
++        }
++        for (int x = x0; x < x1; x += 2) {
++            uint8_t cover = 0;
++            float w[4][3];
++
++            for (int l = 0; l < 4; l++) {
++                int px = x + (l & 1), py = y + (l >> 1);
++                float fx = px + d->centre, fy = py + d->centre;
++                bool in = px >= d->xmin && py >= d->ymin &&
++                          px < d->xmax && py < d->ymax;
++
++                for (int i = 0; i < 3; i++) {
++                    w[l][i] = ex[i] * fx + ey[i] * fy + e0[i];
++                    if (w[l][i] < 0.0f || (w[l][i] == 0.0f && !tl[i])) {
++                        in = false;
++                    }
++                }
++                if (in) {
++                    cover |= 1 << l;
++                }
++            }
++            if (!cover) {
++                continue;
++            }
++            /* pixel shader inputs, helper lanes included */
++            for (int l = 0; l < 4; l++) {
++                float b0 = w[l][0] / area, b1 = w[l][1] / area;
++                float b2 = w[l][2] / area;
++                float iw = b0 * v[0]->invw + b1 * v[1]->invw +
++                           b2 * v[2]->invw;
++                float rw = iw != 0.0f ? 1.0f / iw : 0.0f;
++                VivVec *t = e->t[l];
++
++                t[0].f[0] = x + (l & 1) + d->centre;
++                t[0].f[1] = y + (l >> 1) + d->centre;
++                t[0].f[2] = b0 * v[0]->z + b1 * v[1]->z + b2 * v[2]->z;
++                t[0].f[3] = iw;
++                for (unsigned i = 1; i < d->ps_inputs && i < VIV_OUTPUTS;
++                     i++) {
++                    for (int k = 0; k < 4; k++) {
++                        if (flat_mask & (1u << i)) {
++                            t[i].f[k] = c->var[i].f[k] / c->invw;
++                        } else {
++                            t[i].f[k] = (b0 * v[0]->var[i].f[k] +
++                                         b1 * v[1]->var[i].f[k] +
++                                         b2 * v[2]->var[i].f[k]) * rw;
++                        }
++                    }
++                }
++            }
++            viv_run(e, &d->ps, 0xf);
++            for (int l = 0; l < 4; l++) {
++                float col[4];
++
++                if (!(cover & (1 << l)) || (e->killed & (1 << l))) {
++                    continue;
++                }
++                memcpy(col, e->t[l][d->ps_out_reg & (VIV_TEMPS - 1)].f,
++                       sizeof(col));
++                if (d->st[ST_PS_CONTROL] & PS_SATURATE_RT0) {
++                    for (int k = 0; k < 4; k++) {
++                        col[k] = sat(col[k]);
++                    }
++                }
++                viv_pe(d, x + (l & 1), y + (l >> 1), e->t[l][0].f[2], front,
++                       col);
++            }
++        }
++    }
++}
++
++static unsigned viv_geom_vertex(VivDraw *d, const VivWin *w)
++{
++    if (d->nwin == d->wincap) {
++        d->wincap = MAX(d->wincap * 2, 64);
++        d->win = g_renew(VivWin, d->win, d->wincap);
++    }
++    d->win[d->nwin] = *w;
++    return d->nwin++;
++}
++
++static void viv_geom_triangle(VivDraw *d, unsigned a, unsigned b, unsigned c)
++{
++    const VivWin *w = d->win;
++    float x0 = MIN(MIN(w[a].x, w[b].x), w[c].x);
++    float x1 = MAX(MAX(w[a].x, w[b].x), w[c].x);
++    float y0 = MIN(MIN(w[a].y, w[b].y), w[c].y);
++    float y1 = MAX(MAX(w[a].y, w[b].y), w[c].y);
++
++    if (d->ntri == d->tricap) {
++        d->tricap = MAX(d->tricap * 2, 64);
++        d->tri = g_renew(VivTri, d->tri, d->tricap);
++    }
++    d->tri[d->ntri].v[0] = a;
++    d->tri[d->ntri].v[1] = b;
++    d->tri[d->ntri].v[2] = c;
++    d->ntri++;
++    x0 = MAX(x0, d->xmin);
++    y0 = MAX(y0, d->ymin);
++    x1 = MIN(x1, d->xmax);
++    y1 = MIN(y1, d->ymax);
++    if (x1 > x0 && y1 > y0) {
++        d->pixels += (uint64_t)((x1 - x0) * (y1 - y0));
++    }
++}
++
++/*
++ * Clip a triangle in clip space against the near plane (z >= 0: the blob's
++ * vertex shaders map GL's depth range to [0, w]) and w > 0, then draw.
++ */
++static void viv_clip_triangle(VivDraw *d, const VivVertex *a,
++                              const VivVertex *b, const VivVertex *c)
++{
++    VivVertex poly[2][8];
++    int n = 3, cur = 0;
++    unsigned idx[8];
++    VivWin w;
++
++    poly[0][0] = *a;
++    poly[0][1] = *b;
++    poly[0][2] = *c;
++    if (a->out[0].f[2] >= 0 && b->out[0].f[2] >= 0 && c->out[0].f[2] >= 0 &&
++        a->out[0].f[3] > 0 && b->out[0].f[3] > 0 && c->out[0].f[3] > 0) {
++        goto draw;
++    }
++    for (int plane = 0; plane < 2; plane++) {
++        int m = 0;
++
++        for (int i = 0; i < n; i++) {
++            const VivVertex *p = &poly[cur][i], *q = &poly[cur][(i + 1) % n];
++            float dp = plane ? p->out[0].f[3] - 1e-6f : p->out[0].f[2];
++            float dq = plane ? q->out[0].f[3] - 1e-6f : q->out[0].f[2];
++
++            if (dp >= 0) {
++                poly[!cur][m++] = *p;
++            }
++            if ((dp >= 0) != (dq >= 0) && m < 8) {
++                float t = dp / (dp - dq);
++                VivVertex *r = &poly[!cur][m++];
++
++                for (unsigned o = 0; o < d->vs_outputs; o++) {
++                    for (int k = 0; k < 4; k++) {
++                        r->out[o].f[k] = p->out[o].f[k] +
++                                         (q->out[o].f[k] - p->out[o].f[k]) * t;
++                    }
++                }
++            }
++        }
++        n = m;
++        cur = !cur;
++        if (n < 3) {
++            return;
++        }
++    }
++draw:
++    for (int i = 0; i < n; i++) {
++        viv_to_window(d, &poly[cur][i], &w);
++        idx[i] = viv_geom_vertex(d, &w);
++    }
++    for (int i = 1; i + 1 < n; i++) {
++        viv_geom_triangle(d, idx[0], idx[i], idx[i + 1]);
++    }
++}
++
++/* Lines and points become screen-aligned quads. */
++static void viv_raster_quad(VivDraw *d, const VivVertex *a,
++                            const VivVertex *b, float hw)
++{
++    VivWin wa, wb, q[4];
++    float dx, dy, len;
++    unsigned i[4];
++
++    if (a->out[0].f[3] <= 0 || b->out[0].f[3] <= 0) {
++        return;
++    }
++    viv_to_window(d, a, &wa);
++    viv_to_window(d, b, &wb);
++    dx = wb.x - wa.x;
++    dy = wb.y - wa.y;
++    len = sqrtf(dx * dx + dy * dy);
++    if (len == 0.0f) {                  /* a point: a square */
++        dx = hw;
++        dy = 0.0f;
++        wa.x -= hw;
++        wb.x += hw;
++    } else {
++        dx = dx / len * hw;
++        dy = dy / len * hw;
++    }
++    q[0] = wa;
++    q[1] = wa;
++    q[2] = wb;
++    q[3] = wb;
++    q[0].x -= dy;
++    q[0].y += dx;
++    q[1].x += dy;
++    q[1].y -= dx;
++    q[2].x += dy;
++    q[2].y -= dx;
++    q[3].x -= dy;
++    q[3].y += dx;
++    for (int k = 0; k < 4; k++) {
++        i[k] = viv_geom_vertex(d, &q[k]);
++    }
++    viv_geom_triangle(d, i[0], i[1], i[2]);
++    viv_geom_triangle(d, i[0], i[2], i[3]);
++}
++
++/* ------------------------------------------------------------------ */
++/* Rasteriser threads                                                 */
++
++typedef struct VivWorker {
++    struct VivPool *pool;
++    QemuThread thread;
++    QemuSemaphore go;
++    VivExec *e;
++    unsigned band;
++} VivWorker;
++
++typedef struct VivPool {
++    unsigned n;                 /* bands; band 0 is the calling thread's */
++    VivWorker w[VIV_MAX_THREADS];
++    QemuSemaphore done;
++    VivDraw *job;
++} VivPool;
++
++static void viv_raster_bands(VivDraw *d, VivExec *e, unsigned band,
++                             unsigned nbands)
++{
++    for (unsigned t = 0; t < d->ntri; t++) {
++        const VivTri *tr = &d->tri[t];
++
++        viv_raster_triangle(d, e, &d->win[tr->v[0]], &d->win[tr->v[1]],
++                            &d->win[tr->v[2]], band, nbands);
++    }
++}
++
++static void *viv_worker(void *opaque)
++{
++    VivWorker *w = opaque;
++
++    rcu_register_thread();
++    for (;;) {
++        qemu_sem_wait(&w->go);
++        w->e->d = w->pool->job;
++        viv_raster_bands(w->pool->job, w->e, w->band, w->pool->n);
++        qemu_sem_post(&w->pool->done);
++    }
++    return NULL;
++}
++
++static VivPool *viv_pool(VivGCState *s)
++{
++    VivPool *p = s->pool;
++    long cpus;
++
++    if (p) {
++        return p;
++    }
++    p = s->pool = g_new0(VivPool, 1);
++    cpus = sysconf(_SC_NPROCESSORS_ONLN);
++    p->n = MAX(1, MIN(cpus, VIV_MAX_THREADS));
++    qemu_sem_init(&p->done, 0);
++    for (unsigned i = 1; i < p->n; i++) {
++        VivWorker *w = &p->w[i];
++
++        w->pool = p;
++        w->band = i;
++        w->e = g_new0(VivExec, 1);
++        qemu_sem_init(&w->go, 0);
++        qemu_thread_create(&w->thread, "vivante-raster", viv_worker, w,
++                           QEMU_THREAD_DETACHED);
++    }
++    return p;
++}
++
++/* Samplers the pixel shader uses, set up before the threads share them. */
++static void viv_samplers_prepare(VivDraw *d)
++{
++    for (uint32_t pc = d->ps.start; pc < d->ps.end; pc++) {
++        const VivInst *in = &d->ps.inst[pc];
++        VivSampler *sm;
++
++        if (in->op < OP_TEXLD || in->op > OP_TEXLDL ||
++            in->tex_id >= VIV_SAMPLERS) {
++            continue;
++        }
++        sm = &d->smp[in->tex_id];
++        if (!sm->used) {
++            viv_sampler_setup(d, in->tex_id);
++        }
++        for (unsigned l = 0; l < VIV_LEVELS; l++) {
++            if (!l || sm->level[l].addr) {
++                viv_level(d, sm, l);
++            }
++        }
++    }
++}
++
++static void viv_raster(VivDraw *d, VivExec *e)
++{
++    VivPool *p;
++
++    if (!d->ntri) {
++        return;
++    }
++    p = viv_pool(d->s);
++    if (p->n == 1 || d->pixels < VIV_THREAD_MIN_PIXELS) {
++        viv_raster_bands(d, e, 0, 1);
++        return;
++    }
++    viv_samplers_prepare(d);
++    p->job = d;
++    for (unsigned i = 1; i < p->n; i++) {
++        qemu_sem_post(&p->w[i].go);
++    }
++    viv_raster_bands(d, e, 0, p->n);
++    for (unsigned i = 1; i < p->n; i++) {
++        qemu_sem_wait(&p->done);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Draw                                                               */
++
++static unsigned viv_prim_vertices(uint32_t prim, uint32_t count)
++{
++    switch (prim) {
++    case 1: return count;                   /* points */
++    case 2: return count * 2;               /* lines */
++    case 3: return count + 1;               /* line strip */
++    case 4: return count * 3;               /* triangles */
++    case 5:
++    case 6: return count + 2;               /* strip, fan */
++    case 7: return count;                   /* line loop */
++    case 8: return count * 4;               /* quads */
++    default: return 0;
++    }
++}
++
++static bool viv_draw_setup(VivDraw *d)
++{
++    uint32_t *st = d->st;
++    uint32_t fmt = st[ST_PE_COLOR_FORMAT], zcfg = st[ST_PE_DEPTH_CONFIG];
++    uint32_t span;
++    float zn;
++
++    if (!st[ST_PS_END_PC] || !st[ST_VS_END_PC] || !st[ST_PE_COLOR_ADDR]) {
++        return false;
++    }
++    viv_decode(d->s, &d->vs, ST_VS_INST_MEM, st[ST_VS_START_PC],
++               st[ST_VS_END_PC], st[ST_VS_UNIFORM_BASE]);
++    viv_decode(d->s, &d->ps, ST_PS_INST_MEM, st[ST_PS_START_PC],
++               st[ST_PS_END_PC], st[ST_PS_UNIFORM_BASE]);
++    d->vs_inputs = MIN(st[ST_VS_INPUT_COUNT] & 0x1f, 16u);
++    d->vs_outputs = MIN(st[ST_VS_OUTPUT_COUNT] & 0xff, (uint32_t)VIV_OUTPUTS);
++    d->ps_inputs = MIN(st[ST_PS_INPUT_COUNT] & 0x1f, (uint32_t)VIV_OUTPUTS);
++    for (unsigned i = 0; i < 16; i++) {
++        d->vs_in_reg[i] = st[ST_VS_INPUT + i / 4] >> (8 * (i % 4));
++        d->vs_out_reg[i] = st[ST_VS_OUTPUT + i / 4] >> (8 * (i % 4));
++    }
++    d->ps_out_reg = st[ST_PS_OUTPUT_REG] & 0x7f;
++    if (!d->vs_outputs) {
++        return false;
++    }
++
++    d->vp_scale[0] = fixp16(st[ST_PA_VIEWPORT_SCALE_X]);
++    d->vp_scale[1] = fixp16(st[ST_PA_VIEWPORT_SCALE_Y]);
++    d->vp_scale[2] = fu(st[ST_PA_VIEWPORT_SCALE_Z]);
++    d->vp_offset[0] = fixp16(st[ST_PA_VIEWPORT_OFFSET_X]);
++    d->vp_offset[1] = fixp16(st[ST_PA_VIEWPORT_OFFSET_Y]);
++    d->vp_offset[2] = fu(st[ST_PA_VIEWPORT_OFFSET_Z]);
++    d->centre = st[ST_PA_SYSTEM_MODE] & PA_HALF_PIXEL_CENTER ? 0.5f : 0.0f;
++    d->cull = PA_CULL(st[ST_PA_CONFIG]);
++    d->xmin = st[ST_SE_SCISSOR_LEFT] >> 16;
++    d->ymin = st[ST_SE_SCISSOR_TOP] >> 16;
++    d->xmax = MIN(st[ST_SE_SCISSOR_RIGHT] >> 16, 4096u);
++    d->ymax = MIN(st[ST_SE_SCISSOR_BOTTOM] >> 16, 4096u);
++    if (st[ST_SE_CLIP_RIGHT]) {
++        d->xmax = MIN(d->xmax, (int)(st[ST_SE_CLIP_RIGHT] >> 16) + 1);
++    }
++    if (st[ST_SE_CLIP_BOTTOM]) {
++        d->ymax = MIN(d->ymax, (int)(st[ST_SE_CLIP_BOTTOM] >> 16) + 1);
++    }
++    if (d->xmin >= d->xmax || d->ymin >= d->ymax) {
++        return false;
++    }
++
++    d->rt_fmt = fmt & 0xf;
++    if (fmt & 0x7f000000) {
++        d->rt_fmt = (fmt >> 24) & 0x7f;
++    }
++    if (d->rt_fmt > 0x6 && d->rt_fmt != 0x10) {
++        VIV_UNIMP(d->s, 5, "render target format 0x%x", d->rt_fmt);
++        return false;
++    }
++    d->rt_bpp = d->rt_fmt == 0x10 ? 1 : d->rt_fmt <= 0x4 ? 2 : 4;
++    d->rt_mask = (fmt >> 8) & 0xf;
++    d->rt_stride = st[ST_PE_COLOR_STRIDE];
++    d->rt_layout = fmt & PE_COLOR_SUPER_TILED ? VIV_SUPERTILED : VIV_TILED;
++    span = viv_pixel_offset(d->rt_layout, d->rt_stride, d->rt_bpp, 0,
++                            ROUND_UP(d->ymax, 64));
++    viv_ts_resolve(d->s, st[ST_PE_COLOR_ADDR], span, false);
++    viv_surf_init(&d->rt, d->s, st[ST_PE_COLOR_ADDR], span, false, true);
++
++    d->z_cfg = zcfg;
++    d->zs = !(zcfg & PE_DEPTH_DISABLE_ZS) && st[ST_PE_DEPTH_ADDR] &&
++            (PE_DEPTH_MODE(zcfg) || (st[ST_PE_STENCIL_CONFIG] & 3));
++    if (d->zs) {
++        d->z_bpp = zcfg & PE_DEPTH_D24S8 ? 4 : 2;
++        d->z_stride = st[ST_PE_DEPTH_STRIDE];
++        d->z_layout = zcfg & PE_DEPTH_SUPER_TILED ? VIV_SUPERTILED
++                                                  : VIV_TILED;
++        zn = fu(st[ST_PE_DEPTH_NORMALIZE]);
++        d->z_scale = zn > 0.0f ? zn : d->z_bpp == 2 ? 65535.0f : 16777215.0f;
++        span = viv_pixel_offset(d->z_layout, d->z_stride, d->z_bpp, 0,
++                                ROUND_UP(d->ymax, 64));
++        viv_ts_resolve(d->s, st[ST_PE_DEPTH_ADDR], span, true);
++        viv_surf_init(&d->zb, d->s, st[ST_PE_DEPTH_ADDR], span, false, true);
++    }
++    return true;
++}
++
++void viv3d_draw(VivGCState *s, uint32_t prim, uint32_t start, uint32_t count,
++                bool indexed, uint32_t index_offset)
++{
++    g_autofree VivDraw *d = g_new0(VivDraw, 1);
++    g_autofree VivExec *e = g_new0(VivExec, 1);
++    g_autofree VivVertex *v = NULL;
++    unsigned n = viv_prim_vertices(prim, count);
++    float hw;
++
++    d->s = s;
++    d->st = s->states;
++    e->d = d;
++    if (!n || n > VIV_MAX_VERTICES || !viv_draw_setup(d)) {
++        return;
++    }
++
++    v = g_new0(VivVertex, n);
++    for (unsigned i = 0; i < n; i += 4) {
++        uint32_t idx[4];
++        unsigned m = MIN(4u, n - i);
++
++        for (unsigned l = 0; l < m; l++) {
++            idx[l] = viv_index(d, indexed, start, i + l, index_offset);
++        }
++        viv_shade_vertices(d, e, idx, m, &v[i]);
++    }
++
++    switch (prim) {
++    case 4:
++        for (unsigned i = 0; i + 2 < n; i += 3) {
++            viv_clip_triangle(d, &v[i], &v[i + 1], &v[i + 2]);
++        }
++        break;
++    case 5:
++        for (unsigned i = 0; i + 2 < n; i++) {
++            if (i & 1) {
++                viv_clip_triangle(d, &v[i + 1], &v[i], &v[i + 2]);
++            } else {
++                viv_clip_triangle(d, &v[i], &v[i + 1], &v[i + 2]);
++            }
++        }
++        break;
++    case 6:
++        for (unsigned i = 1; i + 1 < n; i++) {
++            viv_clip_triangle(d, &v[0], &v[i], &v[i + 1]);
++        }
++        break;
++    case 8:
++        for (unsigned i = 0; i + 3 < n; i += 4) {
++            viv_clip_triangle(d, &v[i], &v[i + 1], &v[i + 2]);
++            viv_clip_triangle(d, &v[i], &v[i + 2], &v[i + 3]);
++        }
++        break;
++    case 1:
++        hw = MAX(fu(d->st[ST_PA_POINT_SIZE]), 1.0f) / 2;
++        for (unsigned i = 0; i < n; i++) {
++            viv_raster_quad(d, &v[i], &v[i], hw);
++        }
++        break;
++    case 2:
++    case 3:
++    case 7:
++        hw = MAX(fu(d->st[ST_PA_LINE_WIDTH]), 0.5f);
++        for (unsigned i = 0; i + 1 < n; i += prim == 2 ? 2 : 1) {
++            viv_raster_quad(d, &v[i], &v[i + 1], hw);
++        }
++        if (prim == 7 && n > 2) {
++            viv_raster_quad(d, &v[n - 1], &v[0], hw);
++        }
++        break;
++    }
++
++    viv_raster(d, e);
++
++    viv_samplers_release(d);
++    g_free(d->win);
++    g_free(d->tri);
++    viv_surf_release(&d->rt);
++    if (d->zs) {
++        viv_surf_release(&d->zb);
++    }
++}
+diff --git a/hw/display/vivante_gc.c b/hw/display/vivante_gc.c
+new file mode 100644
+index 0000000..1d8f3d0
+--- /dev/null
++++ b/hw/display/vivante_gc.c
+@@ -0,0 +1,879 @@
++/*
++ * Vivante GC400T GPU (the i.MX6SX GPU3D), as the vendor galcore driver
++ * (5.0.11 build 41671, the flintstone's) and its user-space libraries see it.
++ *
++ * Identity. galcore reads the chip model/revision and the feature words,
++ * and hands them to libGAL, which picks its command formats from them. The
++ * values are the i.MX6SX GC400T's: model 0x400 rev 0x4645 (a revision
++ * galcore special-cases), feature and minor feature words packed from the
++ * REG_* bits of NXP's gc400_4645 entry in Vivante's feature database, the
++ * same packing that reproduces etnaviv's raw words for GC400 rev 0x4652.
++ *
++ * Front end. galcore starts it with AQCmdBufferAddr/Ctrl (0x654/0x658) at
++ * each submission, which LINKs to the user command buffers and ENDs; after
++ * an END it waits for the fetch address (0x664) to read the END's plus 8.
++ * Commands are 64-bit aligned, opcode in bits 31:27 (etnaviv's
++ * cmdstream.xml): LOAD_STATE (1), END (2), NOP (3), DRAW_2D (4),
++ * DRAW_PRIMITIVES (5), DRAW_INDEXED_PRIMITIVES (6), WAIT (7), LINK (8),
++ * STALL (9), CALL (0xA), RETURN (0xB), CHIP_SELECT (0xD). A LOAD_STATE to
++ * 0x0E01 is an event: its id's bit is set in AQIntrAcknowledge (0x010,
++ * read to clear) and the interrupt raised. A WAIT pauses the front end and
++ * it looks at memory again a little later, for a WAIT patched to a LINK.
++ *
++ * MMU (v1). Addresses with bit 31 set go through a flat page table (0x400:
++ * one 32-bit entry per 4 KiB page, the page's physical address); others
++ * are an offset from the memory base galcore programs (0x418), 0x80000000.
++ * The tile status registers take physical addresses.
++ *
++ * Engines. The resolve engine (RS) is here: fills (the tile status fast
++ * clears among them) and copies between linear, tiled and supertiled
++ * surfaces with format conversion, which is how a frame reaches the
++ * framebuffer. Draws go to the 3D pipeline in vivante_3d.c. There is no 2D
++ * core (the GC400T has none) and no DRAW_INSTANCED. With trace=on every
++ * register access, command, state load and resolve is logged.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qemu/units.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/sysbus.h"
++#include "system/address-spaces.h"
++#include "system/memory.h"
++#include "vivante_gc_int.h"
++
++/* Registers */
++#define AQ_CLOCK_CONTROL        0x000
++#define   CLOCK_SOFT_RESET      (1u << 12)
++#define   CLOCK_IDLE_3D         (1u << 16)
++#define   CLOCK_IDLE_2D         (1u << 17)
++#define AQ_IDLE                 0x004
++#define   IDLE_ALL              0x7fffffffu
++#define   IDLE_FE               (1u << 0)
++#define AQ_AXI_STATUS           0x00c
++#define AQ_INTR_ACK             0x010
++#define AQ_INTR_ENABLE          0x014
++#define AQ_CHIP_IDENTITY        0x018
++#define AQ_FEATURES             0x01c
++#define AQ_CHIP_MODEL           0x020
++#define AQ_CHIP_REV             0x024
++#define AQ_MINOR_FEATURES0      0x034
++#define AQ_SPECS                0x048
++#define AQ_MINOR_FEATURES1      0x074
++#define AQ_SPECS2               0x080
++#define AQ_MINOR_FEATURES2      0x084
++#define AQ_MINOR_FEATURES3      0x088
++#define AQ_SPECS3               0x08c
++#define AQ_MINOR_FEATURES4      0x094
++#define AQ_SPECS4               0x09c
++#define AQ_MINOR_FEATURES5      0x0a0
++#define AQ_PRODUCT_ID           0x0a8
++#define AQ_MINOR_FEATURES6      0x0dc
++#define MMU_PAGE_TABLE_FE       0x400
++#define MC_MEMORY_BASE_FE       0x418
++#define FE_CMD_ADDR             0x654
++#define FE_CMD_CTRL             0x658
++#define   CMD_CTRL_ENABLE       (1u << 16)
++#define FE_DEBUG_STATE          0x660
++#define FE_DEBUG_CUR_ADDR       0x664
++#define FE_DEBUG_CMD_LOW        0x668
++
++/* Commands */
++#define CMD_LOAD_STATE          0x01
++#define CMD_END                 0x02
++#define CMD_NOP                 0x03
++#define CMD_DRAW_2D             0x04
++#define CMD_DRAW_PRIMITIVES     0x05
++#define CMD_DRAW_INDEXED        0x06
++#define CMD_WAIT                0x07
++#define CMD_LINK                0x08
++#define CMD_STALL               0x09
++#define CMD_CALL                0x0a
++#define CMD_RETURN              0x0b
++#define CMD_DRAW_INSTANCED      0x0c
++#define CMD_CHIP_SELECT         0x0d
++#define CMD_WAIT_FENCE          0x0f
++
++#define STATE_EVENT             0x0e01
++
++/* Resolve engine (RS) states */
++#define RS_KICKER               0x0580
++#define RS_CONFIG               0x0581
++#define   RS_CFG_SRC_FMT(v)     ((v) & 0x1f)
++#define   RS_CFG_DOWNSAMPLE_X   (1u << 5)
++#define   RS_CFG_DOWNSAMPLE_Y   (1u << 6)
++#define   RS_CFG_SRC_TILED      (1u << 7)
++#define   RS_CFG_DST_FMT(v)     (((v) >> 8) & 0x1f)
++#define   RS_CFG_DST_TILED      (1u << 14)
++#define   RS_CFG_SWAP_RB        (1u << 29)
++#define   RS_CFG_FLIP           (1u << 30)
++#define RS_SOURCE_ADDR          0x0582
++#define RS_SOURCE_STRIDE        0x0583
++#define RS_DEST_ADDR            0x0584
++#define RS_DEST_STRIDE          0x0585
++#define   RS_STRIDE(v)          ((v) & 0x3ffff)
++#define   RS_STRIDE_TILING      (1u << 31)
++#define RS_WINDOW_SIZE          0x0588
++#define RS_CLEAR_CONTROL        0x058f
++#define   RS_CLEAR_MODE(v)      (((v) >> 16) & 3)
++#define RS_FILL_VALUE0          0x0590
++
++/* RS pixel formats */
++#define RS_FMT_X4R4G4B4         0x00
++#define RS_FMT_A4R4G4B4         0x01
++#define RS_FMT_X1R5G5B5         0x02
++#define RS_FMT_A1R5G5B5         0x03
++#define RS_FMT_R5G6B5           0x04
++#define RS_FMT_X8R8G8B8         0x05
++#define RS_FMT_A8R8G8B8         0x06
++#define RS_FMT_YUY2             0x07
++#define RS_FMT_S8               0x10
++#define RS_FMT_64BPP_CLEAR      0x15
++#define RS_FMT_A2R10G10B10      0x16
++#define RS_FMT_D32              0x17
++#define RS_FMT_D16              0x18
++
++/* How often a WAITing front end looks at its memory again. */
++#define VIV_WAIT_NS             (200 * SCALE_US)
++/* Commands run per slice before the front end yields to the guest. */
++#define VIV_SLICE_CMDS          4096
++
++static const struct {
++    hwaddr off;
++    uint32_t val;
++} viv_identity[] = {
++    { AQ_CHIP_IDENTITY,     0x00000000 },
++    { AQ_FEATURES,          0xa0a8e6ed },
++    { AQ_CHIP_MODEL,        0x00000400 },
++    { AQ_CHIP_REV,          0x00004645 },
++    { AQ_MINOR_FEATURES0,   0xe1299fff },
++    { AQ_MINOR_FEATURES1,   0xae13b219 },
++    { AQ_MINOR_FEATURES2,   0xca110000 },
++    { AQ_MINOR_FEATURES3,   0x08000001 },
++    { AQ_MINOR_FEATURES4,   0x00000002 },
++    { AQ_MINOR_FEATURES5,   0x00000000 },
++    { AQ_MINOR_FEATURES6,   0x00000000 },
++    /*
++     * streams 1, 2^6 = 64 temporary registers, 2^7 = 128 threads, one
++     * shader core, one pixel pipe; vertex cache and output buffer 0 (the
++     * driver's GC400 defaults).
++     */
++    { AQ_SPECS,             1 | 6 << 4 | 7 << 8 | 1 << 20 | 1 << 25 },
++    /* 256 instructions (0 = default), 0x240 constants */
++    { AQ_SPECS2,            0x240u << 16 },
++    { AQ_SPECS3,            8 << 4 },           /* 8 varyings */
++    { AQ_SPECS4,            1 << 12 },          /* 1 stream */
++    { AQ_PRODUCT_ID,        0x00000000 },
++};
++
++static void viv_update_irq(VivGCState *s)
++{
++    qemu_set_irq(s->irq, !!(s->intr_pending & s->regs[AQ_INTR_ENABLE / 4]));
++}
++
++static void viv_event(VivGCState *s, uint32_t id)
++{
++    VIV_TRACE(s, "event %u", id);
++    s->intr_pending |= 1u << (id & 31);
++    viv_update_irq(s);
++}
++
++/* GPU address -> physical, through MMU v1 or the memory base. */
++hwaddr viv_translate(VivGCState *s, uint32_t addr)
++{
++    if (addr & 0x80000000u) {
++        uint32_t index = (addr & 0x7fffffffu) >> 12;
++        uint32_t entry = ldl_le_phys(&address_space_memory,
++                                     s->regs[MMU_PAGE_TABLE_FE / 4] +
++                                     index * 4);
++        return (entry & ~0xfffu) | (addr & 0xfffu);
++    }
++    return (hwaddr)s->regs[MC_MEMORY_BASE_FE / 4] + addr;
++}
++
++static uint32_t viv_fetch(VivGCState *s, uint32_t addr)
++{
++    return ldl_le_phys(&address_space_memory, viv_translate(s, addr));
++}
++
++/* Copy between a GPU address range and a host buffer, page by page. */
++void viv_dma(VivGCState *s, uint32_t addr, void *buf, uint32_t len,
++             bool is_write)
++{
++    uint8_t *p = buf;
++
++    while (len) {
++        uint32_t n = MIN(len, 0x1000 - (addr & 0xfff));
++
++        address_space_rw(&address_space_memory, viv_translate(s, addr),
++                         MEMTXATTRS_UNSPECIFIED, p, n, is_write);
++        addr += n;
++        p += n;
++        len -= n;
++    }
++}
++
++void viv_surf_init(VivSurf *m, VivGCState *s, uint32_t base, uint32_t size,
++                   bool phys, bool write)
++{
++    m->s = s;
++    m->base = base;
++    m->size = size;
++    m->phys = phys;
++    m->write = write;
++    m->first_page = base >> 12;
++    m->npages = size ? ((base + size - 1) >> 12) - m->first_page + 1 : 0;
++    m->page = g_new0(uint8_t *, m->npages + 1);
++    m->bad = g_new0(uint8_t, m->npages + 1);
++}
++
++uint8_t *viv_surf_page(VivSurf *m, uint32_t idx)
++{
++    uint32_t addr = (m->first_page + idx) << 12;
++    hwaddr pa, len = 0x1000;
++    uint8_t *p, *old;
++
++    if (idx >= m->npages || qatomic_read(&m->bad[idx])) {
++        return NULL;
++    }
++    pa = m->phys ? addr : viv_translate(m->s, addr);
++    p = address_space_map(&address_space_memory, pa, &len, m->write,
++                          MEMTXATTRS_UNSPECIFIED);
++    if (p && len < 0x1000) {
++        address_space_unmap(&address_space_memory, p, len, m->write, 0);
++        p = NULL;
++    }
++    if (!p) {
++        qatomic_set(&m->bad[idx], 1);
++        VIV_UNIMP(m->s, 0, "GPU access to unmappable memory 0x%08x "
++                  "(0x%" HWADDR_PRIx ")", addr, pa);
++        return NULL;
++    }
++    /* Another thread may have mapped it meanwhile: keep theirs. */
++    old = qatomic_cmpxchg(&m->page[idx], NULL, p);
++    if (old) {
++        address_space_unmap(&address_space_memory, p, 0x1000, m->write, 0);
++        return old;
++    }
++    return p;
++}
++
++void viv_surf_release(VivSurf *m)
++{
++    for (uint32_t i = 0; i < m->npages; i++) {
++        if (m->page[i]) {
++            address_space_unmap(&address_space_memory, m->page[i], 0x1000,
++                                m->write, m->write ? 0x1000 : 0);
++        }
++    }
++    g_free(m->page);
++    g_free(m->bad);
++    m->page = NULL;
++    m->bad = NULL;
++    m->npages = 0;
++}
++
++/*
++ * Fast clear. A surface with tile status has two bits per 64-byte tile in
++ * a side buffer, nonzero while the tile is "cleared": its bytes in memory
++ * are stale and the clear value stands for them. Whatever reads or blends
++ * into such a surface first writes the clear value into the cleared tiles
++ * of the part it touches, [surf, surf + size), and marks them normal. TS
++ * addresses are physical; a surface matches by its physical address.
++ */
++void viv_ts_resolve(VivGCState *s, uint32_t surf, uint32_t size, bool depth)
++{
++    uint32_t *st = s->states;
++    uint32_t cfg = st[ST_TS_MEM_CONFIG];
++    uint32_t surf_base = st[depth ? ST_TS_DEPTH_SURFACE_BASE
++                                  : ST_TS_COLOR_SURFACE_BASE];
++    uint32_t status = st[depth ? ST_TS_DEPTH_STATUS_BASE
++                               : ST_TS_COLOR_STATUS_BASE];
++    uint32_t clear = st[depth ? ST_TS_DEPTH_CLEAR_VALUE
++                              : ST_TS_COLOR_CLEAR_VALUE];
++    hwaddr pa = viv_translate(s, surf);
++    uint32_t first, ntiles;
++    g_autofree uint8_t *ts = NULL;
++    VivSurf m;
++    bool dirty = false;
++    uint32_t i;
++
++    if (!(cfg & (depth ? TS_DEPTH_FAST_CLEAR : TS_COLOR_FAST_CLEAR)) ||
++        pa < surf_base || pa + size > (hwaddr)surf_base + 64 * MiB) {
++        return;
++    }
++    first = (pa - surf_base) / 64;
++    ntiles = (pa - surf_base + size + 63) / 64 - first;
++    /* Whole status bytes: four tiles each. */
++    first &= ~3u;
++    ntiles = ROUND_UP(ntiles + 3, 4);
++    ts = g_malloc(ntiles / 4);
++    address_space_read(&address_space_memory, status + first / 4,
++                       MEMTXATTRS_UNSPECIFIED, ts, ntiles / 4);
++    for (i = 0; i < ntiles / 4 && !ts[i]; i++) {
++        /* nothing cleared in here: nothing to do */
++    }
++    if (i == ntiles / 4) {
++        return;
++    }
++    viv_surf_init(&m, s, surf_base + first * 64, ntiles * 64, true, true);
++    for (i = 0; i < ntiles; i++) {
++        uint8_t *tile;
++
++        if (!(ts[i / 4] >> ((i % 4) * 2) & 3)) {
++            continue;
++        }
++        tile = viv_surf_ptr(&m, i * 64);
++        if (tile) {
++            for (int w = 0; w < 16; w++) {
++                stl_le_p(tile + w * 4, clear);
++            }
++        }
++        ts[i / 4] &= ~(3u << ((i % 4) * 2));
++        dirty = true;
++    }
++    viv_surf_release(&m);
++    if (dirty) {
++        address_space_write(&address_space_memory, status + first / 4,
++                            MEMTXATTRS_UNSPECIFIED, ts, ntiles / 4);
++    }
++}
++
++static unsigned viv_rs_bpp(uint32_t fmt)
++{
++    switch (fmt) {
++    case RS_FMT_S8:
++        return 1;
++    case RS_FMT_X4R4G4B4 ... RS_FMT_R5G6B5:
++    case RS_FMT_YUY2:
++    case RS_FMT_D16:
++        return 2;
++    case RS_FMT_64BPP_CLEAR:
++        return 8;
++    default:
++        return 4;
++    }
++}
++
++static uint32_t viv_expand(uint32_t v, unsigned bits)
++{
++    return bits ? v * 255 / ((1u << bits) - 1) : 255;
++}
++
++/* A pixel to A8R8G8B8. Formats that are not colours pass through. */
++static uint32_t viv_rs_unpack(uint32_t fmt, uint32_t v)
++{
++    unsigned a, r, g, b, ab, rb, gb, bb;
++
++    switch (fmt) {
++    case RS_FMT_X4R4G4B4:
++    case RS_FMT_A4R4G4B4:
++        ab = fmt == RS_FMT_A4R4G4B4 ? 4 : 0, rb = gb = bb = 4;
++        a = v >> 12 & 15, r = v >> 8 & 15, g = v >> 4 & 15, b = v & 15;
++        break;
++    case RS_FMT_X1R5G5B5:
++    case RS_FMT_A1R5G5B5:
++        ab = fmt == RS_FMT_A1R5G5B5 ? 1 : 0, rb = gb = bb = 5;
++        a = v >> 15 & 1, r = v >> 10 & 31, g = v >> 5 & 31, b = v & 31;
++        break;
++    case RS_FMT_R5G6B5:
++        ab = 0, rb = bb = 5, gb = 6;
++        a = 0, r = v >> 11 & 31, g = v >> 5 & 63, b = v & 31;
++        break;
++    case RS_FMT_X8R8G8B8:
++        return v | 0xff000000u;
++    default:
++        return v;
++    }
++    return viv_expand(a, ab) << 24 | viv_expand(r, rb) << 16 |
++           viv_expand(g, gb) << 8 | viv_expand(b, bb);
++}
++
++static uint32_t viv_rs_pack(uint32_t fmt, uint32_t v)
++{
++    unsigned a = v >> 24, r = v >> 16 & 255, g = v >> 8 & 255, b = v & 255;
++
++    switch (fmt) {
++    case RS_FMT_X4R4G4B4:
++    case RS_FMT_A4R4G4B4:
++        return (a >> 4) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | b >> 4;
++    case RS_FMT_X1R5G5B5:
++    case RS_FMT_A1R5G5B5:
++        return (a >> 7) << 15 | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3;
++    case RS_FMT_R5G6B5:
++        return (r >> 3) << 11 | (g >> 2) << 5 | b >> 3;
++    default:
++        return v;
++    }
++}
++
++static bool viv_rs_is_colour(uint32_t fmt)
++{
++    return fmt <= RS_FMT_A8R8G8B8 && fmt != RS_FMT_YUY2;
++}
++
++/*
++ * A surface as the RS sees it: tiled ones are tiled, or supertiled with
++ * the stride's TILING bit, and their stride is that of a row of 4x4 tiles.
++ */
++static void viv_rs_surface(bool tiled, uint32_t stride_reg, int *layout,
++                           uint32_t *stride)
++{
++    *stride = RS_STRIDE(stride_reg);
++    *layout = VIV_LINEAR;
++    if (tiled) {
++        *layout = stride_reg & RS_STRIDE_TILING ? VIV_SUPERTILED : VIV_TILED;
++        *stride /= 4;
++    }
++}
++
++/* Bytes from a surface's start to just past its pixel (w - 1, h - 1). */
++static uint32_t viv_surface_span(int layout, uint32_t stride, unsigned bpp,
++                                 uint32_t w, uint32_t h)
++{
++    uint32_t align = layout == VIV_SUPERTILED ? 64 : layout == VIV_TILED ? 4 : 1;
++
++    return viv_pixel_offset(layout, stride, bpp, 0, ROUND_UP(h, align)) +
++           (layout == VIV_LINEAR ? w * bpp : 0);
++}
++
++/*
++ * A resolve: fill the destination window with the fill value, or copy the
++ * source window to it, converting tiling and colour format on the way,
++ * optionally halving it (the multisample downsample) and flipping it.
++ */
++static void viv_rs_kick(VivGCState *s)
++{
++    uint32_t *st = s->states;
++    uint32_t cfg = st[RS_CONFIG];
++    uint32_t sfmt = RS_CFG_SRC_FMT(cfg), dfmt = RS_CFG_DST_FMT(cfg);
++    unsigned sbpp = viv_rs_bpp(sfmt), dbpp = viv_rs_bpp(dfmt);
++    uint32_t w = st[RS_WINDOW_SIZE] & 0xffff, h = st[RS_WINDOW_SIZE] >> 16;
++    uint32_t clear = RS_CLEAR_MODE(st[RS_CLEAR_CONTROL]);
++    unsigned dx = cfg & RS_CFG_DOWNSAMPLE_X ? 2 : 1;
++    unsigned dy = cfg & RS_CFG_DOWNSAMPLE_Y ? 2 : 1;
++    bool convert = sfmt != dfmt && viv_rs_is_colour(sfmt) &&
++                   viv_rs_is_colour(dfmt);
++    int slayout, dlayout;
++    uint32_t sstride, dstride, slen, dlen;
++    VivSurf src, dst;
++    uint8_t fill[8];
++
++    viv_rs_surface(cfg & RS_CFG_SRC_TILED, st[RS_SOURCE_STRIDE], &slayout,
++                   &sstride);
++    viv_rs_surface(cfg & RS_CFG_DST_TILED, st[RS_DEST_STRIDE], &dlayout,
++                   &dstride);
++    VIV_TRACE(s, "RS cfg %08x src %08x/%08x dst %08x/%08x %ux%u clear %08x "
++              "fill %08x %08x", cfg, st[RS_SOURCE_ADDR], st[RS_SOURCE_STRIDE],
++              st[RS_DEST_ADDR], st[RS_DEST_STRIDE], w, h,
++              st[RS_CLEAR_CONTROL], st[RS_FILL_VALUE0],
++              st[RS_FILL_VALUE0 + 1]);
++    if (!w || !h || w > 8192 || h > 8192) {
++        return;
++    }
++    dlen = viv_surface_span(dlayout, dstride, dbpp, w / dx, h / dy);
++    slen = viv_surface_span(slayout, sstride, sbpp, w, h);
++    viv_surf_init(&dst, s, st[RS_DEST_ADDR], dlen, false, true);
++
++    if (clear) {
++        stl_le_p(fill, st[RS_FILL_VALUE0]);
++        stl_le_p(fill + 4, dbpp == 8 ? st[RS_FILL_VALUE0 + 1] :
++                           st[RS_FILL_VALUE0]);
++        for (uint32_t y = 0; y < h; y++) {
++            for (uint32_t x = 0; x < w; x++) {
++                uint8_t *dp = viv_surf_ptr(&dst, viv_pixel_offset(
++                                  dlayout, dstride, dbpp, x, y));
++                if (dp) {
++                    memcpy(dp, fill, dbpp);
++                }
++            }
++        }
++        viv_surf_release(&dst);
++        return;
++    }
++
++    viv_ts_resolve(s, st[RS_SOURCE_ADDR], slen, false);
++    viv_ts_resolve(s, st[RS_SOURCE_ADDR], slen, true);
++    viv_surf_init(&src, s, st[RS_SOURCE_ADDR], slen, false, false);
++    for (uint32_t y = 0; y < h / dy; y++) {
++        uint32_t oy = cfg & RS_CFG_FLIP ? h / dy - 1 - y : y;
++
++        for (uint32_t x = 0; x < w / dx; x++) {
++            uint8_t *sp = viv_surf_ptr(&src, viv_pixel_offset(
++                              slayout, sstride, sbpp, x * dx, y * dy));
++            uint8_t *dp = viv_surf_ptr(&dst, viv_pixel_offset(
++                              dlayout, dstride, dbpp, x, oy));
++            uint32_t v;
++
++            if (!sp || !dp) {
++                continue;
++            }
++            if (!convert && !(cfg & RS_CFG_SWAP_RB)) {
++                memcpy(dp, sp, MIN(sbpp, dbpp));
++                continue;
++            }
++            v = viv_rs_unpack(sfmt, sbpp == 2 ? lduw_le_p(sp) : ldl_le_p(sp));
++            if (cfg & RS_CFG_SWAP_RB) {
++                v = (v & 0xff00ff00u) | (v >> 16 & 0xff) | (v & 0xff) << 16;
++            }
++            v = viv_rs_pack(dfmt, v);
++            if (dbpp == 2) {
++                stw_le_p(dp, v);
++            } else {
++                stl_le_p(dp, v);
++            }
++        }
++    }
++    viv_surf_release(&src);
++    viv_surf_release(&dst);
++}
++
++/*
++ * Some states are written a field at a time: each such field has a mask
++ * bit alongside, and a write with the mask bit set leaves that field as
++ * it was.
++ */
++static const struct {
++    uint16_t reg;
++    uint32_t field, mask;
++} viv_masked[] = {
++    { 0x028d, 0x00000004, 0x00000008 },     /* PA_CONFIG */
++    { 0x028d, 0x00000010, 0x00000020 },
++    { 0x028d, 0x00000300, 0x00000400 },
++    { 0x028d, 0x00003000, 0x00004000 },
++    { 0x028d, 0x00030000, 0x00040000 },
++    { 0x028d, 0x00400000, 0x00800000 },
++    { 0x0500, 0x00000003, 0x00000008 },     /* PE_DEPTH_CONFIG */
++    { 0x0500, 0x00000010, 0x00000020 },
++    { 0x0500, 0x00000700, 0x00000800 },
++    { 0x0500, 0x00001000, 0x00002000 },
++    { 0x0500, 0x00010000, 0x00020000 },
++    { 0x0500, 0x00100000, 0x00200000 },
++    { 0x0500, 0x01000000, 0x02000000 },
++    { 0x0500, 0x04000000, 0x08000000 },
++    { 0x0506, 0x00000007, 0x00000008 },     /* PE_STENCIL_OP */
++    { 0x0506, 0x00000070, 0x00000080 },
++    { 0x0506, 0x00000700, 0x00000800 },
++    { 0x0506, 0x00007000, 0x00008000 },
++    { 0x0506, 0x00070000, 0x00080000 },
++    { 0x0506, 0x00700000, 0x00800000 },
++    { 0x0506, 0x07000000, 0x08000000 },
++    { 0x0506, 0x70000000, 0x80000000 },
++    { 0x0507, 0x00000003, 0x00000010 },     /* PE_STENCIL_CONFIG */
++    { 0x0507, 0x0000ff00, 0x00000020 },
++    { 0x0507, 0x00ff0000, 0x00000040 },
++    { 0x0507, 0xff000000, 0x00000080 },
++    { 0x0508, 0x00000001, 0x00000002 },     /* PE_ALPHA_OP */
++    { 0x0508, 0x00000070, 0x00000080 },
++    { 0x0508, 0x0000ff00, 0x00010000 },
++    { 0x050a, 0x00000001, 0x00000002 },     /* PE_ALPHA_CONFIG */
++    { 0x050a, 0x000000f0, 0x00000004 },
++    { 0x050a, 0x00000f00, 0x00000008 },
++    { 0x050a, 0x00007000, 0x00008000 },
++    { 0x050a, 0x00010000, 0x00020000 },
++    { 0x050a, 0x00f00000, 0x00040000 },
++    { 0x050a, 0x0f000000, 0x00080000 },
++    { 0x050a, 0x70000000, 0x80000000 },
++    { 0x050b, 0x0000000f, 0x00000010 },     /* PE_COLOR_FORMAT */
++    { 0x050b, 0x00000f00, 0x00001000 },
++    { 0x050b, 0x00010000, 0x00020000 },
++    { 0x050b, 0x00100000, 0x00200000 },
++    { 0x050b, 0x7f000000, 0x80000000 },
++    { 0x0528, 0x000000ff, 0x00000100 },     /* PE_STENCIL_CONFIG_EXT */
++    { 0x0529, 0x0000000f, 0x00000010 },     /* PE_LOGIC_OP */
++    { 0x0529, 0x00000060, 0x00000400 },
++    { 0x0529, 0x00000300, 0x00000080 },
++    { 0x0529, 0x80000000, 0x40000000 },
++};
++
++static void viv_load_state(VivGCState *s, uint32_t reg, uint32_t val)
++{
++    if (reg >= VIV_NUM_STATES) {
++        return;
++    }
++    if (reg == 0x028d || (reg >= 0x0500 && reg <= 0x0529)) {
++        uint32_t keep = 0, masks = 0;
++        bool masked = false;
++
++        for (size_t i = 0; i < ARRAY_SIZE(viv_masked); i++) {
++            if (viv_masked[i].reg == reg) {
++                masked = true;
++                masks |= viv_masked[i].mask;
++                if (val & viv_masked[i].mask) {
++                    keep |= viv_masked[i].field;
++                }
++            }
++        }
++        if (masked) {
++            val = (s->states[reg] & keep) | (val & ~keep & ~masks);
++        }
++    }
++    s->states[reg] = val;
++    if (reg == STATE_EVENT) {
++        viv_event(s, val & 0x1f);
++    } else if (reg == RS_KICKER) {
++        viv_rs_kick(s);
++    }
++}
++
++/*
++ * Run commands from fe_addr until the front end stops or waits, or a slice
++ * is used up; returns whether to run again soon.
++ */
++static bool viv_fe_run(VivGCState *s)
++{
++    for (int n = 0; n < VIV_SLICE_CMDS; n++) {
++        uint32_t addr = s->fe_addr;
++        uint32_t cmd = viv_fetch(s, addr);
++        uint32_t op = cmd >> 27;
++
++        s->regs[FE_DEBUG_CUR_ADDR / 4] = addr;
++        s->regs[FE_DEBUG_CMD_LOW / 4] = cmd;
++
++        switch (op) {
++        case CMD_LOAD_STATE: {
++            uint32_t count = (cmd >> 16) & 0x3ff;
++            uint32_t reg = cmd & 0xffff;
++
++            if (!count) {
++                count = 0x400;
++            }
++            if (s->trace && reg != STATE_EVENT) {
++                VIV_TRACE(s, "%08x LOAD_STATE 0x%04x x%u", addr, reg, count);
++            }
++            for (uint32_t i = 0; i < count; i++) {
++                viv_load_state(s, reg + i, viv_fetch(s, addr + 4 + 4 * i));
++            }
++            /* The header and the values, padded to 64 bits. */
++            s->fe_addr = addr + (((1 + count) * 4 + 7) & ~7u);
++            break;
++        }
++        case CMD_END:
++            VIV_TRACE(s, "%08x END", addr);
++            s->fe_running = false;
++            s->fe_addr = addr + 8;
++            /* galcore's idle check wants the fetch address past the END. */
++            s->regs[FE_DEBUG_CUR_ADDR / 4] = s->fe_addr;
++            return false;
++        case CMD_WAIT:
++            /* Look again at the same WAIT: the driver patches it to a LINK. */
++            s->fe_addr = addr;
++            return true;
++        case CMD_LINK:
++            s->fe_addr = viv_fetch(s, addr + 4);
++            VIV_TRACE(s, "%08x LINK -> %08x", addr, s->fe_addr);
++            break;
++        case CMD_CALL:
++            s->fe_ret = addr + 8;
++            s->fe_addr = viv_fetch(s, addr + 4);
++            break;
++        case CMD_RETURN:
++            s->fe_addr = s->fe_ret;
++            break;
++        case CMD_NOP:
++        case CMD_STALL:
++        case CMD_CHIP_SELECT:
++        case CMD_WAIT_FENCE:
++            s->fe_addr = addr + 8;
++            break;
++        case CMD_DRAW_PRIMITIVES:
++            VIV_TRACE(s, "%08x DRAW_PRIMITIVES type %u start %u count %u",
++                      addr, viv_fetch(s, addr + 4), viv_fetch(s, addr + 8),
++                      viv_fetch(s, addr + 12));
++            viv3d_draw(s, viv_fetch(s, addr + 4), viv_fetch(s, addr + 8),
++                       viv_fetch(s, addr + 12), false, 0);
++            s->draws++;
++            s->fe_addr = addr + 16;
++            break;
++        case CMD_DRAW_INDEXED:
++            VIV_TRACE(s, "%08x DRAW_INDEXED type %u start %u count %u "
++                      "offset %u", addr, viv_fetch(s, addr + 4),
++                      viv_fetch(s, addr + 8), viv_fetch(s, addr + 12),
++                      viv_fetch(s, addr + 16));
++            viv3d_draw(s, viv_fetch(s, addr + 4), viv_fetch(s, addr + 8),
++                       viv_fetch(s, addr + 12), true, viv_fetch(s, addr + 16));
++            s->draws++;
++            /* Header, command, start, count, offset: padded to 24 bytes. */
++            s->fe_addr = addr + 24;
++            break;
++        case CMD_DRAW_INSTANCED:
++            s->draws++;
++            VIV_TRACE(s, "%08x DRAW_INSTANCED", addr);
++            s->fe_addr = addr + 16;
++            break;
++        case CMD_DRAW_2D: {
++            uint32_t count = (cmd >> 8) & 0xff;
++            uint32_t data = (cmd >> 16) & 0x7ff;
++
++            VIV_TRACE(s, "%08x DRAW_2D x%u data %u", addr, count, data);
++            /* Header, a rectangle (two words) per count, the data words. */
++            s->fe_addr = addr + 8 + count * 8 + ((data * 4 + 7) & ~7u);
++            break;
++        }
++        default:
++            qemu_log_mask(LOG_UNIMP, "vivante-gc: unknown command 0x%08x at "
++                          "0x%08x, front end stopped\n", cmd, addr);
++            s->fe_running = false;
++            return false;
++        }
++    }
++    return true;
++}
++
++static void viv_fe_tick(void *opaque)
++{
++    VivGCState *s = opaque;
++
++    if (!s->fe_running) {
++        return;
++    }
++    if (viv_fe_run(s)) {
++        /* On a WAIT: come back later. After a full slice: carry on. */
++        int64_t delay = viv_fetch(s, s->fe_addr) >> 27 == CMD_WAIT ?
++                        VIV_WAIT_NS : 0;
++
++        timer_mod(s->fe_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay);
++    }
++}
++
++static void viv_fe_start(VivGCState *s)
++{
++    s->fe_addr = s->regs[FE_CMD_ADDR / 4];
++    s->fe_running = true;
++    VIV_TRACE(s, "front end started at %08x", s->fe_addr);
++    timer_mod(s->fe_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++}
++
++static void viv_soft_reset(VivGCState *s)
++{
++    timer_del(s->fe_timer);
++    s->fe_running = false;
++    s->intr_pending = 0;
++    viv_update_irq(s);
++}
++
++static uint64_t viv_read(void *opaque, hwaddr off, unsigned size)
++{
++    VivGCState *s = VIVANTE_GC(opaque);
++    uint32_t val;
++
++    switch (off) {
++    case AQ_CLOCK_CONTROL:
++        val = (s->regs[off / 4] & ~CLOCK_SOFT_RESET) |
++              CLOCK_IDLE_3D | CLOCK_IDLE_2D;
++        break;
++    case AQ_IDLE:
++        /* A front end that is running, even waiting, is not idle. */
++        val = s->fe_running ? IDLE_ALL & ~IDLE_FE : IDLE_ALL;
++        break;
++    case AQ_AXI_STATUS:
++        val = 0;
++        break;
++    case AQ_INTR_ACK:
++        val = s->intr_pending;
++        s->intr_pending = 0;
++        viv_update_irq(s);
++        break;
++    case FE_DEBUG_STATE:
++        val = s->fe_running ? 1 : 0;
++        break;
++    default:
++        val = s->regs[off / 4];
++        break;
++    }
++    VIV_TRACE(s, "rd 0x%03" HWADDR_PRIx " = 0x%08x", off, val);
++    return val;
++}
++
++static void viv_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
++{
++    VivGCState *s = VIVANTE_GC(opaque);
++
++    VIV_TRACE(s, "wr 0x%03" HWADDR_PRIx " = 0x%08" PRIx64, off, val);
++    for (size_t i = 0; i < ARRAY_SIZE(viv_identity); i++) {
++        if (viv_identity[i].off == off) {
++            return;                 /* read-only */
++        }
++    }
++    switch (off) {
++    case AQ_CLOCK_CONTROL:
++        if (val & CLOCK_SOFT_RESET) {
++            viv_soft_reset(s);
++        }
++        s->regs[off / 4] = val & ~CLOCK_SOFT_RESET;
++        return;
++    case AQ_INTR_ENABLE:
++        s->regs[off / 4] = val;
++        viv_update_irq(s);
++        return;
++    case FE_CMD_CTRL:
++        s->regs[off / 4] = val;
++        if (val & CMD_CTRL_ENABLE) {
++            viv_fe_start(s);
++        }
++        return;
++    }
++    s->regs[off / 4] = val;
++}
++
++static const MemoryRegionOps viv_ops = {
++    .read = viv_read,
++    .write = viv_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void viv_reset(DeviceState *dev)
++{
++    VivGCState *s = VIVANTE_GC(dev);
++
++    viv_soft_reset(s);
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->states, 0, VIV_NUM_STATES * sizeof(uint32_t));
++    for (size_t i = 0; i < ARRAY_SIZE(viv_identity); i++) {
++        s->regs[viv_identity[i].off / 4] = viv_identity[i].val;
++    }
++    s->draws = 0;
++}
++
++static void viv_realize(DeviceState *dev, Error **errp)
++{
++    VivGCState *s = VIVANTE_GC(dev);
++
++    memory_region_init_io(&s->iomem, OBJECT(dev), &viv_ops, s, "vivante-gc",
++                          VIV_REGS_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++    s->states = g_new0(uint32_t, VIV_NUM_STATES);
++    s->fe_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, viv_fe_tick, s);
++}
++
++static const Property viv_props[] = {
++    DEFINE_PROP_BOOL("trace", VivGCState, trace, false),
++};
++
++static void viv_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->desc = "Vivante GC400T GPU";
++    dc->realize = viv_realize;
++    device_class_set_legacy_reset(dc, viv_reset);
++    device_class_set_props(dc, viv_props);
++}
++
++static const TypeInfo viv_types[] = {
++    {
++        .name           = TYPE_VIVANTE_GC,
++        .parent         = TYPE_SYS_BUS_DEVICE,
++        .instance_size  = sizeof(VivGCState),
++        .class_init     = viv_class_init,
++    },
++};
++
++DEFINE_TYPES(viv_types)
+diff --git a/hw/display/vivante_gc_int.h b/hw/display/vivante_gc_int.h
+new file mode 100644
+index 0000000..8405a3e
+--- /dev/null
++++ b/hw/display/vivante_gc_int.h
+@@ -0,0 +1,145 @@
++/*
++ * Vivante GC400T GPU model: what the front end / resolve side
++ * (vivante_gc.c) and the 3D pipeline (vivante_3d.c) share.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_DISPLAY_VIVANTE_GC_INT_H
++#define HW_DISPLAY_VIVANTE_GC_INT_H
++
++#include "qemu/atomic.h"
++#include "qemu/log.h"
++#include "exec/hwaddr.h"
++#include "hw/core/sysbus.h"
++#include "hw/display/vivante_gc.h"
++
++OBJECT_DECLARE_SIMPLE_TYPE(VivGCState, VIVANTE_GC)
++
++#define VIV_REGS_SIZE           0x4000
++#define VIV_NUM_STATES          0x10000
++
++struct VivGCState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    QEMUTimer *fe_timer;
++    bool trace;
++
++    uint32_t regs[VIV_REGS_SIZE / 4];
++    uint32_t *states;
++    uint32_t intr_pending;
++
++    bool fe_running;
++    uint32_t fe_addr;           /* next command, GPU address */
++    uint32_t fe_ret;            /* CALL's return address */
++    uint64_t draws;
++    uint64_t unimp_seen;        /* LOG_UNIMP messages already given */
++    struct VivPool *pool;       /* rasteriser threads (vivante_3d.c) */
++};
++
++#define VIV_TRACE(s, fmt, ...)                                              \
++    do {                                                                    \
++        if ((s)->trace) {                                                   \
++            qemu_log("vivante-gc: " fmt "\n", ## __VA_ARGS__);              \
++        }                                                                   \
++    } while (0)
++
++/* Log something unimplemented once per kind (bit 0..63). */
++#define VIV_UNIMP(s, bit, fmt, ...)                                         \
++    do {                                                                    \
++        if (!((s)->unimp_seen & (1ull << (bit)))) {                         \
++            (s)->unimp_seen |= 1ull << (bit);                               \
++            qemu_log_mask(LOG_UNIMP, "vivante-gc: " fmt "\n",               \
++                          ## __VA_ARGS__);                                  \
++        }                                                                   \
++    } while (0)
++
++/* States (register byte address / 4) shared by both halves */
++#define ST_TS_MEM_CONFIG            0x0595
++#define   TS_DEPTH_FAST_CLEAR       (1u << 0)
++#define   TS_COLOR_FAST_CLEAR       (1u << 1)
++#define ST_TS_COLOR_STATUS_BASE     0x0596
++#define ST_TS_COLOR_SURFACE_BASE    0x0597
++#define ST_TS_COLOR_CLEAR_VALUE     0x0598
++#define ST_TS_DEPTH_STATUS_BASE     0x0599
++#define ST_TS_DEPTH_SURFACE_BASE    0x059a
++#define ST_TS_DEPTH_CLEAR_VALUE     0x059b
++
++/* Surface layouts: rows, 4x4 tiles, or 64x64 supertiles of 4x4 tiles. */
++enum { VIV_LINEAR, VIV_TILED, VIV_SUPERTILED };
++
++/*
++ * Byte offset of pixel (x, y) in a surface whose pixel rows (of its
++ * aligned width) are @stride bytes apart. Tiles are 16 pixels in a row;
++ * a supertile's 16x16 tiles go in the order the blob's are seen to:
++ * pairs across, four rows down, then the next pair of columns.
++ */
++static inline uint32_t viv_pixel_offset(int layout, uint32_t stride,
++                                        unsigned bpp, uint32_t x, uint32_t y)
++{
++    uint32_t tx, ty, t;
++
++    switch (layout) {
++    case VIV_TILED:
++        return (y >> 2) * stride * 4 +
++               ((x >> 2) * 16 + (y & 3) * 4 + (x & 3)) * bpp;
++    case VIV_SUPERTILED:
++        tx = (x >> 2) & 15;
++        ty = (y >> 2) & 15;
++        t = (tx & 1) | (ty & 3) << 1 | (tx >> 1) << 3 | (ty >> 2) << 6;
++        return (y >> 6) * stride * 64 + (x >> 6) * 64 * 64 * bpp +
++               (t * 16 + (y & 3) * 4 + (x & 3)) * bpp;
++    default:
++        return y * stride + x * bpp;
++    }
++}
++
++/*
++ * A window onto GPU memory for pixel work: pages are mapped as they are
++ * first touched, from any thread, and released (and, when written, marked
++ * dirty) together.
++ */
++typedef struct VivSurf {
++    VivGCState *s;
++    uint32_t base;              /* first byte, GPU (or physical) address */
++    uint32_t size;
++    bool phys;                  /* base is a physical address (TS) */
++    bool write;
++    uint32_t first_page;
++    uint32_t npages;
++    uint8_t **page;             /* host pointer per page, NULL = unmapped */
++    uint8_t *bad;               /* pages that could not be mapped */
++} VivSurf;
++
++hwaddr viv_translate(VivGCState *s, uint32_t addr);
++void viv_dma(VivGCState *s, uint32_t addr, void *buf, uint32_t len,
++             bool is_write);
++void viv_surf_init(VivSurf *m, VivGCState *s, uint32_t base, uint32_t size,
++                   bool phys, bool write);
++uint8_t *viv_surf_page(VivSurf *m, uint32_t idx);
++void viv_surf_release(VivSurf *m);
++
++/* Host pointer to byte @off of the surface, NULL if out of it or unmapped. */
++static inline uint8_t *viv_surf_ptr(VivSurf *m, uint32_t off)
++{
++    uint32_t a, idx;
++    uint8_t *page;
++
++    if (off >= m->size) {
++        return NULL;
++    }
++    a = m->base + off;
++    idx = (a >> 12) - m->first_page;
++    page = qatomic_read(&m->page[idx]);
++    if (!page) {
++        page = viv_surf_page(m, idx);
++    }
++    return page ? page + (a & 0xfff) : NULL;
++}
++
++void viv_ts_resolve(VivGCState *s, uint32_t surf, uint32_t size, bool depth);
++void viv3d_draw(VivGCState *s, uint32_t prim, uint32_t start, uint32_t count,
++                bool indexed, uint32_t index_offset);
++
++#endif /* HW_DISPLAY_VIVANTE_GC_INT_H */
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+index ce05d7c..cf7d579 100644
+--- a/include/hw/arm/fsl-imx6sx.h
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -82,9 +82,9 @@ DECLARE_INSTANCE_CHECKER(FslIMX6SXState, FSL_IMX6SX, TYPE_FSL_IMX6SX)
+ #define FSL_IMX6SX_OCRAM_ADDR       0x00900000
+ #define FSL_IMX6SX_OCRAM_SIZE       0x20000    /* 128 KiB mega-fast SRAM */
+ 
+-/* Vivante GC400T GPU3D register block (register stub only) */
++/* Vivante GC400T GPU3D */
+ #define FSL_IMX6SX_GPU_ADDR         0x01800000
+-#define FSL_IMX6SX_GPU_SIZE         0x4000
++#define FSL_IMX6SX_GPU_IRQ          10
+ 
+ /* GPMI NAND subsystem on its own bus segment (modeled in a later phase) */
+ #define FSL_IMX6SX_APBH_ADDR        0x01804000
+@@ -262,8 +262,6 @@ struct FslIMX6SXState {
+     MemoryRegion rom;
+     MemoryRegion caam;
+     MemoryRegion ocram;
+-    MemoryRegion gpu;
+-    uint32_t gpu_clock_ctrl;
+ 
+     uint32_t phy_num;
+ };
+diff --git a/include/hw/display/vivante_gc.h b/include/hw/display/vivante_gc.h
+new file mode 100644
+index 0000000..bd87f0a
+--- /dev/null
++++ b/include/hw/display/vivante_gc.h
+@@ -0,0 +1,11 @@
++/*
++ * Vivante GC400T GPU (i.MX6SX GPU3D), see hw/display/vivante_gc.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_DISPLAY_VIVANTE_GC_H
++#define HW_DISPLAY_VIVANTE_GC_H
++
++#define TYPE_VIVANTE_GC "vivante-gc"
++
++#endif /* HW_DISPLAY_VIVANTE_GC_H */
+-- 
+2.55.0
+

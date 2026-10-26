@@ -1,0 +1,52 @@
+From ec30f799adcba463deeaa1e85d884634799928a4 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:09:11 -0400
+Subject: [PATCH 92/93] hw/arm: fsl-imx6sx: the LPM SRAM is RAM
+
+The kernel copies its suspend code to OCRAM_S at 0x008f8000 and runs it there;
+as an unimplemented device it read back as zeros and the suspend oopsed.
+---
+ hw/arm/fsl-imx6sx.c         | 7 ++++++-
+ include/hw/arm/fsl-imx6sx.h | 1 +
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index b4163bf..8e9119f 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -50,7 +50,6 @@ static const struct {
+     const char *name;
+ } fsl_imx6sx_unimplemented[] = {
+     /* AIPS1 */
+-    { FSL_IMX6SX_LPM_SRAM_ADDR, FSL_IMX6SX_LPM_SRAM_SIZE, "lpm-sram" },
+     { FSL_IMX6SX_CAN1_ADDR,  0x8000,                "flexcan1-2" },
+     { FSL_IMX6SX_ANATOP_ADDR, FSL_IMX6SX_ANATOP_SIZE, "anatop" },
+     { FSL_IMX6SX_GPC_ADDR,   0x4000,                "gpc" },
+@@ -554,6 +553,12 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_OCRAM_ADDR,
+                                 &s->ocram);
+ 
++    /* OCRAM_S: the kernel runs its suspend code from here */
++    memory_region_init_ram(&s->lpm_sram, NULL, "imx6sx.lpm-sram",
++                           FSL_IMX6SX_LPM_SRAM_SIZE, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_LPM_SRAM_ADDR,
++                                &s->lpm_sram);
++
+     memory_region_init_ram(&s->caam, NULL, "imx6sx.caam",
+                            FSL_IMX6SX_CAAM_MEM_SIZE, &error_fatal);
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6SX_CAAM_MEM_ADDR,
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+index eb4c5c7..cbf1fa2 100644
+--- a/include/hw/arm/fsl-imx6sx.h
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -265,6 +265,7 @@ struct FslIMX6SXState {
+     MemoryRegion rom;
+     MemoryRegion caam;
+     MemoryRegion ocram;
++    MemoryRegion lpm_sram;
+ 
+     uint32_t phy_num;
+ };
+-- 
+2.56.0
+

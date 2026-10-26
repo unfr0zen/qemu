@@ -1,0 +1,491 @@
+From 491c0edbf86c46a20120228c76f7e5d76aadc582 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:36:14 -0400
+Subject: [PATCH 11/20] hw/adc: add an i.MX6SX/vf610 ADC model with the board's
+ magwheel
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The board has two of these 4-channel blocks and the stock firmware uses
+both:
+
+  adc@02280000 (nestlabs,vf610-adc-magwheel) — the rotating wheel. Two
+  Hall channels (1 and 2, midpoints 0x7ad/0x7f6 from the device tree)
+  sit in quadrature; the driver decodes them into direction and steps.
+  The model synthesizes the pair from a wheel-position property (detents,
+  driven by the UI over QMP): ch1 = mid1 + A*sin, ch2 = mid2 + A*cos,
+  one full cycle per detent, gated by the hall-enable line GPIO7_IO02
+  (active low).
+
+  adc@02284000 (fsl,vf610-adc) — channel 0 reads the battery divider
+  (adc-div-battery), gated by GPIO6_IO16 (active high); it reports
+  ch0-sample (≈3.7 V through the DT's divider) while enabled.
+
+The hardware is one conversion per transaction: HC0 = channel | AIEN,
+completion raises the IRQ, R0 read clears COCO. Calibration is the same
+dance with HC0 = 0x9f and GC.CAL set — CAL self-clears, GS.CALF stays
+clear. Results land 10 µs of virtual time after the trigger.
+
+Verified on boot: the magwheel registers its input device with no
+calibration timeout, and the firmware's shutdown-manager reads
+batteryLevel @ 3.702 through the battery channel.
+---
+ hw/adc/imx6_adc.c         | 381 ++++++++++++++++++++++++++++++++++++++
+ hw/adc/meson.build        |   1 +
+ include/hw/adc/imx6_adc.h |  45 +++++
+ 3 files changed, 427 insertions(+)
+ create mode 100644 hw/adc/imx6_adc.c
+ create mode 100644 include/hw/adc/imx6_adc.h
+
+diff --git a/hw/adc/imx6_adc.c b/hw/adc/imx6_adc.c
+new file mode 100644
+index 0000000..5c2b2b6
+--- /dev/null
++++ b/hw/adc/imx6_adc.c
+@@ -0,0 +1,381 @@
++/*
++ * i.MX6SX / Vybrid vf610 ADC emulation.
++ *
++ * The board has two of these blocks (4 channels each), and the stock
++ * firmware uses both:
++ *
++ *   adc@02280000, "nestlabs,vf610-adc-magwheel" — the rotating wheel. Two
++ *   Hall channels (1 and 2, midpoints 0x7ad/0x7f6 from the device tree)
++ *   sit 90° apart around the ring; the driver decodes quadrature into
++ *   direction and steps. The model synthesizes the pair from a
++ *   `wheel-position` property (detents, driven by the UI over QMP),
++ *   gated by the hall-enable line on GPIO7_IO02 (active low).
++ *
++ *   adc@02284000, "fsl,vf610-adc" — channel 0 reads the battery divider
++ *   (adc-div-battery), enabled by GPIO6_IO16 (active high).
++ *
++ * The hardware is single-conversion-per-transaction: the driver writes
++ * HC0 = channel | AIEN, waits for the conversion-complete interrupt, then
++ * reads R0 (which clears the COCO flag). Calibration is the same dance
++ * with HC0 = AIEN|0x1f and GC.CAL set (CAL self-clears, GS.CALF stays
++ * clear when it worked). Conversion time is not simulated precisely: the
++ * result lands a fixed 10 µs of virtual time after the trigger.
++ *
++ * Driver: drivers/iio/adc/vf610_adc.c v4.1 (VF610_REG_ADC_*: HC0 0x00,
++ * HC1 0x04, HS 0x08, R0 0x0c, R1 0x10, CFG 0x14, GC 0x18, GS 0x1c, ...).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "hw/adc/imx6_adc.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qemu/units.h"
++
++#define ADC_HC0     0x00
++#define ADC_HC1     0x04
++#define ADC_HS      0x08
++#define ADC_R0      0x0c
++#define ADC_R1      0x10
++#define ADC_CFG     0x14
++#define ADC_GC      0x18
++#define ADC_GS      0x1c
++#define ADC_CV      0x20
++#define ADC_OFS     0x24
++#define ADC_CAL     0x28
++#define ADC_PCTL    0x30
++
++#define ADC_ADCH(x)     ((x) & 0x1f)
++#define ADC_AIEN        BIT(7)
++#define ADC_CONV_DISABLE 0x1f
++
++#define ADC_GC_CAL      BIT(7)
++
++#define ADC_GS_ADACT    BIT(0)
++#define ADC_GS_CALF     BIT(1)
++
++#define ADC_HS_COCO(ch) BIT(ch)
++
++#define ADC_12BIT_MASK  0xfff
++
++/* One conversion, in virtual time. */
++#define ADC_CONVERT_NS  (10 * SCALE_US)
++
++static void adc_update_irq(Imx6AdcState *s)
++{
++    qemu_set_irq(s->irq, s->hs != 0);
++}
++
++static void imx6_adc_gate_set(void *opaque, int n, int level)
++{
++    Imx6AdcState *s = IMX6_ADC(opaque);
++
++    s->gate = level != 0;
++}
++
++/* Whether the analog front end the gate line powers is active. */
++static bool adc_gate_enabled(Imx6AdcState *s)
++{
++    return s->gate_active_low ? !s->gate : s->gate;
++}
++
++/* Sample of a channel, given the block's outside world. */
++static uint32_t adc_channel_sample(Imx6AdcState *s, unsigned ch)
++{
++    double theta;
++
++    switch (ch) {
++    case 0:
++        /* Battery divider: enabled (gate high) reads the pack, else ~0 V. */
++        return adc_gate_enabled(s) ? s->ch0_sample : 0;
++
++    case 1:
++    case 2:
++        /*
++         * The wheel's Hall pair, in quadrature around their midpoints:
++         * ch1 = mid1 + A*sin(θ), ch2 = mid2 + A*cos(θ). One full cycle
++         * per detent, so every decode the driver might use (thresholds,
++         * atan2, edge counting) lands on the same step.
++         */
++        if (!adc_gate_enabled(s)) {
++            return 0;               /* hall sensors unpowered */
++        }
++        theta = 2.0 * M_PI *
++            (double)(s->wheel_position % (int64_t)s->wheel_steps) /
++            (double)s->wheel_steps;
++        if (ch == 1) {
++            return s->mid1 + s->amplitude * sin(theta);
++        }
++        return s->mid2 + s->amplitude * cos(theta);
++
++    default:
++        /* Unused channels float to mid scale. */
++        return 0x800;
++    }
++}
++
++static void adc_convert_done(void *opaque)
++{
++    Imx6AdcState *s = opaque;
++    unsigned ch = ADC_ADCH(s->hc[0]);
++
++    s->gs &= ~ADC_GS_ADACT;
++
++    if (ch == ADC_CONV_DISABLE) {
++        /* The calibration pass: CAL self-clears, and it worked (no CALF). */
++        s->gc &= ~ADC_GC_CAL;
++    } else {
++        s->r[0] = adc_channel_sample(s, ch) & ADC_12BIT_MASK;
++    }
++    s->hs |= ADC_HS_COCO(0);
++    adc_update_irq(s);
++}
++
++static void adc_start_conversion(Imx6AdcState *s)
++{
++    s->gs |= ADC_GS_ADACT;
++    timer_mod(s->convert, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                          ADC_CONVERT_NS);
++}
++
++static uint64_t imx6_adc_read(void *opaque, hwaddr off, unsigned size)
++{
++    Imx6AdcState *s = IMX6_ADC(opaque);
++    uint32_t val;
++
++    switch (off) {
++    case ADC_HC0:
++        val = s->hc[0];
++        break;
++    case ADC_HC1:
++        val = s->hc[1];
++        break;
++    case ADC_HS:
++        val = s->hs;
++        break;
++    case ADC_R0:
++        /* Reading a result register clears its COCO flag. */
++        val = s->r[0];
++        s->hs &= ~ADC_HS_COCO(0);
++        adc_update_irq(s);
++        break;
++    case ADC_R1:
++        val = s->r[1];
++        s->hs &= ~ADC_HS_COCO(1);
++        adc_update_irq(s);
++        break;
++    case ADC_CFG:
++        val = s->cfg;
++        break;
++    case ADC_GC:
++        val = s->gc & ~ADC_GC_CAL;  /* CAL is self-clearing */
++        break;
++    case ADC_GS:
++        val = s->gs & ~ADC_GS_CALF; /* calibration never fails here */
++        break;
++    case ADC_CV:
++        val = s->cv;
++        break;
++    case ADC_OFS:
++        val = s->ofs;
++        break;
++    case ADC_CAL:
++        val = s->cal;
++        break;
++    case ADC_PCTL:
++        val = s->pctl;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "imx6.adc: read of bad offset "
++                      "0x%" HWADDR_PRIx "\n", off);
++        val = 0;
++        break;
++    }
++    return val;
++}
++
++static void imx6_adc_write(void *opaque, hwaddr off, uint64_t val,
++                           unsigned size)
++{
++    Imx6AdcState *s = IMX6_ADC(opaque);
++
++    switch (off) {
++    case ADC_HC0:
++        s->hc[0] = val;
++        if (ADC_ADCH(val) != ADC_CONV_DISABLE || (s->gc & ADC_GC_CAL)) {
++            /* A real channel, or the calibration trigger (HC0 = 0x9f). */
++            adc_start_conversion(s);
++        }
++        break;
++
++    case ADC_HC1:
++        s->hc[1] = val;
++        if (ADC_ADCH(val) != ADC_CONV_DISABLE) {
++            s->r[1] = adc_channel_sample(s, ADC_ADCH(val)) & ADC_12BIT_MASK;
++            s->hs |= ADC_HS_COCO(1);
++            adc_update_irq(s);
++        }
++        break;
++
++    case ADC_CFG:
++        s->cfg = val;
++        break;
++    case ADC_GC:
++        s->gc = val;
++        /*
++         * CAL is a self-clearing trigger: the driver points HC0 at
++         * "conversion disabled" (the calibration sample) first and then
++         * sets CAL, so the conversion starts here.
++         */
++        if ((val & ADC_GC_CAL) && ADC_ADCH(s->hc[0]) == ADC_CONV_DISABLE) {
++            adc_start_conversion(s);
++        }
++        break;
++    case ADC_GS:
++        s->gs = val & ADC_GS_ADACT; /* only ADACT is software-visible */
++        break;
++    case ADC_CV:
++        s->cv = val;
++        break;
++    case ADC_OFS:
++        s->ofs = val;
++        break;
++    case ADC_CAL:
++        s->cal = val;
++        break;
++    case ADC_PCTL:
++        s->pctl = val;
++        break;
++
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "imx6.adc: write to bad offset "
++                      "0x%" HWADDR_PRIx " = 0x%08" PRIx64 "\n", off, val);
++        break;
++    }
++}
++
++static const MemoryRegionOps imx6_adc_ops = {
++    .read = imx6_adc_read,
++    .write = imx6_adc_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void imx6_adc_reset(DeviceState *dev)
++{
++    Imx6AdcState *s = IMX6_ADC(dev);
++
++    s->hc[0] = ADC_CONV_DISABLE;
++    s->hc[1] = ADC_CONV_DISABLE;
++    s->hs = 0;
++    s->r[0] = 0;
++    s->r[1] = 0;
++    s->cfg = 0;
++    s->gc = 0;
++    s->gs = 0;
++    s->cv = 0;
++    s->ofs = 0;
++    s->cal = 0;
++    s->pctl = 0;
++}
++
++static void imx6_adc_realize(DeviceState *dev, Error **errp)
++{
++    Imx6AdcState *s = IMX6_ADC(dev);
++
++    memory_region_init_io(&s->iomem, OBJECT(dev), &imx6_adc_ops, s,
++                          TYPE_IMX6_ADC, IMX6_ADC_REG_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++
++    /*
++     * The gate line is the power of the analog front end: the wheel's
++     * hall-enable (GPIO7_IO02, active low) or the battery divider's
++     * enable (GPIO6_IO16, active high). qemu_set_irq starts at 0.
++     */
++    qdev_init_gpio_in(dev, imx6_adc_gate_set, 1);
++    s->convert = timer_new_ns(QEMU_CLOCK_VIRTUAL, adc_convert_done, s);
++}
++
++static void imx6_adc_unrealize(DeviceState *dev)
++{
++    Imx6AdcState *s = IMX6_ADC(dev);
++
++    timer_del(s->convert);
++    timer_free(s->convert);
++}
++
++static const Property imx6_adc_properties[] = {
++    /* Wheel geometry: one detent per quadrature cycle. */
++    DEFINE_PROP_UINT64("wheel-position", Imx6AdcState, wheel_position, 0),
++    DEFINE_PROP_UINT32("wheel-steps", Imx6AdcState, wheel_steps, 24),
++    DEFINE_PROP_UINT32("wheel-amplitude", Imx6AdcState, amplitude, 0x180),
++    DEFINE_PROP_UINT32("wheel-mid1", Imx6AdcState, mid1, 0x7ad),
++    DEFINE_PROP_UINT32("wheel-mid2", Imx6AdcState, mid2, 0x7f6),
++    /* What channel 0 (the battery divider) reads while enabled. */
++    DEFINE_PROP_UINT32("ch0-sample", Imx6AdcState, ch0_sample, 3450),
++    /* Gate line polarity: hall-enable is active low, the divider high. */
++    DEFINE_PROP_BOOL("gate-active-low", Imx6AdcState, gate_active_low, false),
++};
++
++static const VMStateDescription vmstate_imx6_adc = {
++    .name = TYPE_IMX6_ADC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(hc, Imx6AdcState, 2),
++        VMSTATE_UINT32(hs, Imx6AdcState),
++        VMSTATE_UINT32_ARRAY(r, Imx6AdcState, 2),
++        VMSTATE_UINT32(cfg, Imx6AdcState),
++        VMSTATE_UINT32(gc, Imx6AdcState),
++        VMSTATE_UINT32(gs, Imx6AdcState),
++        VMSTATE_UINT32(cv, Imx6AdcState),
++        VMSTATE_UINT32(ofs, Imx6AdcState),
++        VMSTATE_UINT32(cal, Imx6AdcState),
++        VMSTATE_UINT32(pctl, Imx6AdcState),
++        VMSTATE_BOOL(gate, Imx6AdcState),
++        VMSTATE_BOOL(gate_active_low, Imx6AdcState),
++        VMSTATE_UINT64(wheel_position, Imx6AdcState),
++        VMSTATE_UINT32(wheel_steps, Imx6AdcState),
++        VMSTATE_UINT32(amplitude, Imx6AdcState),
++        VMSTATE_UINT32(mid1, Imx6AdcState),
++        VMSTATE_UINT32(mid2, Imx6AdcState),
++        VMSTATE_UINT32(ch0_sample, Imx6AdcState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx6_adc_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = imx6_adc_realize;
++    dc->unrealize = imx6_adc_unrealize;
++    device_class_set_legacy_reset(dc, imx6_adc_reset);
++    device_class_set_props(dc, imx6_adc_properties);
++    dc->vmsd = &vmstate_imx6_adc;
++    dc->desc = "i.MX6SX / vf610 ADC";
++}
++
++static const TypeInfo imx6_adc_info = {
++    .name = TYPE_IMX6_ADC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Imx6AdcState),
++    .class_init = imx6_adc_class_init,
++};
++
++static void imx6_adc_register_types(void)
++{
++    type_register_static(&imx6_adc_info);
++}
++
++type_init(imx6_adc_register_types)
+diff --git a/hw/adc/meson.build b/hw/adc/meson.build
+index 7f7acc1..8574ecb 100644
+--- a/hw/adc/meson.build
++++ b/hw/adc/meson.build
+@@ -1,4 +1,5 @@
+ system_ss.add(when: 'CONFIG_STM32F2XX_ADC', if_true: files('stm32f2xx_adc.c'))
++system_ss.add(when: 'CONFIG_IMX', if_true: files('imx6_adc.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_adc.c'))
+ system_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx_adc.c'))
+ system_ss.add(when: 'CONFIG_ZYNQ', if_true: files('zynq-xadc.c'))
+diff --git a/include/hw/adc/imx6_adc.h b/include/hw/adc/imx6_adc.h
+new file mode 100644
+index 0000000..23a353e
+--- /dev/null
++++ b/include/hw/adc/imx6_adc.h
+@@ -0,0 +1,45 @@
++/*
++ * i.MX6SX / vf610 ADC — see imx6_adc.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_ADC_IMX6_ADC_H
++#define HW_ADC_IMX6_ADC_H
++
++#include "system/memory.h"
++#include "hw/core/sysbus.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_IMX6_ADC "imx6.adc"
++OBJECT_DECLARE_SIMPLE_TYPE(Imx6AdcState, IMX6_ADC)
++
++#define IMX6_ADC_REG_SIZE   0x4000
++
++struct Imx6AdcState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++
++    /* Hardware registers */
++    uint32_t hc[2];     /* HC0/HC1: channel + AIEN */
++    uint32_t hs;        /* COCO flags */
++    uint32_t r[2];      /* R0/R1: last results */
++    uint32_t cfg, gc, gs, cv, ofs, cal, pctl;
++
++    /* The outside world */
++    bool gate;              /* level of the gate line */
++    bool gate_active_low;   /* hall-enable: low = powered */
++
++    /* The wheel (adc@02280000) */
++    uint64_t wheel_position; /* detents, set from the UI via QMP */
++    uint32_t wheel_steps;   /* detents per revolution */
++    uint32_t amplitude;     /* Hall swing around the midpoints, LSB */
++    uint32_t mid1, mid2;    /* DT: adc-channel-midpoints, channels 1/2 */
++    uint32_t ch0_sample;    /* battery divider reading while enabled */
++
++    QEMUTimer *convert;     /* completes the pending conversion */
++};
++
++#endif /* HW_ADC_IMX6_ADC_H */
+-- 
+2.55.0
+

@@ -1,0 +1,202 @@
+From c5155d9354e0b2bf36d6c28dc0bed8132304780b Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 73/91] hw/usb: OMAP3 HS USB OTG as an unplugged peripheral
+
+---
+ hw/usb/omap3_musb.c | 183 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 183 insertions(+)
+ create mode 100644 hw/usb/omap3_musb.c
+
+diff --git a/hw/usb/omap3_musb.c b/hw/usb/omap3_musb.c
+new file mode 100644
+index 0000000..c008d3c
+--- /dev/null
++++ b/hw/usb/omap3_musb.c
+@@ -0,0 +1,183 @@
++/*
++ * OMAP3 HS USB OTG controller (Mentor MUSBMHDRC with TI's OTG wrapper),
++ * as a peripheral with nothing plugged in
++ *
++ * The MUSB core's registers read back what was written, except
++ * CONFIGDATA, which reports the OMAP3630's core: dynamic FIFOs, so the
++ * driver lays its endpoints out from the board's FIFO table (fifo_mode 4,
++ * 16 endpoints) as on the chip and a gadget gets as many as it binds.
++ * The wrapper's soft reset completes at once. With no host on the cable
++ * the gadget driver probes and then waits for a session that never
++ * comes, as on a unit off USB. (USB device mode is not modelled.)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_MUSB "omap3-musb"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3MusbState, OMAP3_MUSB)
++
++#define MUSB_CORE_SIZE      0x400
++#define MUSB_INDEX          0x0e
++#define MUSB_CONFIGDATA     0x1f        /* with INDEX 0; FIFOSIZE otherwise */
++/* MPRXE | MPTXE | HBRXE | HBTXE | DYNFIFO | SOFTCONE */
++#define OMAP3_CONFIGDATA    0xde
++#define OTG_REVISION        0x400
++#define OTG_SYSCONFIG       0x404
++#define OTG_SYSSTATUS       0x408
++#define OTG_INTERFSEL       0x40c
++#define OTG_SIMENABLE       0x410
++#define OTG_FORCESTDBY      0x414
++#define OTG_BIGENDIAN       0x418
++
++struct Omap3MusbState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    uint8_t core[MUSB_CORE_SIZE];
++    uint32_t sysconfig;
++    uint32_t interfsel;
++    uint32_t simenable;
++    uint32_t forcestdby;
++};
++
++static uint64_t musb_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3MusbState *s = opaque;
++    uint64_t v = 0;
++
++    if (addr < MUSB_CORE_SIZE) {
++        for (unsigned i = 0; i < size && addr + i < MUSB_CORE_SIZE; i++) {
++            uint8_t byte = s->core[addr + i];
++            if (addr + i == MUSB_CONFIGDATA && s->core[MUSB_INDEX] == 0) {
++                byte = OMAP3_CONFIGDATA;
++            }
++            v |= (uint64_t)byte << (8 * i);
++        }
++        return v;
++    }
++    switch (addr) {
++    case OTG_REVISION:
++        return 0x33;
++    case OTG_SYSCONFIG:
++        return s->sysconfig;
++    case OTG_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case OTG_INTERFSEL:
++        return s->interfsel;
++    case OTG_SIMENABLE:
++        return s->simenable;
++    case OTG_FORCESTDBY:
++        return s->forcestdby;
++    case OTG_BIGENDIAN:
++        return 0;
++    }
++    qemu_log_mask(LOG_UNIMP, "omap3-musb: read at 0x%" HWADDR_PRIx "\n", addr);
++    return 0;
++}
++
++static void musb_reset(DeviceState *dev)
++{
++    Omap3MusbState *s = OMAP3_MUSB(dev);
++
++    memset(s->core, 0, sizeof(s->core));
++    s->sysconfig = 0;
++    s->interfsel = 1;                   /* ULPI */
++    s->simenable = 0;
++    s->forcestdby = 1;
++}
++
++static void musb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3MusbState *s = opaque;
++
++    if (addr < MUSB_CORE_SIZE) {
++        for (unsigned i = 0; i < size && addr + i < MUSB_CORE_SIZE; i++) {
++            s->core[addr + i] = val >> (8 * i);
++        }
++        return;
++    }
++    switch (addr) {
++    case OTG_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            musb_reset(DEVICE(s));
++            return;
++        }
++        s->sysconfig = val;
++        return;
++    case OTG_INTERFSEL:
++        s->interfsel = val;
++        return;
++    case OTG_SIMENABLE:
++        s->simenable = val;
++        return;
++    case OTG_FORCESTDBY:
++        s->forcestdby = val;
++        return;
++    }
++    qemu_log_mask(LOG_UNIMP, "omap3-musb: write at 0x%" HWADDR_PRIx "\n", addr);
++}
++
++static const MemoryRegionOps musb_ops = {
++    .read = musb_read,
++    .write = musb_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static void musb_init(Object *obj)
++{
++    Omap3MusbState *s = OMAP3_MUSB(obj);
++
++    memory_region_init_io(&s->iomem, obj, &musb_ops, s, "omap3-musb", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static const VMStateDescription musb_vmstate = {
++    .name = TYPE_OMAP3_MUSB,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8_ARRAY(core, Omap3MusbState, MUSB_CORE_SIZE),
++        VMSTATE_UINT32(sysconfig, Omap3MusbState),
++        VMSTATE_UINT32(interfsel, Omap3MusbState),
++        VMSTATE_UINT32(simenable, Omap3MusbState),
++        VMSTATE_UINT32(forcestdby, Omap3MusbState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void musb_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, musb_reset);
++    dc->vmsd = &musb_vmstate;
++    dc->desc = "OMAP3 HS USB OTG (unplugged peripheral)";
++}
++
++static const TypeInfo musb_info = {
++    .name = TYPE_OMAP3_MUSB,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3MusbState),
++    .instance_init = musb_init,
++    .class_init = musb_class_init,
++};
++
++static void musb_register_types(void)
++{
++    type_register_static(&musb_info);
++}
++
++type_init(musb_register_types)
+-- 
+2.55.0
+

@@ -1,0 +1,25 @@
+From 29e61e279957afe53d24a67188342e2bef2eb118 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 90/91] hw/arm: build the OMAP3630 SoC and the j49 machine
+
+---
+ hw/arm/meson.build | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index 36bcf92..e93fb08 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -40,6 +40,8 @@ arm_common_ss.add(when: 'CONFIG_FSL_IMX25', if_true: files('fsl-imx25.c', 'imx25
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX31', if_true: files('fsl-imx31.c', 'kzm.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6', if_true: files('fsl-imx6.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6SX', if_true: files('fsl-imx6sx.c'))
++arm_common_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3630.c'))
++arm_common_ss.add(when: 'CONFIG_J49', if_true: files('j49.c', 'j49_board.c'))
+ arm_common_ss.add(when: 'CONFIG_FLINTSTONE', if_true: files('flintstone.c',
+                                                             'flintstone_board.c'))
+ arm_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files(
+-- 
+2.55.0
+

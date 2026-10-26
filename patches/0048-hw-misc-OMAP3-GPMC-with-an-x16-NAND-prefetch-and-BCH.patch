@@ -1,0 +1,786 @@
+From 92b056d6214cb6ddc5d0c24c094f2e9999c119ce Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 48/91] hw/misc: OMAP3 GPMC with an x16 NAND, prefetch and BCH
+ engines
+
+---
+ hw/misc/omap3_gpmc.c | 766 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 766 insertions(+)
+ create mode 100644 hw/misc/omap3_gpmc.c
+
+diff --git a/hw/misc/omap3_gpmc.c b/hw/misc/omap3_gpmc.c
+new file mode 100644
+index 0000000..0fc48d0
+--- /dev/null
++++ b/hw/misc/omap3_gpmc.c
+@@ -0,0 +1,766 @@
++/*
++ * OMAP3 general-purpose memory controller (GPMC) with a NAND flash on
++ * one chip select and the BCH ECC engine
++ *
++ * The NAND is the board's Micron MT29F2G16 (x16, 2048 + 64 byte pages, 64
++ * pages a block), its backend a raw image: each
++ * page's 2048 data bytes followed by its 64 OOB bytes, ECC included.
++ * Software reaches it through the chip select's NAND_COMMAND/ADDRESS/DATA
++ * registers, or the chip select's window for data (Linux and U-Boot read
++ * through the window, x-loader through NAND_DATA). Programming ANDs into
++ * the page and erasing fills the block with 0xff, as flash does; both are
++ * refused while GPMC_CONFIG drives the write-protect pin low.
++ *
++ * The chip has no ONFI parameter page: READ ID at 0x20 repeats the ID, so
++ * software sizes it from the ID's fourth byte (0x55: 2 KiB pages, 64-byte
++ * OOB, 128 KiB blocks, x16).
++ *
++ * The prefetch/write-posting engine (polled use, as Linux drives it): once
++ * started for TRANSFERCOUNT bytes on the NAND's chip select, its FIFO
++ * always holds (or has room for) the next min(64, remaining) bytes, which
++ * software moves through the chip-select window; COUNTVALUE reaches 0
++ * when they have all gone through.
++ *
++ * BCH engine: every byte moved through the data port of the configured chip
++ * select while the engine is enabled is recorded. In wrap mode 6 (writing)
++ * a sector's result is the BCH4 parity of its 512 data bytes; in wrap
++ * mode 9 (reading), once the page's OOB has also been read, it is the
++ * received code word (data, then the stored code at OOB 36 + 7 * sector)
++ * times x^52, modulo the generator: zero when it is intact. That is the
++ * form the decoders x-loader, U-Boot and Linux share expect, data bit
++ * 8 * byte + bit (LSB first) at degree 104 + 4095 - (8 * byte + 7 - bit);
++ * a flipped parity bit lands below degree 104, where they find no data
++ * error to correct ("BCH decoding failed", the data left as read).
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/omap3_gpmc.h"
++#include "hw/misc/omap3_bch.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "migration/vmstate.h"
++#include "system/block-backend.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/units.h"
++
++#define GPMC_REVISION           0x000
++#define GPMC_SYSCONFIG          0x010
++#define GPMC_SYSSTATUS          0x014
++#define GPMC_IRQSTATUS          0x018
++#define GPMC_IRQENABLE          0x01c
++#define GPMC_TIMEOUT_CONTROL    0x040
++#define GPMC_ERR_ADDRESS        0x044
++#define GPMC_ERR_TYPE           0x048
++#define GPMC_CONFIG             0x050
++#define GPMC_STATUS             0x054
++#define GPMC_CS_BASE            0x060   /* + 0x30 * cs */
++#define GPMC_CS_STRIDE          0x30
++#define GPMC_CS_CONFIG1         0x00
++#define GPMC_CS_CONFIG7         0x18
++#define GPMC_CS_NAND_COMMAND    0x1c
++#define GPMC_CS_NAND_ADDRESS    0x20
++#define GPMC_CS_NAND_DATA       0x24
++#define GPMC_PREFETCH_CONFIG1   0x1e0
++#define GPMC_PREFETCH_CONFIG2   0x1e4
++#define GPMC_PREFETCH_CONTROL   0x1ec
++#define GPMC_PREFETCH_STATUS    0x1f0
++#define GPMC_ECC_CONFIG         0x1f4
++#define GPMC_ECC_CONTROL        0x1f8
++#define GPMC_ECC_SIZE_CONFIG    0x1fc
++#define GPMC_ECC_RESULT         0x200   /* 1..9 */
++#define GPMC_BCH_RESULT         0x240   /* + 0x10 * sector, 4 words */
++#define GPMC_BCH_SWDATA         0x2d0
++
++#define CONFIG_WRITEPROTECT     (1 << 4)
++#define STATUS_EMPTYWRITEBUFFER (1 << 0)
++#define STATUS_WAIT0            (1 << 8)
++#define IRQ_WAIT0EDGE           (1 << 8)
++
++#define CONFIG1_DEVICESIZE(v)   (((v) >> 12) & 3)
++#define CONFIG7_BASE(v)         ((v) & 0x3f)
++#define CONFIG7_CSVALID         (1 << 6)
++#define CONFIG7_MASK(v)         (((v) >> 8) & 0xf)
++
++#define PREFETCH_ENGINE_CS(v)   (((v) >> 24) & 7)
++#define PREFETCH_ENABLEENGINE   (1 << 7)
++#define PREFETCH_STARTENGINE    (1 << 0)
++#define PREFETCH_FIFO           64
++#define IRQ_TERMINALCOUNT       (1 << 1)
++
++#define ECC_CONFIG_ENABLE       (1 << 0)
++#define ECC_CONFIG_CS(v)        (((v) >> 1) & 7)
++#define ECC_CONFIG_TOPSECTOR(v) (((v) >> 4) & 7)
++#define ECC_CONFIG_WRAPMODE(v)  (((v) >> 8) & 0xf)
++#define ECC_CONFIG_BCHT8        (1 << 12)
++#define ECC_CONFIG_BCH          (1 << 16)
++#define ECC_CONTROL_CLEAR       (1 << 8)
++
++#define BCH4_WRAP_READ          9
++#define BCH4_ECC_OFFSET         36
++#define BCH4_ECC_BYTES          7
++
++/* what data-port reads return */
++enum {
++    OUT_NONE,
++    OUT_ID,
++    OUT_STATUS,
++    OUT_PAGE,
++};
++
++#define NAND_STATUS_READY       0x60
++#define NAND_STATUS_NOT_WP      0x80
++#define NAND_STATUS_FAIL        0x01
++
++static bool gpmc_nand_wide(Omap3GpmcState *s)
++{
++    return CONFIG1_DEVICESIZE(s->cs_config[s->nand_cs][0]) == 1;
++}
++
++static uint64_t gpmc_page_offset(uint32_t row)
++{
++    return (uint64_t)row * OMAP3_NAND_PAGE_RAW;
++}
++
++static void gpmc_nand_load(Omap3GpmcState *s)
++{
++    if (s->row >= s->nand_pages ||
++        blk_pread(s->blk, gpmc_page_offset(s->row), OMAP3_NAND_PAGE_RAW,
++                  s->page_buf, 0) < 0) {
++        memset(s->page_buf, 0xff, sizeof(s->page_buf));
++    }
++}
++
++static bool gpmc_nand_writable(Omap3GpmcState *s)
++{
++    return s->config & CONFIG_WRITEPROTECT;     /* nWP driven high */
++}
++
++static void gpmc_nand_ready(Omap3GpmcState *s)
++{
++    s->irqstatus |= IRQ_WAIT0EDGE;
++    qemu_set_irq(s->irq, !!(s->irqstatus & s->irqenable));
++}
++
++static void gpmc_nand_program(Omap3GpmcState *s)
++{
++    uint8_t page[OMAP3_NAND_PAGE_RAW];
++
++    s->status &= ~NAND_STATUS_FAIL;
++    if (!gpmc_nand_writable(s) || s->row >= s->nand_pages ||
++        blk_pread(s->blk, gpmc_page_offset(s->row), sizeof(page), page, 0) < 0) {
++        s->status |= NAND_STATUS_FAIL;
++        return;
++    }
++    for (int i = 0; i < OMAP3_NAND_PAGE_RAW; i++) {
++        page[i] &= s->page_buf[i];
++    }
++    if (blk_pwrite(s->blk, gpmc_page_offset(s->row), sizeof(page), page, 0) < 0) {
++        s->status |= NAND_STATUS_FAIL;
++    }
++}
++
++static void gpmc_nand_erase(Omap3GpmcState *s)
++{
++    uint32_t first = s->row & ~(OMAP3_NAND_PAGES_PER_BLOCK - 1);
++    uint64_t len = (uint64_t)OMAP3_NAND_PAGES_PER_BLOCK * OMAP3_NAND_PAGE_RAW;
++    g_autofree uint8_t *block = NULL;
++
++    s->status &= ~NAND_STATUS_FAIL;
++    if (!gpmc_nand_writable(s) || first >= s->nand_pages) {
++        s->status |= NAND_STATUS_FAIL;
++        return;
++    }
++    block = g_malloc(len);
++    memset(block, 0xff, len);
++    if (blk_pwrite(s->blk, gpmc_page_offset(first), len, block, 0) < 0) {
++        s->status |= NAND_STATUS_FAIL;
++    }
++}
++
++/* Column cycles count words on an x16 part. */
++static uint32_t gpmc_nand_column(Omap3GpmcState *s)
++{
++    uint32_t col = s->addr[0] | (s->addr[1] << 8);
++
++    return gpmc_nand_wide(s) ? col * 2 : col;
++}
++
++static void gpmc_nand_command(Omap3GpmcState *s, uint8_t cmd)
++{
++    switch (cmd) {
++    case 0xff:                  /* RESET */
++        s->out_mode = OUT_NONE;
++        s->programming = false;
++        s->status = NAND_STATUS_READY | NAND_STATUS_NOT_WP;
++        gpmc_nand_ready(s);
++        break;
++    case 0x90:                  /* READ ID */
++    case 0x00:                  /* READ */
++    case 0x05:                  /* CHANGE READ COLUMN */
++    case 0x60:                  /* BLOCK ERASE */
++        s->naddr = 0;
++        break;
++    case 0x80:                  /* PROGRAM */
++        s->naddr = 0;
++        s->programming = true;
++        memset(s->page_buf, 0xff, sizeof(s->page_buf));
++        break;
++    case 0x85:                  /* CHANGE WRITE COLUMN */
++        s->naddr = 0;
++        break;
++    case 0x30:                  /* READ confirm */
++        s->col = gpmc_nand_column(s);
++        s->row = s->addr[2] | (s->addr[3] << 8) | (s->addr[4] << 16);
++        gpmc_nand_load(s);
++        s->out_mode = OUT_PAGE;
++        gpmc_nand_ready(s);
++        break;
++    case 0xe0:                  /* CHANGE READ COLUMN confirm */
++        s->col = gpmc_nand_column(s);
++        s->out_mode = OUT_PAGE;
++        break;
++    case 0x10:                  /* PROGRAM confirm */
++        if (s->programming) {
++            gpmc_nand_program(s);
++            s->programming = false;
++        }
++        s->out_mode = OUT_STATUS;
++        gpmc_nand_ready(s);
++        break;
++    case 0xd0:                  /* BLOCK ERASE confirm */
++        s->row = s->addr[0] | (s->addr[1] << 8) | (s->addr[2] << 16);
++        gpmc_nand_erase(s);
++        s->out_mode = OUT_STATUS;
++        gpmc_nand_ready(s);
++        break;
++    case 0x70:                  /* READ STATUS */
++        s->out_mode = OUT_STATUS;
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "omap3-gpmc: NAND command 0x%02x\n", cmd);
++        return;
++    }
++    s->cmd = cmd;
++}
++
++static void gpmc_nand_address(Omap3GpmcState *s, uint8_t a)
++{
++    if (s->naddr < sizeof(s->addr)) {
++        s->addr[s->naddr] = a;
++    }
++    s->naddr++;
++    switch (s->cmd) {
++    case 0x90:
++        s->out_mode = OUT_ID;
++        s->col = 0;
++        break;
++    case 0x80:
++        if (s->naddr == 5) {
++            s->col = gpmc_nand_column(s);
++            s->row = s->addr[2] | (s->addr[3] << 8) | (s->addr[4] << 16);
++        }
++        break;
++    case 0x85:
++        if (s->naddr == 2) {
++            s->col = gpmc_nand_column(s);
++        }
++        break;
++    }
++}
++
++static void gpmc_ecc_feed(Omap3GpmcState *s, uint8_t b)
++{
++    if ((s->ecc_config & ECC_CONFIG_ENABLE) &&
++        ECC_CONFIG_CS(s->ecc_config) == s->nand_cs &&
++        s->ecc_count < sizeof(s->ecc_buf)) {
++        s->ecc_buf[s->ecc_count++] = b;
++    }
++}
++
++/* One bus cycle on the data port: a byte, or a word on an x16 part. */
++static uint32_t gpmc_nand_read_cycle(Omap3GpmcState *s)
++{
++    int n = gpmc_nand_wide(s) ? 2 : 1;
++    uint32_t v = 0;
++
++    switch (s->out_mode) {
++    case OUT_ID:                /* one ID byte per cycle, on D[7:0] */
++        v = s->col < sizeof(s->nand_id) ? s->nand_id[s->col] : 0;
++        s->col++;
++        return v;
++    case OUT_STATUS:
++        return s->status;
++    case OUT_PAGE:
++        for (int i = 0; i < n; i++) {
++            uint8_t b = s->col < OMAP3_NAND_PAGE_RAW ? s->page_buf[s->col] : 0xff;
++
++            s->col++;
++            gpmc_ecc_feed(s, b);
++            v |= b << (8 * i);
++        }
++        return v;
++    default:
++        return 0;
++    }
++}
++
++static void gpmc_nand_write_cycle(Omap3GpmcState *s, uint32_t v)
++{
++    int n = gpmc_nand_wide(s) ? 2 : 1;
++
++    for (int i = 0; i < n; i++) {
++        uint8_t b = v >> (8 * i);
++
++        gpmc_ecc_feed(s, b);
++        if (s->programming && s->col < OMAP3_NAND_PAGE_RAW) {
++            s->page_buf[s->col] = b;
++        }
++        s->col++;
++    }
++}
++
++static uint64_t gpmc_nand_data_read(Omap3GpmcState *s, unsigned size)
++{
++    int bus = gpmc_nand_wide(s) ? 2 : 1;
++    int cycles = MAX(size / bus, 1);
++    uint64_t v = 0;
++
++    for (int i = 0; i < cycles; i++) {
++        v |= (uint64_t)gpmc_nand_read_cycle(s) << (8 * bus * i);
++    }
++    return v;
++}
++
++static void gpmc_nand_data_write(Omap3GpmcState *s, uint64_t v, unsigned size)
++{
++    int bus = gpmc_nand_wide(s) ? 2 : 1;
++    int cycles = MAX(size / bus, 1);
++
++    for (int i = 0; i < cycles; i++) {
++        gpmc_nand_write_cycle(s, v >> (8 * bus * i));
++    }
++}
++
++static bool gpmc_prefetch_running(Omap3GpmcState *s)
++{
++    return (s->prefetch_control & PREFETCH_STARTENGINE) &&
++           (s->prefetch_config1 & PREFETCH_ENABLEENGINE) &&
++           PREFETCH_ENGINE_CS(s->prefetch_config1) == s->nand_cs;
++}
++
++static void gpmc_prefetch_moved(Omap3GpmcState *s, unsigned size)
++{
++    if (!gpmc_prefetch_running(s) || !s->prefetch_remaining) {
++        return;
++    }
++    s->prefetch_remaining -= MIN(size, s->prefetch_remaining);
++    if (!s->prefetch_remaining) {
++        s->irqstatus |= IRQ_TERMINALCOUNT;
++        qemu_set_irq(s->irq, !!(s->irqstatus & s->irqenable));
++    }
++}
++
++static uint64_t gpmc_window_read(void *opaque, hwaddr addr, unsigned size)
++{
++    uint64_t v = gpmc_nand_data_read(opaque, size);
++
++    gpmc_prefetch_moved(opaque, size);
++    return v;
++}
++
++static void gpmc_window_write(void *opaque, hwaddr addr, uint64_t val,
++                              unsigned size)
++{
++    gpmc_nand_data_write(opaque, val, size);
++    gpmc_prefetch_moved(opaque, size);
++}
++
++static const MemoryRegionOps gpmc_window_ops = {
++    .read = gpmc_window_read,
++    .write = gpmc_window_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++/* Map the NAND's data window where its CONFIG7 puts it, if valid. */
++static void gpmc_update_window(Omap3GpmcState *s)
++{
++    uint32_t c7 = s->cs_config[s->nand_cs][6];
++    /* MASKADDRESS 0b1111: 16 MiB, 0b1110: 32 MiB ... 0b0000: 256 MiB */
++    uint64_t size = (16 * MiB) << ctz32(CONFIG7_MASK(c7) | 0x10);
++
++    if (memory_region_is_mapped(&s->nand_window)) {
++        memory_region_del_subregion(&s->cs_space, &s->nand_window);
++    }
++    if (!(c7 & CONFIG7_CSVALID)) {
++        return;
++    }
++    memory_region_set_size(&s->nand_window, MIN(size, 256 * MiB));
++    memory_region_add_subregion_overlap(&s->cs_space,
++                                        (uint64_t)CONFIG7_BASE(c7) << 24,
++                                        &s->nand_window, 1);
++}
++
++/* A sector's BCH result: 52 bits, low word first. */
++static uint64_t gpmc_bch_result(Omap3GpmcState *s, int sector)
++{
++    const uint8_t *data = s->ecc_buf + sector * 512;
++    uint32_t ecc_end = OMAP3_NAND_PAGE + BCH4_ECC_OFFSET +
++                       (sector + 1) * BCH4_ECC_BYTES;
++    uint64_t parity, stored = 0;
++
++    if (!(s->ecc_config & ECC_CONFIG_BCH) || (s->ecc_config & ECC_CONFIG_BCHT8)) {
++        qemu_log_mask(LOG_UNIMP, "omap3-gpmc: ECC config 0x%x\n", s->ecc_config);
++        return 0;
++    }
++    if (sector > ECC_CONFIG_TOPSECTOR(s->ecc_config) ||
++        s->ecc_count < (sector + 1) * 512) {
++        return 0;
++    }
++    parity = omap3_bch4_parity(data, 512);
++    if (ECC_CONFIG_WRAPMODE(s->ecc_config) == BCH4_WRAP_READ &&
++        s->ecc_count >= ecc_end) {
++        for (int i = 0; i < BCH4_ECC_BYTES; i++) {
++            stored = stored << 8 | s->ecc_buf[ecc_end - BCH4_ECC_BYTES + i];
++        }
++        parity ^= stored & ((1ull << OMAP3_BCH4_BITS) - 1);
++        parity = omap3_bch4_mulx52(parity);
++    }
++    return parity;
++}
++
++static uint64_t gpmc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3GpmcState *s = opaque;
++
++    if (addr >= GPMC_CS_BASE &&
++        addr < GPMC_CS_BASE + GPMC_CS_STRIDE * OMAP3_GPMC_NUM_CS) {
++        int cs = (addr - GPMC_CS_BASE) / GPMC_CS_STRIDE;
++        hwaddr reg = (addr - GPMC_CS_BASE) % GPMC_CS_STRIDE;
++
++        if (reg <= GPMC_CS_CONFIG7) {
++            return s->cs_config[cs][reg / 4];
++        }
++        if (reg == GPMC_CS_NAND_DATA && cs == s->nand_cs) {
++            return gpmc_nand_data_read(s, size);
++        }
++        return 0;
++    }
++    if (addr >= GPMC_BCH_RESULT && addr < GPMC_BCH_RESULT + 0x10 * 8) {
++        int sector = (addr - GPMC_BCH_RESULT) / 0x10;
++        uint64_t r = gpmc_bch_result(s, sector);
++
++        switch ((addr - GPMC_BCH_RESULT) % 0x10) {
++        case 0:
++            return (uint32_t)r;
++        case 4:
++            return r >> 32;
++        default:
++            return 0;
++        }
++    }
++
++    switch (addr) {
++    case GPMC_REVISION:
++        return 0x50;
++    case GPMC_SYSCONFIG:
++        return s->sysconfig;
++    case GPMC_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case GPMC_IRQSTATUS:
++        return s->irqstatus;
++    case GPMC_IRQENABLE:
++        return s->irqenable;
++    case GPMC_TIMEOUT_CONTROL:
++        return s->timeout_control;
++    case GPMC_ERR_ADDRESS:
++    case GPMC_ERR_TYPE:
++        return 0;
++    case GPMC_CONFIG:
++        return s->config;
++    case GPMC_STATUS:
++        return STATUS_EMPTYWRITEBUFFER | STATUS_WAIT0;
++    case GPMC_PREFETCH_CONFIG1:
++        return s->prefetch_config1;
++    case GPMC_PREFETCH_CONFIG2:
++        return s->prefetch_config2;
++    case GPMC_PREFETCH_CONTROL:
++        return s->prefetch_control;
++    case GPMC_PREFETCH_STATUS:
++        if (!gpmc_prefetch_running(s)) {
++            return 0;
++        }
++        /* FIFOPOINTER: bytes ready (reading) or free (posting) */
++        return MIN(PREFETCH_FIFO, s->prefetch_remaining) << 24 |
++               (s->prefetch_remaining > PREFETCH_FIFO ? 1 << 16 : 0) |
++               (s->prefetch_remaining & 0x3fff);
++    case GPMC_ECC_CONFIG:
++        return s->ecc_config;
++    case GPMC_ECC_CONTROL:
++        return s->ecc_control;
++    case GPMC_ECC_SIZE_CONFIG:
++        return s->ecc_size_config;
++    case GPMC_ECC_RESULT ... GPMC_ECC_RESULT + 0x20:
++        qemu_log_mask(LOG_UNIMP, "omap3-gpmc: Hamming ECC result read\n");
++        return 0;
++    case GPMC_BCH_SWDATA:
++        return 0;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-gpmc: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void gpmc_reset(DeviceState *dev)
++{
++    Omap3GpmcState *s = OMAP3_GPMC(dev);
++
++    s->sysconfig = 0;
++    s->irqstatus = 0;
++    s->irqenable = 0;
++    s->timeout_control = 0x1ff0;
++    s->config = 0x00000a00;
++    memset(s->cs_config, 0, sizeof(s->cs_config));
++    /* As the boot ROM leaves it for NAND boot: an x16 NAND on the boot
++     * chip select, valid at 0, 16 MiB. */
++    s->cs_config[s->nand_cs][0] = 0x00001800;
++    s->cs_config[s->nand_cs][6] = 0x00000f40;
++    s->prefetch_config1 = 0x00004000;
++    s->prefetch_config2 = 0;
++    s->prefetch_control = 0;
++    s->prefetch_remaining = 0;
++    s->ecc_config = 0;
++    s->ecc_control = 0;
++    s->ecc_size_config = 0x3fcff000;
++    s->ecc_count = 0;
++    s->cmd = 0;
++    s->naddr = 0;
++    s->out_mode = OUT_NONE;
++    s->programming = false;
++    s->status = NAND_STATUS_READY | NAND_STATUS_NOT_WP;
++    gpmc_update_window(s);
++    qemu_set_irq(s->irq, 0);
++}
++
++static void gpmc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3GpmcState *s = opaque;
++
++    if (addr >= GPMC_CS_BASE &&
++        addr < GPMC_CS_BASE + GPMC_CS_STRIDE * OMAP3_GPMC_NUM_CS) {
++        int cs = (addr - GPMC_CS_BASE) / GPMC_CS_STRIDE;
++        hwaddr reg = (addr - GPMC_CS_BASE) % GPMC_CS_STRIDE;
++
++        if (reg <= GPMC_CS_CONFIG7) {
++            s->cs_config[cs][reg / 4] = val;
++            if (cs == s->nand_cs && reg == GPMC_CS_CONFIG7) {
++                gpmc_update_window(s);
++            }
++            return;
++        }
++        if (cs != s->nand_cs) {
++            return;                     /* nothing on this chip select */
++        }
++        switch (reg) {
++        case GPMC_CS_NAND_COMMAND:
++            gpmc_nand_command(s, val);
++            return;
++        case GPMC_CS_NAND_ADDRESS:
++            gpmc_nand_address(s, val);
++            return;
++        case GPMC_CS_NAND_DATA:
++            gpmc_nand_data_write(s, val, size);
++            return;
++        }
++        return;
++    }
++
++    switch (addr) {
++    case GPMC_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            gpmc_reset(DEVICE(s));
++            return;
++        }
++        s->sysconfig = val;
++        return;
++    case GPMC_IRQSTATUS:
++        s->irqstatus &= ~val;
++        break;
++    case GPMC_IRQENABLE:
++        s->irqenable = val;
++        break;
++    case GPMC_TIMEOUT_CONTROL:
++        s->timeout_control = val;
++        return;
++    case GPMC_CONFIG:
++        s->config = val;
++        return;
++    case GPMC_PREFETCH_CONFIG1:
++        s->prefetch_config1 = val;
++        return;
++    case GPMC_PREFETCH_CONFIG2:
++        s->prefetch_config2 = val;
++        return;
++    case GPMC_PREFETCH_CONTROL:
++        if ((val & PREFETCH_STARTENGINE) &&
++            !(s->prefetch_control & PREFETCH_STARTENGINE)) {
++            s->prefetch_remaining = s->prefetch_config2 & 0x3fff;
++        }
++        s->prefetch_control = val & PREFETCH_STARTENGINE;
++        return;
++    case GPMC_ECC_CONFIG:
++        s->ecc_config = val;
++        return;
++    case GPMC_ECC_CONTROL:
++        if (val & ECC_CONTROL_CLEAR) {
++            s->ecc_count = 0;
++        }
++        s->ecc_control = val & 0xf;
++        return;
++    case GPMC_ECC_SIZE_CONFIG:
++        s->ecc_size_config = val;
++        return;
++    case GPMC_ERR_ADDRESS:
++    case GPMC_ERR_TYPE:
++    case GPMC_BCH_SWDATA:
++        return;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "omap3-gpmc: bad write at 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    qemu_set_irq(s->irq, !!(s->irqstatus & s->irqenable));
++}
++
++static const MemoryRegionOps gpmc_ops = {
++    .read = gpmc_read,
++    .write = gpmc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static void gpmc_realize(DeviceState *dev, Error **errp)
++{
++    Omap3GpmcState *s = OMAP3_GPMC(dev);
++    int64_t len;
++
++    if (!s->blk) {
++        s->nand_pages = 0;
++        return;
++    }
++    if (!blk_supports_write_perm(s->blk)) {
++        error_setg(errp, "omap3-gpmc: the NAND drive must be writable");
++        return;
++    }
++    if (blk_set_perm(s->blk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
++                     BLK_PERM_ALL, errp) < 0) {
++        return;
++    }
++    len = blk_getlength(s->blk);
++    if (len < 0 || len % (OMAP3_NAND_PAGE_RAW * OMAP3_NAND_PAGES_PER_BLOCK)) {
++        error_setg(errp, "omap3-gpmc: the NAND image must hold whole blocks "
++                   "of %d-byte pages (data + OOB)", OMAP3_NAND_PAGE_RAW);
++        return;
++    }
++    s->nand_pages = len / OMAP3_NAND_PAGE_RAW;
++}
++
++static void gpmc_init(Object *obj)
++{
++    Omap3GpmcState *s = OMAP3_GPMC(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &gpmc_ops, s, "omap3-gpmc", 0x1000);
++    memory_region_init(&s->cs_space, obj, "omap3-gpmc-cs", 1 * GiB);
++    memory_region_init_io(&s->nand_window, obj, &gpmc_window_ops, s,
++                          "omap3-gpmc-nand", 16 * MiB);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_mmio(sbd, &s->cs_space);
++    sysbus_init_irq(sbd, &s->irq);
++}
++
++static const Property gpmc_properties[] = {
++    DEFINE_PROP_DRIVE("drive", Omap3GpmcState, blk),
++    DEFINE_PROP_UINT8("nand-cs", Omap3GpmcState, nand_cs, 0),
++    /* Micron MT29F2G16ABBEA: 2c ba 90 55 06 */
++    DEFINE_PROP_UINT8("nand-id0", Omap3GpmcState, nand_id[0], 0x2c),
++    DEFINE_PROP_UINT8("nand-id1", Omap3GpmcState, nand_id[1], 0xba),
++    DEFINE_PROP_UINT8("nand-id2", Omap3GpmcState, nand_id[2], 0x90),
++    DEFINE_PROP_UINT8("nand-id3", Omap3GpmcState, nand_id[3], 0x55),
++    DEFINE_PROP_UINT8("nand-id4", Omap3GpmcState, nand_id[4], 0x06),
++};
++
++static int gpmc_post_load(void *opaque, int version_id)
++{
++    gpmc_update_window(opaque);
++    return 0;
++}
++
++static const VMStateDescription gpmc_vmstate = {
++    .name = TYPE_OMAP3_GPMC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = gpmc_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(sysconfig, Omap3GpmcState),
++        VMSTATE_UINT32(irqstatus, Omap3GpmcState),
++        VMSTATE_UINT32(irqenable, Omap3GpmcState),
++        VMSTATE_UINT32(timeout_control, Omap3GpmcState),
++        VMSTATE_UINT32(config, Omap3GpmcState),
++        VMSTATE_UINT32_2DARRAY(cs_config, Omap3GpmcState, OMAP3_GPMC_NUM_CS, 7),
++        VMSTATE_UINT32(prefetch_config1, Omap3GpmcState),
++        VMSTATE_UINT32(prefetch_config2, Omap3GpmcState),
++        VMSTATE_UINT32(prefetch_control, Omap3GpmcState),
++        VMSTATE_UINT32(prefetch_remaining, Omap3GpmcState),
++        VMSTATE_UINT32(ecc_config, Omap3GpmcState),
++        VMSTATE_UINT32(ecc_control, Omap3GpmcState),
++        VMSTATE_UINT32(ecc_size_config, Omap3GpmcState),
++        VMSTATE_UINT8(cmd, Omap3GpmcState),
++        VMSTATE_UINT8_ARRAY(addr, Omap3GpmcState, 5),
++        VMSTATE_UINT8(naddr, Omap3GpmcState),
++        VMSTATE_UINT8(out_mode, Omap3GpmcState),
++        VMSTATE_UINT32(row, Omap3GpmcState),
++        VMSTATE_UINT32(col, Omap3GpmcState),
++        VMSTATE_UINT8(status, Omap3GpmcState),
++        VMSTATE_UINT8_ARRAY(page_buf, Omap3GpmcState, OMAP3_NAND_PAGE_RAW),
++        VMSTATE_BOOL(programming, Omap3GpmcState),
++        VMSTATE_UINT8_ARRAY(ecc_buf, Omap3GpmcState, OMAP3_NAND_PAGE_RAW),
++        VMSTATE_UINT32(ecc_count, Omap3GpmcState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void gpmc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = gpmc_realize;
++    device_class_set_legacy_reset(dc, gpmc_reset);
++    device_class_set_props(dc, gpmc_properties);
++    dc->vmsd = &gpmc_vmstate;
++    dc->desc = "OMAP3 GPMC with NAND flash";
++}
++
++static const TypeInfo gpmc_info = {
++    .name = TYPE_OMAP3_GPMC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3GpmcState),
++    .instance_init = gpmc_init,
++    .class_init = gpmc_class_init,
++};
++
++static void gpmc_register_types(void)
++{
++    type_register_static(&gpmc_info);
++}
++
++type_init(gpmc_register_types)
+-- 
+2.55.0
+

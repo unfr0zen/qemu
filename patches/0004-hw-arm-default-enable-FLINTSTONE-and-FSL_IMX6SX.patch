@@ -1,0 +1,50 @@
+From 2cad5a0ea65ec971e8cf73271d53dde0fba49467 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:22:08 -0400
+Subject: [PATCH 04/20] hw/arm: default-enable FLINTSTONE and FSL_IMX6SX
+
+---
+ hw/arm/Kconfig | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 4e50fb1..359113c 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -198,6 +198,12 @@ config SABRELITE
+     select FSL_IMX6
+     select SSI_M25P80
+ 
++config FLINTSTONE
++    bool
++    default y
++    depends on TCG && ARM
++    select FSL_IMX6SX
++
+ config STELLARIS
+     bool
+     default y
+@@ -526,6 +532,20 @@ config FSL_IMX6
+     select USB_CHIPIDEA
+     select OR_IRQ
+ 
++config FSL_IMX6SX
++    bool
++    imply I2C_DEVICES
++    select A9MPCORE
++    select IMX
++    select IMX_FEC
++    select IMX_I2C
++    select IMX_USBPHY
++    select WDT_IMX2
++    select PL310  # cache controller
++    select SDHCI
++    select USB_CHIPIDEA
++    select UNIMP
++
+ config ASPEED_SOC
+     bool
+     default y
+-- 
+2.55.0
+

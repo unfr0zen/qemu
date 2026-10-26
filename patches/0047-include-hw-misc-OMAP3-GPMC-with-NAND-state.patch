@@ -1,0 +1,88 @@
+From 2e8293636493f4df53a01433d97cdb00ac8f889f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 47/91] include/hw/misc: OMAP3 GPMC with NAND state
+
+---
+ include/hw/misc/omap3_gpmc.h | 69 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+ create mode 100644 include/hw/misc/omap3_gpmc.h
+
+diff --git a/include/hw/misc/omap3_gpmc.h b/include/hw/misc/omap3_gpmc.h
+new file mode 100644
+index 0000000..6402d20
+--- /dev/null
++++ b/include/hw/misc/omap3_gpmc.h
+@@ -0,0 +1,69 @@
++/*
++ * OMAP3 general-purpose memory controller (GPMC) with a NAND flash on
++ * one chip select and the BCH ECC engine
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_OMAP3_GPMC_H
++#define HW_MISC_OMAP3_GPMC_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_GPMC "omap3-gpmc"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3GpmcState, OMAP3_GPMC)
++
++#define OMAP3_GPMC_NUM_CS       8
++#define OMAP3_NAND_PAGE         2048
++#define OMAP3_NAND_OOB          64
++#define OMAP3_NAND_PAGE_RAW     (OMAP3_NAND_PAGE + OMAP3_NAND_OOB)
++#define OMAP3_NAND_PAGES_PER_BLOCK 64
++
++struct Omap3GpmcState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;         /* registers, 0x6e000000 */
++    MemoryRegion cs_space;      /* the 1 GiB chip-select space at 0 */
++    MemoryRegion nand_window;   /* data port, mapped per CONFIG7 */
++    qemu_irq irq;
++
++    /* the NAND: raw pages of 2048 data + 64 OOB bytes */
++    BlockBackend *blk;
++    uint8_t nand_cs;
++    uint8_t nand_id[5];
++    uint32_t nand_pages;
++
++    uint32_t sysconfig;
++    uint32_t irqstatus;
++    uint32_t irqenable;
++    uint32_t timeout_control;
++    uint32_t config;
++    uint32_t cs_config[OMAP3_GPMC_NUM_CS][7];
++    uint32_t prefetch_config1;
++    uint32_t prefetch_config2;
++    uint32_t prefetch_control;
++    uint32_t prefetch_remaining;    /* bytes the engine has still to move */
++    uint32_t ecc_config;
++    uint32_t ecc_control;
++    uint32_t ecc_size_config;
++
++    /* NAND chip state */
++    uint8_t cmd;
++    uint8_t addr[5];
++    uint8_t naddr;
++    uint8_t out_mode;           /* what data reads return */
++    uint32_t row;
++    uint32_t col;               /* byte column in page_buf */
++    uint8_t status;
++    uint8_t page_buf[OMAP3_NAND_PAGE_RAW];
++    bool programming;
++
++    /* ECC engine: the bytes moved since it was cleared */
++    uint8_t ecc_buf[OMAP3_NAND_PAGE_RAW];
++    uint32_t ecc_count;
++};
++
++#endif
+-- 
+2.55.0
+

@@ -1,0 +1,83 @@
+From 068d850e7039e7e27a2ed7fb2c930d5f021b3313 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 06:34:39 -0400
+Subject: [PATCH 95/95] hw/watchdog: imx2: no reset for a timeout the host slept
+ through
+
+A macOS host's CLOCK_MONOTONIC counts its sleep, so on wake the timeout
+had passed before the guest could service it; it is counted again.
+---
+ hw/watchdog/wdt_imx2.c         | 34 ++++++++++++++++++++++++++++++++++
+ include/hw/watchdog/wdt_imx2.h |  1 +
+ 2 files changed, 35 insertions(+)
+
+diff --git a/hw/watchdog/wdt_imx2.c b/hw/watchdog/wdt_imx2.c
+index c83d410..2e69c10 100644
+--- a/hw/watchdog/wdt_imx2.c
++++ b/hw/watchdog/wdt_imx2.c
+@@ -29,9 +29,42 @@ static void imx2_wdt_interrupt(void *opaque)
+     qemu_set_irq(s->irq, 1);
+ }
+ 
++/*
++ * Nanoseconds the host has slept since it booted. QEMU's clocks run on
++ * CLOCK_MONOTONIC, which on a macOS host counts its sleep: on wake every
++ * timer sees the whole sleep at once. CLOCK_UPTIME_RAW does not count it.
++ * Elsewhere CLOCK_MONOTONIC stops with the host, and this stays 0.
++ */
++static int64_t imx2_wdt_host_slept(void)
++{
++#ifdef __APPLE__
++    struct timespec mono, up;
++
++    clock_gettime(CLOCK_MONOTONIC, &mono);
++    clock_gettime(CLOCK_UPTIME_RAW, &up);
++    return (mono.tv_sec - up.tv_sec) * NANOSECONDS_PER_SECOND +
++           (mono.tv_nsec - up.tv_nsec);
++#else
++    return 0;
++#endif
++}
++
+ static void imx2_wdt_expired(void *opaque)
+ {
+     IMX2WdtState *s = IMX2_WDT(opaque);
++    int64_t slept = imx2_wdt_host_slept();
++
++    /*
++     * The host slept through the timeout, and the guest had no time to
++     * service it: count the timeout again from now. Called inside the
++     * ptimer's transaction.
++     */
++    if (slept - s->host_slept > NANOSECONDS_PER_SECOND) {
++        s->host_slept = slept;
++        ptimer_set_count(s->timer, ((s->wcr & IMX2_WDT_WCR_WT) >> 8) + 1);
++        ptimer_run(s->timer, 1);
++        return;
++    }
+ 
+     trace_imx2_wdt_expired();
+ 
+@@ -126,6 +159,7 @@ static void imx_wdt2_update_itimer(IMX2WdtState *s, bool start)
+ 
+ static void imx_wdt2_update_timer(IMX2WdtState *s, bool start)
+ {
++    s->host_slept = imx2_wdt_host_slept();
+     ptimer_transaction_begin(s->timer);
+     if (start) {
+         ptimer_stop(s->timer);
+diff --git a/include/hw/watchdog/wdt_imx2.h b/include/hw/watchdog/wdt_imx2.h
+index ad36b88..6551e93 100644
+--- a/include/hw/watchdog/wdt_imx2.h
++++ b/include/hw/watchdog/wdt_imx2.h
+@@ -84,6 +84,7 @@ struct IMX2WdtState {
+     uint16_t wmcr;
+ 
+     bool wcr_locked;            /* affects WDZST, WDBG, and WDW */
++    int64_t host_slept;         /* imx2_wdt_host_slept() at the last count */
+     bool wcr_wde_locked;        /* affects WDE */
+     bool wcr_wdt_locked;        /* affects WDT (never cleared) */
+ };
+-- 
+2.56.0
+

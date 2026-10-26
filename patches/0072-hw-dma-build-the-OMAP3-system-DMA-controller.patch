@@ -1,0 +1,24 @@
+From 9255d272611c96f815bbe1058d283be7df31d58a Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 72/91] hw/dma: build the OMAP3 system DMA controller
+
+---
+ hw/dma/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/dma/meson.build b/hw/dma/meson.build
+index cc7810b..a359a20 100644
+--- a/hw/dma/meson.build
++++ b/hw/dma/meson.build
+@@ -9,6 +9,7 @@ system_ss.add(when: 'CONFIG_STP2000', if_true: files('sparc32_dma.c'))
+ system_ss.add(when: 'CONFIG_XLNX_ZYNQMP_ARM', if_true: files('xlnx_dpdma.c'))
+ system_ss.add(when: 'CONFIG_XLNX_ZDMA', if_true: files('xlnx-zdma.c'))
+ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_dma.c', 'soc_dma.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_sdma.c'))
+ system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_dma.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_PDMA', if_true: files('sifive_pdma.c'))
+ system_ss.add(when: 'CONFIG_XLNX_CSU_DMA', if_true: files('xlnx_csu_dma.c'))
+-- 
+2.55.0
+

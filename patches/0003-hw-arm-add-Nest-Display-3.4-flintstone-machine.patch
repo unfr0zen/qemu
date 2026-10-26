@@ -1,0 +1,88 @@
+From ba43eb8dfd917e7520a81573bed4d4f3435acc07 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:22:08 -0400
+Subject: [PATCH 03/20] hw/arm: add Nest Display-3.4 'flintstone' machine
+
+Boots the board's own stock firmware images unmodified. RAM is fixed
+at 512 MiB at 0x80000000, as declared by the board's Device Tree;
+ignore_memory_transaction_failures keeps accesses to yet-unmodeled
+registers from turning into guest data aborts, which deadlock the
+vendor U-Boot in its own abort handler.
+---
+ hw/arm/flintstone.c | 64 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+ create mode 100644 hw/arm/flintstone.c
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+new file mode 100644
+index 0000000..97f051d
+--- /dev/null
++++ b/hw/arm/flintstone.c
+@@ -0,0 +1,64 @@
++/*
++ * Nest Display-3.4 ("Flintstone") machine — i.MX6SX board emulation.
++ *
++ * The goal is to boot the device's own stock firmware images unmodified:
++ * U-Boot 2014.04 from NAND, the 4.1.15 vendor kernel and the UBIFS rootfs.
++ *
++ * Phase 1: SoC skeleton + UART console. The stock U-Boot image is loaded
++ * into RAM by hand (see qemu/run.sh), later phases add the GPMI NAND
++ * controller model and the boot-ROM stub so the chain boots by itself.
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/arm/fsl-imx6sx.h"
++#include "hw/arm/machines-qom.h"
++#include "hw/core/boards.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/sysbus.h"
++#include "system/system.h"
++#include "qemu/error-report.h"
++#include "qemu/units.h"
++
++#define FLINTSTONE_RAM_ADDR     FSL_IMX6SX_DRAM_ADDR
++#define FLINTSTONE_RAM_SIZE     (512 * MiB)   /* DTB: <0x80000000 0x20000000> */
++
++static void flintstone_init(MachineState *machine)
++{
++    DeviceState *soc;
++
++    if (machine->ram_size != FLINTSTONE_RAM_SIZE) {
++        error_report("flintstone: this board has %lu MiB of DDR3",
++                     (unsigned long)(FLINTSTONE_RAM_SIZE / MiB));
++        exit(1);
++    }
++
++    soc = qdev_new(TYPE_FSL_IMX6SX);
++    qdev_realize_and_unref(soc, NULL, &error_fatal);
++
++    memory_region_add_subregion(get_system_memory(), FLINTSTONE_RAM_ADDR,
++                                machine->ram);
++}
++
++static void flintstone_machine_class_init(MachineClass *mc)
++{
++    mc->desc = "Nest Display-3.4 (i.MX6SX, 'Flintstone')";
++    mc->init = flintstone_init;
++    /* The vendor boot software pokes registers we do not model yet; treat
++     * those accesses as reads-0/writes-ignored instead of data aborts. */
++    mc->ignore_memory_transaction_failures = true;
++    mc->min_cpus = FSL_IMX6SX_NUM_CPUS;
++    mc->max_cpus = FSL_IMX6SX_NUM_CPUS;
++    mc->default_cpus = FSL_IMX6SX_NUM_CPUS;
++    mc->default_ram_size = FLINTSTONE_RAM_SIZE;
++    mc->default_ram_id = "flintstone.ram";
++}
++
++DEFINE_MACHINE_ARM("flintstone", flintstone_machine_class_init)
+-- 
+2.55.0
+

@@ -1,0 +1,61 @@
+From 0bb157828dfe2cc4751b224baf8ccb27559be615 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 58/91] include/hw/gpio: OMAP3 GPIO bank state
+
+---
+ include/hw/gpio/omap3_gpio.h | 42 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+ create mode 100644 include/hw/gpio/omap3_gpio.h
+
+diff --git a/include/hw/gpio/omap3_gpio.h b/include/hw/gpio/omap3_gpio.h
+new file mode 100644
+index 0000000..9d5430a
+--- /dev/null
++++ b/include/hw/gpio/omap3_gpio.h
+@@ -0,0 +1,42 @@
++/*
++ * OMAP3 GPIO bank (32 lines)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_GPIO_OMAP3_GPIO_H
++#define HW_GPIO_OMAP3_GPIO_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_GPIO "omap3-gpio"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3GpioState, OMAP3_GPIO)
++
++struct Omap3GpioState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq[2];            /* MPU and IVA2 interrupt lines */
++    qemu_irq out[32];
++
++    uint32_t inputs;            /* levels driven onto the pins */
++    uint32_t sysconfig;
++    uint32_t irqstatus[2];
++    uint32_t irqenable[2];
++    uint32_t wakeupenable;
++    uint32_t ctrl;
++    uint32_t oe;
++    uint32_t dataout;
++    uint32_t leveldetect0;
++    uint32_t leveldetect1;
++    uint32_t risingdetect;
++    uint32_t fallingdetect;
++    uint32_t debounceenable;
++    uint32_t debouncingtime;
++    uint32_t datain_last;       /* for edge detection */
++};
++
++#endif
+-- 
+2.55.0
+

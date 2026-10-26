@@ -1,0 +1,444 @@
+From 1b31bf9d0903a6b9406bf65372ae2fbd0433798c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 56/91] hw/i2c: OMAP3 I2C controller with its FIFO
+
+---
+ hw/i2c/omap3_i2c.c | 425 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 425 insertions(+)
+ create mode 100644 hw/i2c/omap3_i2c.c
+
+diff --git a/hw/i2c/omap3_i2c.c b/hw/i2c/omap3_i2c.c
+new file mode 100644
+index 0000000..b0d0228
+--- /dev/null
++++ b/hw/i2c/omap3_i2c.c
+@@ -0,0 +1,425 @@
++/*
++ * OMAP3 I2C controller (master mode, with the FIFO)
++ *
++ * Transfers happen at bus speed zero: a start addresses the slave at once,
++ * each byte written to I2C_DATA goes straight to the slave, and a receive
++ * fills the RX FIFO from the slave as it drains. The FIFO status follows
++ * the thresholds in I2C_BUF the way Linux's i2c-omap uses them on OMAP3:
++ * XRDY/RRDY while a whole threshold's worth can move, XDR/RDR to drain the
++ * tail (with BUFSTAT's counts), ARDY once the transfer is done, NACK when
++ * the slave does not answer. U-Boot polls the same bits with thresholds of
++ * one byte.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/i2c/omap3_i2c.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define I2C_REV         0x00
++#define I2C_IE          0x04
++#define I2C_STAT        0x08
++#define I2C_WE          0x0c
++#define I2C_SYSS        0x10
++#define I2C_BUF         0x14
++#define I2C_CNT         0x18
++#define I2C_DATA        0x1c
++#define I2C_SYSC        0x20
++#define I2C_CON         0x24
++#define I2C_OA0         0x28
++#define I2C_SA          0x2c
++#define I2C_PSC         0x30
++#define I2C_SCLL        0x34
++#define I2C_SCLH        0x38
++#define I2C_SYSTEST     0x3c
++#define I2C_BUFSTAT     0x40
++#define I2C_OA1         0x44
++#define I2C_OA2         0x48
++#define I2C_OA3         0x4c
++#define I2C_ACTOA       0x50
++#define I2C_SBLOCK      0x54
++
++#define STAT_AL         (1 << 0)
++#define STAT_NACK       (1 << 1)
++#define STAT_ARDY       (1 << 2)
++#define STAT_RRDY       (1 << 3)
++#define STAT_XRDY       (1 << 4)
++#define STAT_BF         (1 << 8)
++#define STAT_BB         (1 << 12)
++#define STAT_RDR        (1 << 13)
++#define STAT_XDR        (1 << 14)
++#define STAT_LATCHED    0x0ee7      /* events software acknowledges */
++
++#define CON_STT         (1 << 0)
++#define CON_STP         (1 << 1)
++#define CON_TRX         (1 << 9)
++#define CON_MST         (1 << 10)
++#define CON_EN          (1 << 15)
++
++#define BUF_TXFIFO_CLR  (1 << 6)
++#define BUF_RXFIFO_CLR  (1 << 14)
++
++static uint32_t i2c_xthr(Omap3I2cState *s)
++{
++    return (s->buf & 0x3f) + 1;
++}
++
++static uint32_t i2c_rthr(Omap3I2cState *s)
++{
++    return ((s->buf >> 8) & 0x3f) + 1;
++}
++
++static uint16_t i2c_stat(Omap3I2cState *s)
++{
++    uint16_t st = s->stat;
++
++    if (s->active) {
++        st |= STAT_BB;
++        if (!s->receiving && s->remaining) {
++            st |= s->remaining >= i2c_xthr(s) ? STAT_XRDY : STAT_XDR;
++        } else if (s->receiving && s->rx_count) {
++            if (s->rx_count >= i2c_rthr(s)) {
++                st |= STAT_RRDY;
++            } else if (!s->remaining) {
++                st |= STAT_RDR;
++            }
++        }
++    } else {
++        st |= STAT_BF;
++    }
++    return st;
++}
++
++static void i2c_update_irq(Omap3I2cState *s)
++{
++    qemu_set_irq(s->irq, !!(i2c_stat(s) & s->ie));
++}
++
++static void i2c_stop(Omap3I2cState *s)
++{
++    if (s->active) {
++        i2c_end_transfer(s->bus);
++        s->active = false;
++    }
++    s->con &= ~(CON_MST | CON_STT | CON_STP);
++}
++
++/* The transfer's bytes have all moved: report it, and stop if asked. */
++static void i2c_finish(Omap3I2cState *s)
++{
++    s->stat |= STAT_ARDY;
++    if (s->con & CON_STP) {
++        i2c_stop(s);
++    }
++}
++
++static void i2c_fill_rx(Omap3I2cState *s)
++{
++    while (s->remaining && s->rx_count < OMAP3_I2C_FIFO) {
++        s->rx_fifo[(s->rx_head + s->rx_count++) % OMAP3_I2C_FIFO] =
++            i2c_recv(s->bus);
++        s->remaining--;
++    }
++}
++
++static void i2c_start(Omap3I2cState *s)
++{
++    s->con &= ~CON_STT;
++    s->receiving = !(s->con & CON_TRX);
++    s->rx_head = s->rx_count = 0;
++    if (i2c_start_transfer(s->bus, s->sa & 0x7f, s->receiving)) {
++        s->stat |= STAT_NACK;
++        s->active = false;
++        i2c_end_transfer(s->bus);
++        return;
++    }
++    s->active = true;
++    s->remaining = s->cnt;
++    if (s->receiving) {
++        i2c_fill_rx(s);
++    }
++    if (!s->remaining && !s->rx_count) {
++        i2c_finish(s);
++    }
++}
++
++static void i2c_write_data(Omap3I2cState *s, uint8_t b)
++{
++    if (!s->active || s->receiving || !s->remaining) {
++        qemu_log_mask(LOG_GUEST_ERROR, "omap3-i2c: data written with no "
++                      "transmission in progress\n");
++        return;
++    }
++    s->remaining--;
++    if (i2c_send(s->bus, b)) {
++        s->stat |= STAT_NACK;
++        s->remaining = 0;
++        return;
++    }
++    if (!s->remaining) {
++        i2c_finish(s);
++    }
++}
++
++static uint8_t i2c_read_data(Omap3I2cState *s)
++{
++    uint8_t b;
++
++    if (!s->rx_count) {
++        return 0;
++    }
++    b = s->rx_fifo[s->rx_head];
++    s->rx_head = (s->rx_head + 1) % OMAP3_I2C_FIFO;
++    s->rx_count--;
++    i2c_fill_rx(s);
++    if (s->active && !s->remaining && !s->rx_count) {
++        i2c_finish(s);
++    }
++    return b;
++}
++
++static uint64_t i2c_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3I2cState *s = opaque;
++    uint64_t v;
++
++    switch (addr) {
++    case I2C_REV:
++        return 0x40;
++    case I2C_IE:
++        return s->ie;
++    case I2C_STAT:
++        return i2c_stat(s);
++    case I2C_WE:
++        return s->we;
++    case I2C_SYSS:
++        return 1;                       /* RDONE */
++    case I2C_BUF:
++        return s->buf;
++    case I2C_CNT:
++        return s->cnt;
++    case I2C_DATA:
++        v = i2c_read_data(s);
++        i2c_update_irq(s);
++        return v;
++    case I2C_SYSC:
++        return s->sysc;
++    case I2C_CON:
++        return s->con;
++    case I2C_OA0:
++        return s->oa[0];
++    case I2C_SA:
++        return s->sa;
++    case I2C_PSC:
++        return s->psc;
++    case I2C_SCLL:
++        return s->scll;
++    case I2C_SCLH:
++        return s->sclh;
++    case I2C_SYSTEST:
++        return s->systest;
++    case I2C_BUFSTAT:
++        return (s->fifo_depth & 3) << 14 | MIN(s->rx_count, 63) << 8 |
++               (s->receiving ? 0 : MIN(s->remaining, 63));
++    case I2C_OA1:
++    case I2C_OA2:
++    case I2C_OA3:
++        return s->oa[(addr - I2C_OA1) / 4 + 1];
++    case I2C_ACTOA:
++    case I2C_SBLOCK:
++        return 0;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-i2c: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void i2c_reset(DeviceState *dev)
++{
++    Omap3I2cState *s = OMAP3_I2C(dev);
++
++    if (s->active) {
++        i2c_end_transfer(s->bus);
++    }
++    s->ie = 0;
++    s->stat = 0;
++    s->we = 0;
++    s->buf = 0;
++    s->cnt = 0;
++    s->sysc = 0;
++    s->con = 0;
++    memset(s->oa, 0, sizeof(s->oa));
++    s->sa = 0x3ff;
++    s->psc = 0;
++    s->scll = 0;
++    s->sclh = 0;
++    s->systest = 0;
++    s->active = false;
++    s->receiving = false;
++    s->remaining = 0;
++    s->rx_head = s->rx_count = 0;
++    i2c_update_irq(s);
++}
++
++static void i2c_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3I2cState *s = opaque;
++
++    switch (addr) {
++    case I2C_IE:
++        s->ie = val & 0x7fff;
++        break;
++    case I2C_STAT:
++        s->stat &= ~(val & STAT_LATCHED);
++        break;
++    case I2C_WE:
++        s->we = val;
++        return;
++    case I2C_BUF:
++        if (val & BUF_RXFIFO_CLR) {
++            s->rx_head = s->rx_count = 0;
++        }
++        s->buf = val & ~(BUF_TXFIFO_CLR | BUF_RXFIFO_CLR);
++        break;
++    case I2C_CNT:
++        s->cnt = val;
++        return;
++    case I2C_DATA:
++        i2c_write_data(s, val);
++        break;
++    case I2C_SYSC:
++        if (val & 2) {                  /* SRST */
++            i2c_reset(DEVICE(s));
++            return;
++        }
++        s->sysc = val;
++        return;
++    case I2C_CON:
++        s->con = val;
++        if (!(val & CON_EN)) {
++            i2c_stop(s);
++            s->stat = 0;
++            s->rx_head = s->rx_count = 0;
++            s->remaining = 0;
++        } else if (val & CON_STT) {
++            i2c_start(s);
++        } else if ((val & CON_STP) && s->active && !s->remaining) {
++            i2c_stop(s);
++        }
++        break;
++    case I2C_OA0:
++        s->oa[0] = val;
++        return;
++    case I2C_SA:
++        s->sa = val & 0x3ff;
++        return;
++    case I2C_PSC:
++        s->psc = val;
++        return;
++    case I2C_SCLL:
++        s->scll = val;
++        return;
++    case I2C_SCLH:
++        s->sclh = val;
++        return;
++    case I2C_SYSTEST:
++        s->systest = val;
++        return;
++    case I2C_OA1:
++    case I2C_OA2:
++    case I2C_OA3:
++        s->oa[(addr - I2C_OA1) / 4 + 1] = val;
++        return;
++    case I2C_SBLOCK:
++        return;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "omap3-i2c: bad write at 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    i2c_update_irq(s);
++}
++
++static const MemoryRegionOps i2c_ops = {
++    .read = i2c_read,
++    .write = i2c_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 2,
++    .impl.max_access_size = 2,
++};
++
++static void i2c_init(Object *obj)
++{
++    Omap3I2cState *s = OMAP3_I2C(obj);
++
++    memory_region_init_io(&s->iomem, obj, &i2c_ops, s, "omap3-i2c", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++    s->bus = i2c_init_bus(DEVICE(obj), "i2c");
++}
++
++static const Property i2c_properties[] = {
++    DEFINE_PROP_UINT8("fifo-depth", Omap3I2cState, fifo_depth, 0),
++};
++
++static const VMStateDescription i2c_vmstate = {
++    .name = TYPE_OMAP3_I2C,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT16(ie, Omap3I2cState),
++        VMSTATE_UINT16(stat, Omap3I2cState),
++        VMSTATE_UINT16(we, Omap3I2cState),
++        VMSTATE_UINT16(buf, Omap3I2cState),
++        VMSTATE_UINT16(cnt, Omap3I2cState),
++        VMSTATE_UINT16(sysc, Omap3I2cState),
++        VMSTATE_UINT16(con, Omap3I2cState),
++        VMSTATE_UINT16_ARRAY(oa, Omap3I2cState, 4),
++        VMSTATE_UINT16(sa, Omap3I2cState),
++        VMSTATE_UINT16(psc, Omap3I2cState),
++        VMSTATE_UINT16(scll, Omap3I2cState),
++        VMSTATE_UINT16(sclh, Omap3I2cState),
++        VMSTATE_UINT16(systest, Omap3I2cState),
++        VMSTATE_BOOL(active, Omap3I2cState),
++        VMSTATE_BOOL(receiving, Omap3I2cState),
++        VMSTATE_UINT32(remaining, Omap3I2cState),
++        VMSTATE_UINT8_ARRAY(rx_fifo, Omap3I2cState, OMAP3_I2C_FIFO),
++        VMSTATE_UINT32(rx_head, Omap3I2cState),
++        VMSTATE_UINT32(rx_count, Omap3I2cState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void i2c_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, i2c_reset);
++    device_class_set_props(dc, i2c_properties);
++    dc->vmsd = &i2c_vmstate;
++    dc->desc = "OMAP3 I2C controller";
++}
++
++static const TypeInfo i2c_info = {
++    .name = TYPE_OMAP3_I2C,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3I2cState),
++    .instance_init = i2c_init,
++    .class_init = i2c_class_init,
++};
++
++static void i2c_register_types(void)
++{
++    type_register_static(&i2c_info);
++}
++
++type_init(i2c_register_types)
+-- 
+2.55.0
+

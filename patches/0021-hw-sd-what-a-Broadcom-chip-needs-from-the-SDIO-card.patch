@@ -1,0 +1,113 @@
+From 497ed58a940d02b280635ef94ec5809cf47d2c0a Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 13:16:51 -0400
+Subject: [PATCH 21/36] hw/sd: what a Broadcom chip needs from the SDIO card
+
+Four changes to the sdio-card for the flintstone's BCM43341:
+
+- a "power" input: a chip held in reset (WL_REG_ON low) does not drive
+  CMD, and losing power forgets what the host set up. Unconnected, the
+  card stays powered, as before.
+- CMD53 block mode uses the block size of the function it addresses, set
+  through that function's FBR; bcmdhd runs F1 at 64 and F2 at 512.
+- the transfer buffer holds the largest CMD53, 511 blocks of 512 bytes.
+- CCCR 0xf0-0xff is vendor space, where Broadcom keeps its card control
+  and the out-of-band interrupt setup (SEPINT), so the chip model sees it.
+---
+ hw/sd/sd.c | 38 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index bbb202b..f43c3be 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -226,6 +226,7 @@ struct SDState {
+     uint8_t sdio_class;
+     uint16_t sdio_vendor;
+     uint16_t sdio_device;
++    bool sdio_powered;          /* the chip's power/reset line */
+ };
+ 
+ static void sd_realize(DeviceState *dev, Error **errp);
+@@ -2528,6 +2529,10 @@ static size_t sd_do_command(SDState *sd, SDRequest *req,
+     if (!sd->sdio_io && (!sd->blk || !blk_is_inserted(sd->blk))) {
+         return 0;
+     }
++    /* A chip held in reset doesn't drive CMD at all. */
++    if (sd->sdio_io && !sd->sdio_powered) {
++        return 0;
++    }
+ 
+     if (sd->state == sd_inactive_state) {
+         rtype = sd_illegal;
+@@ -3312,8 +3317,8 @@ static void emmc_class_init(ObjectClass *klass, const void *data)
+ #define SDIO_CIS_FN(fn)         (0x1000 + 0x1000 * (fn))
+ #define SDIO_NUM_FUNCS          2
+ #define SDIO_IO_SIZE            0x4000
+-/* Big enough for the largest multi-block CMD53 the aic8800 driver issues. */
+-#define SDIO_BLK_SIZE           0x2000
++/* The largest CMD53: 511 blocks of the largest block size. */
++#define SDIO_BLK_SIZE           (511 * 512)
+ 
+ /* Tuples the core understands; anything else it skips. */
+ #define CISTPL_MANFID           0x20
+@@ -3473,6 +3478,13 @@ static sd_rsp_type_t sdio_cmd_IO_RW_DIRECT(SDState *sd, SDRequest req)
+     uint8_t data = req.arg & 0xff;
+     SDIOFunctionClass *fc = fn ? sdio_fn_class(sd) : NULL;
+ 
++    /*
++     * CCCR 0xf0-0xff is vendor space (Broadcom keeps its card control and
++     * the out-of-band interrupt setup there), so the chip model sees it.
++     */
++    if (!fn && addr >= 0xf0 && addr < 0x100) {
++        fc = sdio_fn_class(sd);
++    }
+     if (fc && fc->rw) {
+         data = fc->rw(sd->sdio_fn_dev, fn, addr, data, write);
+     } else if (write) {
+@@ -3499,7 +3511,12 @@ static sd_rsp_type_t sdio_cmd_IO_RW_EXTENDED(SDState *sd, SDRequest req)
+     uint32_t len;
+ 
+     if (block_mode) {
+-        len = (count ? count : 512) * sd->blk_len;
++        /* Each function has its own block size, set through its FBR. */
++        uint32_t base = fn ? SDIO_FBR(fn) : 0;
++        uint32_t blksz = sdio_io_read(sd, base + SDIO_FBR_BLKSIZE) |
++                         sdio_io_read(sd, base + SDIO_FBR_BLKSIZE + 1) << 8;
++
++        len = (count ? count : 512) * (blksz ? blksz : 512);
+     } else {
+         len = count ? count : 512;
+     }
+@@ -3584,6 +3601,18 @@ static void sdio_card_int_handler(void *opaque, int n, int level)
+     sdbus_set_card_int(SD_BUS(qdev_get_parent_bus(DEVICE(sd))), level);
+ }
+ 
++static void sdio_card_power_handler(void *opaque, int n, int level)
++{
++    SDState *sd = opaque;
++
++    /* Losing power forgets everything the host set up. */
++    if (sd->sdio_powered && !level) {
++        sdio_build_io(sd);
++        sd->state = sd_idle_state;
++    }
++    sd->sdio_powered = level;
++}
++
+ static void sdio_card_realize(DeviceState *dev, Error **errp)
+ {
+     SDState *sd = SDMMC_COMMON(dev);
+@@ -3595,6 +3624,9 @@ static void sdio_card_realize(DeviceState *dev, Error **errp)
+     sd->state = sd_idle_state;
+     sd->blk_len = 512;
+     qdev_init_gpio_in_named(dev, sdio_card_int_handler, "card-int", 1);
++    /* Unconnected, the card is always powered. */
++    sd->sdio_powered = true;
++    qdev_init_gpio_in_named(dev, sdio_card_power_handler, "power", 1);
+ }
+ 
+ static void sdio_card_reset(DeviceState *dev)
+-- 
+2.55.0
+

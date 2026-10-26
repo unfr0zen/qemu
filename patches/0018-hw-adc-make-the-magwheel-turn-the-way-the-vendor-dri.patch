@@ -1,0 +1,285 @@
+From e201f2cb02cc7733ed08a40e84fac55bfb55a482 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 09:32:45 -0400
+Subject: [PATCH 18/20] hw/adc: make the magwheel turn the way the vendor
+ driver reads it
+
+The vendor magwheel driver (magwheel_isr / wait_handler in the 4.1.15
+kernel) alternates channel 1/2 conversions, takes atan2 of the pair
+around the DT midpoints by CORDIC and reports the change of magnet angle
+in degrees as EV_REL/REL_DIAL; nlclient scales that by its rotarygain
+into 16.16 UI units, and its setup menus move one item per ~716 degrees.
+Three things kept the wheel from working:
+
+- wheel-position was a uint64: the first turn below zero stored 2^64-1
+  and every later qom-set of a negative value failed, so the wheel
+  wedged. It is now an int64, exposed on the machine through its own
+  int getter/setter (there is no signed pointer-property helper).
+- one magnet cycle per 24 detents (15 degrees each) needed ~48 detents
+  per menu item. wheel-degrees (default 360, two detents per item) sets
+  the magnet angle per detent, and the magnet slews at most 30 degrees
+  per conversion toward the target: the driver takes the shortest way
+  round between samples, so a large jump would alias.
+- every conversion completed in a flat 10 us, while the driver sets up
+  32x hardware averaging on a divided async clock; its self-retriggering
+  ISR turned that into ~29k IRQs/s. The conversion time now follows
+  CFG/GC (clock select, divider, sample time, averaging): ~1.2 ms for
+  the wheel, ~770 IRQs/s.
+
+The compare function (GC.ACFE, CV) is still not modeled: every
+conversion completes.
+---
+ hw/adc/imx6_adc.c         | 97 +++++++++++++++++++++++++++++----------
+ hw/arm/flintstone.c       | 20 ++++++--
+ include/hw/adc/imx6_adc.h |  5 +-
+ 3 files changed, 94 insertions(+), 28 deletions(-)
+
+diff --git a/hw/adc/imx6_adc.c b/hw/adc/imx6_adc.c
+index 03b602e..581c739 100644
+--- a/hw/adc/imx6_adc.c
++++ b/hw/adc/imx6_adc.c
+@@ -6,10 +6,20 @@
+  *
+  *   adc@02280000, "nestlabs,vf610-adc-magwheel" — the rotating wheel. Two
+  *   Hall channels (1 and 2, midpoints 0x7ad/0x7f6 from the device tree)
+- *   sit 90° apart around the ring; the driver decodes quadrature into
+- *   direction and steps. The model synthesizes the pair from a
+- *   `wheel-position` property (detents, driven by the UI over QMP),
+- *   gated by the hall-enable line on GPIO7_IO02 (active low).
++ *   see the ring's magnet 90° apart. The vendor driver (magwheel_isr /
++ *   wait_handler in the 4.1.15 kernel) samples the pair alternately,
++ *   takes atan2(ch2 - mid2, ch1 - mid1) by CORDIC and reports the change
++ *   in magnet angle, in degrees, as EV_REL/REL_DIAL. nlclient multiplies
++ *   that by its rotarygain (-368) into 16.16 fixed point (its demo
++ *   "dial" posts turn * 65536); the setup menus move one item per ~716
++ *   degrees of magnet angle (measured). The model synthesizes the pair
++ *   from a signed `wheel-position` (detents, driven by the UI over QMP)
++ *   and `wheel-degrees` of magnet angle per detent - 360 by default, two
++ *   detents (a page ring step or mouse-wheel notch) per menu item - gated
++ *   by the hall-enable line on GPIO7_IO02 (active low). Like a real ring the
++ *   magnet slews to the new position rather than jumping: the driver
++ *   takes the shortest way round between samples, so a step near 180
++ *   degrees would read as either direction.
+  *
+  *   adc@02284000, "fsl,vf610-adc" — channel 0 reads the battery divider
+  *   (adc-div-battery), enabled by GPIO6_IO16 (active high).
+@@ -18,8 +28,12 @@
+  * HC0 = channel | AIEN, waits for the conversion-complete interrupt, then
+  * reads R0 (which clears the COCO flag). Calibration is the same dance
+  * with HC0 = AIEN|0x1f and GC.CAL set (CAL self-clears, GS.CALF stays
+- * clear when it worked). Conversion time is not simulated precisely: the
+- * result lands a fixed 10 µs of virtual time after the trigger.
++ * clear when it worked). The result lands after the conversion time the
++ * CFG/GC fields ask for (clock, divider, sample time, hardware averaging;
++ * see adc_conversion_ns) - the wheel driver's setup takes ~1.2 ms, and
++ * a much shorter time turns its self-retriggering ISR into an IRQ storm.
++ * The compare function (GC.ACFE, CV) is not modeled: every conversion
++ * completes.
+  *
+  * Driver: drivers/iio/adc/vf610_adc.c v4.1 (VF610_REG_ADC_*: HC0 0x00,
+  * HC1 0x04, HS 0x08, R0 0x0c, R1 0x10, CFG 0x14, GC 0x18, GS 0x1c, ...).
+@@ -58,6 +72,17 @@
+ #define ADC_CONV_DISABLE 0x1f
+ 
+ #define ADC_GC_CAL      BIT(7)
++#define ADC_GC_AVGE     BIT(5)
++
++/* CFG fields (i.MX6SX RM, ADC_CFG) */
++#define ADC_CFG_ADICLK(x)   ((x) & 0x3)          /* 0 IPG, 1 IPG/2, 3 ADACK */
++#define ADC_CFG_ADLSMP      BIT(4)               /* long sample time */
++#define ADC_CFG_ADIV(x)     (((x) >> 5) & 0x3)   /* ADCK = clock >> ADIV */
++#define ADC_CFG_ADSTS(x)    (((x) >> 8) & 0x3)   /* sample time select */
++#define ADC_CFG_AVGS(x)     (((x) >> 14) & 0x3)  /* 4 << AVGS averages */
++
++#define ADC_IPG_HZ      66000000
++#define ADC_ADACK_HZ    10000000    /* the async clock, typical */
+ 
+ #define ADC_GS_ADACT    BIT(0)
+ #define ADC_GS_CALF     BIT(1)
+@@ -66,9 +91,6 @@
+ 
+ #define ADC_12BIT_MASK  0xfff
+ 
+-/* One conversion, in virtual time. */
+-#define ADC_CONVERT_NS  (10 * SCALE_US)
+-
+ static void adc_update_irq(Imx6AdcState *s)
+ {
+     qemu_set_irq(s->irq, s->hs != 0);
+@@ -87,6 +109,18 @@ static bool adc_gate_enabled(Imx6AdcState *s)
+     return s->gate_active_low ? !s->gate : s->gate;
+ }
+ 
++/* Most the magnet turns between two conversions (the driver's pairs). */
++#define WHEEL_SLEW_MDEG 30000
++
++/* Move the magnet toward the detent the UI set, as far as it gets. */
++static void adc_wheel_slew(Imx6AdcState *s)
++{
++    int64_t target = s->wheel_position * s->wheel_degrees * 1000;
++    int64_t d = target - s->wheel_angle;
++
++    s->wheel_angle += MAX(-WHEEL_SLEW_MDEG, MIN(WHEEL_SLEW_MDEG, d));
++}
++
+ /* Sample of a channel, given the block's outside world. */
+ static uint32_t adc_channel_sample(Imx6AdcState *s, unsigned ch)
+ {
+@@ -101,16 +135,12 @@ static uint32_t adc_channel_sample(Imx6AdcState *s, unsigned ch)
+     case 2:
+         /*
+          * The wheel's Hall pair, in quadrature around their midpoints:
+-         * ch1 = mid1 + A*sin(θ), ch2 = mid2 + A*cos(θ). One full cycle
+-         * per detent, so every decode the driver might use (thresholds,
+-         * atan2, edge counting) lands on the same step.
++         * ch1 = mid1 + A*sin(θ), ch2 = mid2 + A*cos(θ), θ the magnet angle.
+          */
+         if (!adc_gate_enabled(s)) {
+             return 0;               /* hall sensors unpowered */
+         }
+-        theta = 2.0 * M_PI *
+-            (double)(s->wheel_position % (int64_t)s->wheel_steps) /
+-            (double)s->wheel_steps;
++        theta = (double)s->wheel_angle * M_PI / 180000.0;
+         if (ch == 1) {
+             return s->mid1 + s->amplitude * sin(theta);
+         }
+@@ -133,17 +163,37 @@ static void adc_convert_done(void *opaque)
+         /* The calibration pass: CAL self-clears, and it worked (no CALF). */
+         s->gc &= ~ADC_GC_CAL;
+     } else {
++        adc_wheel_slew(s);
+         s->r[0] = adc_channel_sample(s, ch) & ADC_12BIT_MASK;
+     }
+     s->hs |= ADC_HS_COCO(0);
+     adc_update_irq(s);
+ }
+ 
++/*
++ * How long one result takes: ~25 ADCK cycles of successive approximation
++ * plus the sample time (short 2..8 or long 12..24 cycles by ADSTS), times
++ * the hardware average count, at the ADCK the clock select and divider
++ * give.
++ */
++static int64_t adc_conversion_ns(Imx6AdcState *s)
++{
++    static const uint32_t clock_hz[4] = {
++        ADC_IPG_HZ, ADC_IPG_HZ / 2, ADC_IPG_HZ, ADC_ADACK_HZ,
++    };
++    uint32_t adck = clock_hz[ADC_CFG_ADICLK(s->cfg)] >> ADC_CFG_ADIV(s->cfg);
++    uint32_t sample = (s->cfg & ADC_CFG_ADLSMP) ?
++        12 + 4 * ADC_CFG_ADSTS(s->cfg) : 2 + 2 * ADC_CFG_ADSTS(s->cfg);
++    uint32_t averages = (s->gc & ADC_GC_AVGE) ? 4 << ADC_CFG_AVGS(s->cfg) : 1;
++
++    return muldiv64(averages * (25 + sample), NANOSECONDS_PER_SECOND, adck);
++}
++
+ static void adc_start_conversion(Imx6AdcState *s)
+ {
+     s->gs |= ADC_GS_ADACT;
+     timer_mod(s->convert, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+-                          ADC_CONVERT_NS);
++                          adc_conversion_ns(s));
+ }
+ 
+ static uint64_t imx6_adc_read(void *opaque, hwaddr off, unsigned size)
+@@ -322,9 +372,9 @@ static void imx6_adc_unrealize(DeviceState *dev)
+ }
+ 
+ static const Property imx6_adc_properties[] = {
+-    /* Wheel geometry: one detent per quadrature cycle. */
+-    DEFINE_PROP_UINT64("wheel-position", Imx6AdcState, wheel_position, 0),
+-    DEFINE_PROP_UINT32("wheel-steps", Imx6AdcState, wheel_steps, 24),
++    /* Wheel: detents, and the magnet angle each one turns (the "gain"). */
++    DEFINE_PROP_INT64("wheel-position", Imx6AdcState, wheel_position, 0),
++    DEFINE_PROP_UINT32("wheel-degrees", Imx6AdcState, wheel_degrees, 360),
+     DEFINE_PROP_UINT32("wheel-amplitude", Imx6AdcState, amplitude, 0x180),
+     DEFINE_PROP_UINT32("wheel-mid1", Imx6AdcState, mid1, 0x7ad),
+     DEFINE_PROP_UINT32("wheel-mid2", Imx6AdcState, mid2, 0x7f6),
+@@ -336,8 +386,8 @@ static const Property imx6_adc_properties[] = {
+ 
+ static const VMStateDescription vmstate_imx6_adc = {
+     .name = TYPE_IMX6_ADC,
+-    .version_id = 1,
+-    .minimum_version_id = 1,
++    .version_id = 3,
++    .minimum_version_id = 3,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT32_ARRAY(hc, Imx6AdcState, 2),
+         VMSTATE_UINT32(hs, Imx6AdcState),
+@@ -351,8 +401,9 @@ static const VMStateDescription vmstate_imx6_adc = {
+         VMSTATE_UINT32(pctl, Imx6AdcState),
+         VMSTATE_BOOL(gate, Imx6AdcState),
+         VMSTATE_BOOL(gate_active_low, Imx6AdcState),
+-        VMSTATE_UINT64(wheel_position, Imx6AdcState),
+-        VMSTATE_UINT32(wheel_steps, Imx6AdcState),
++        VMSTATE_INT64(wheel_position, Imx6AdcState),
++        VMSTATE_UINT32(wheel_degrees, Imx6AdcState),
++        VMSTATE_INT64(wheel_angle, Imx6AdcState),
+         VMSTATE_UINT32(amplitude, Imx6AdcState),
+         VMSTATE_UINT32(mid1, Imx6AdcState),
+         VMSTATE_UINT32(mid2, Imx6AdcState),
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 36d513d..5a7fc0f 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -18,6 +18,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
++#include "qapi/visitor.h"
+ #include "hw/adc/imx6_adc.h"
+ #include "hw/arm/flintstone_board.h"
+ #include "hw/arm/fsl-imx6sx.h"
+@@ -75,6 +76,19 @@ static void flintstone_rom_boot(void *opaque)
+     cpu_set_pc(first_cpu, FLINTSTONE_FW_ENTRY);
+ }
+ 
++/* /machine/wheel-position: the adc's signed detent count, either way round. */
++static void flintstone_get_wheel(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    visit_type_int64(v, name, opaque, errp);
++}
++
++static void flintstone_set_wheel(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    visit_type_int64(v, name, opaque, errp);
++}
++
+ static void flintstone_init(MachineState *machine)
+ {
+     DeviceState *soc;
+@@ -164,9 +178,9 @@ static void flintstone_init(MachineState *machine)
+      * detents. The property lives on the machine so its QOM path is
+      * stable; the storage is the adc's own, sampled per conversion.
+      */
+-    object_property_add_uint64_ptr(OBJECT(machine), "wheel-position",
+-                                   &IMX6_ADC(adc1)->wheel_position,
+-                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_add(OBJECT(machine), "wheel-position", "int",
++                        flintstone_get_wheel, flintstone_set_wheel, NULL,
++                        &IMX6_ADC(adc1)->wheel_position);
+ }
+ 
+ static void flintstone_machine_class_init(MachineClass *mc)
+diff --git a/include/hw/adc/imx6_adc.h b/include/hw/adc/imx6_adc.h
+index 23a353e..528bed8 100644
+--- a/include/hw/adc/imx6_adc.h
++++ b/include/hw/adc/imx6_adc.h
+@@ -33,8 +33,9 @@ struct Imx6AdcState {
+     bool gate_active_low;   /* hall-enable: low = powered */
+ 
+     /* The wheel (adc@02280000) */
+-    uint64_t wheel_position; /* detents, set from the UI via QMP */
+-    uint32_t wheel_steps;   /* detents per revolution */
++    int64_t wheel_position; /* detents, either way round, from the UI */
++    uint32_t wheel_degrees; /* magnet angle per detent */
++    int64_t wheel_angle;    /* where the magnet is now, millidegrees */
+     uint32_t amplitude;     /* Hall swing around the midpoints, LSB */
+     uint32_t mid1, mid2;    /* DT: adc-channel-midpoints, channels 1/2 */
+     uint32_t ch0_sample;    /* battery divider reading while enabled */
+-- 
+2.55.0
+

@@ -1,0 +1,129 @@
+From 612afa7b6e4bf14183e064aaa36db8ce3ba04e27 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 77/91] hw/display: an LM3530 backlight driver for the j49
+
+---
+ hw/display/lm3530.c | 110 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+ create mode 100644 hw/display/lm3530.c
+
+diff --git a/hw/display/lm3530.c b/hw/display/lm3530.c
+new file mode 100644
+index 0000000..366bb3e
+--- /dev/null
++++ b/hw/display/lm3530.c
+@@ -0,0 +1,110 @@
++/*
++ * TI LM3530 backlight driver (i2c) - a register file
++ *
++ * The j49's panel backlight sits on i2c3 at 0x36 (board-diamond.c's
++ * "lm3530-backlight", manual mode). The vendor kernel's lm3530_bl driver
++ * writes its configuration at probe and the brightness register on every
++ * change, and reads nothing back in manual mode, so an 8-bit register
++ * file with auto-increment that ACKs everything is all it needs; nothing
++ * is drawn from the brightness.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/i2c/i2c.h"
++#include "migration/vmstate.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++
++#define TYPE_LM3530 "lm3530"
++OBJECT_DECLARE_SIMPLE_TYPE(LM3530State, LM3530)
++
++struct LM3530State {
++    I2CSlave i2c;
++
++    uint8_t regs[256];
++    uint8_t cur;        /* register being addressed */
++    bool first_byte;    /* next send() byte is a register address */
++};
++
++static int lm3530_event(I2CSlave *i2c, enum i2c_event event)
++{
++    LM3530State *s = LM3530(i2c);
++
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->first_byte = true;
++    }
++    return 0;
++}
++
++static int lm3530_send(I2CSlave *i2c, uint8_t data)
++{
++    LM3530State *s = LM3530(i2c);
++
++    if (s->first_byte) {
++        s->cur = data;
++        s->first_byte = false;
++    } else {
++        s->regs[s->cur++] = data;
++    }
++    return 0;
++}
++
++static uint8_t lm3530_recv(I2CSlave *i2c)
++{
++    LM3530State *s = LM3530(i2c);
++
++    return s->regs[s->cur++];
++}
++
++static void lm3530_reset(DeviceState *dev)
++{
++    LM3530State *s = LM3530(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->cur = 0;
++    s->first_byte = false;
++}
++
++static const VMStateDescription lm3530_vmstate = {
++    .name = TYPE_LM3530,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_I2C_SLAVE(i2c, LM3530State),
++        VMSTATE_UINT8_ARRAY(regs, LM3530State, 256),
++        VMSTATE_UINT8(cur, LM3530State),
++        VMSTATE_BOOL(first_byte, LM3530State),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void lm3530_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, lm3530_reset);
++    dc->vmsd = &lm3530_vmstate;
++    dc->desc = "TI LM3530 backlight driver";
++    k->event = lm3530_event;
++    k->send = lm3530_send;
++    k->recv = lm3530_recv;
++}
++
++static const TypeInfo lm3530_info = {
++    .name = TYPE_LM3530,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(LM3530State),
++    .class_init = lm3530_class_init,
++};
++
++static void lm3530_register_types(void)
++{
++    type_register_static(&lm3530_info);
++}
++
++type_init(lm3530_register_types)
+-- 
+2.55.0
+

@@ -1,0 +1,21 @@
+From 6582973a6ede53e0e4a5c18bbc30843a5a2ad95c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 60/91] hw/gpio: build the OMAP3 GPIO bank
+
+---
+ hw/gpio/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/gpio/meson.build b/hw/gpio/meson.build
+index 6a67ee9..c9ddefa 100644
+--- a/hw/gpio/meson.build
++++ b/hw/gpio/meson.build
+@@ -19,3 +19,4 @@ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_gpio.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_sgpio.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_GPIO', if_true: files('sifive_gpio.c'))
+ system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_gpio.c'))
+-- 
+2.55.0
+

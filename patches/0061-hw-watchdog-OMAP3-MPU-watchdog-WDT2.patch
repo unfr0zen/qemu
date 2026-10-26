@@ -1,0 +1,293 @@
+From 1ef8eb82e560c4287531ed305c11ddc5b6381867 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 61/91] hw/watchdog: OMAP3 MPU watchdog (WDT2)
+
+---
+ hw/watchdog/omap3_wdt.c | 274 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 274 insertions(+)
+ create mode 100644 hw/watchdog/omap3_wdt.c
+
+diff --git a/hw/watchdog/omap3_wdt.c b/hw/watchdog/omap3_wdt.c
+new file mode 100644
+index 0000000..9f2b8c1
+--- /dev/null
++++ b/hw/watchdog/omap3_wdt.c
+@@ -0,0 +1,274 @@
++/*
++ * OMAP3 watchdog timer (WDT2, the MPU watchdog)
++ *
++ * An up-counter at 32768 Hz, divided by 2^PTV when WCLR.PRE is set,
++ * reloaded from WLDR by any new value written to WTGR; when it wraps the
++ * watchdog action is taken (by default a system reset). It runs from reset
++ * with WLDR 0xfffb0000 (about ten seconds), as on the chip: the boot
++ * software stops it with the WSPR sequence 0xaaaa, 0x5555, and starts it
++ * again with 0xbbbb, 0x4444.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "system/watchdog.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_WDT "omap3-wdt"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3WdtState, OMAP3_WDT)
++
++#define WDT_WIDR        0x00
++#define WDT_SYSCONFIG   0x10
++#define WDT_SYSSTATUS   0x14
++#define WDT_WISR        0x18
++#define WDT_WIER        0x1c
++#define WDT_WCLR        0x24
++#define WDT_WCRR        0x28
++#define WDT_WLDR        0x2c
++#define WDT_WTGR        0x30
++#define WDT_WWPS        0x34
++#define WDT_WSPR        0x48
++
++#define WCLR_PRE        (1 << 5)
++
++struct Omap3WdtState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    QEMUTimer *timer;
++
++    uint32_t sysconfig;
++    uint32_t wisr;
++    uint32_t wier;
++    uint32_t wclr;
++    uint32_t wldr;
++    uint32_t wtgr;
++    uint32_t wspr;
++    bool running;
++    uint32_t counter_base;      /* WCRR at base_ns */
++    int64_t base_ns;
++};
++
++static uint64_t wdt_rate(Omap3WdtState *s)
++{
++    if (s->wclr & WCLR_PRE) {
++        return 32768 >> ((s->wclr >> 2) & 7);
++    }
++    return 32768;
++}
++
++static uint32_t wdt_counter(Omap3WdtState *s, int64_t now)
++{
++    if (!s->running) {
++        return s->counter_base;
++    }
++    return s->counter_base + muldiv64(now - s->base_ns, wdt_rate(s),
++                                      NANOSECONDS_PER_SECOND);
++}
++
++static void wdt_schedule(Omap3WdtState *s)
++{
++    uint64_t ticks = (1ull << 32) - s->counter_base;
++
++    if (!s->running) {
++        timer_del(s->timer);
++        return;
++    }
++    timer_mod(s->timer, s->base_ns +
++              muldiv64(ticks, NANOSECONDS_PER_SECOND, wdt_rate(s)));
++}
++
++static void wdt_rebase(Omap3WdtState *s)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    s->counter_base = wdt_counter(s, now);
++    s->base_ns = now;
++}
++
++static void wdt_expired(void *opaque)
++{
++    Omap3WdtState *s = opaque;
++
++    qemu_log_mask(CPU_LOG_RESET, "omap3-wdt: expired\n");
++    s->counter_base = s->wldr;
++    s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    wdt_schedule(s);
++    watchdog_perform_action();
++}
++
++static uint64_t wdt_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3WdtState *s = opaque;
++
++    switch (addr) {
++    case WDT_WIDR:
++        return 0x31;
++    case WDT_SYSCONFIG:
++        return s->sysconfig;
++    case WDT_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case WDT_WISR:
++        return s->wisr;
++    case WDT_WIER:
++        return s->wier;
++    case WDT_WCLR:
++        return s->wclr;
++    case WDT_WCRR:
++        return wdt_counter(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++    case WDT_WLDR:
++        return s->wldr;
++    case WDT_WTGR:
++        return s->wtgr;
++    case WDT_WWPS:
++        return 0;                       /* no posted write pending */
++    case WDT_WSPR:
++        return s->wspr;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-wdt: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void wdt_reset(DeviceState *dev)
++{
++    Omap3WdtState *s = OMAP3_WDT(dev);
++
++    s->sysconfig = 0;
++    s->wisr = 0;
++    s->wier = 0;
++    s->wclr = 0x20;                     /* PRE, PTV 0 */
++    s->wldr = 0xfffb0000;
++    s->wtgr = 0;
++    s->wspr = 0;
++    s->counter_base = s->wldr;
++    s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->running = true;
++    wdt_schedule(s);
++}
++
++static void wdt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3WdtState *s = opaque;
++
++    switch (addr) {
++    case WDT_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            wdt_reset(DEVICE(s));
++            return;
++        }
++        s->sysconfig = val;
++        return;
++    case WDT_WISR:
++        s->wisr &= ~val;
++        return;
++    case WDT_WIER:
++        s->wier = val & 1;
++        return;
++    case WDT_WCLR:
++        wdt_rebase(s);
++        s->wclr = val & 0x3c;
++        break;
++    case WDT_WCRR:
++        s->counter_base = val;
++        s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        break;
++    case WDT_WLDR:
++        s->wldr = val;
++        return;
++    case WDT_WTGR:
++        if (val != s->wtgr) {           /* a new value reloads the count */
++            s->counter_base = s->wldr;
++            s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        }
++        s->wtgr = val;
++        break;
++    case WDT_WSPR:
++        if (s->wspr == 0xaaaa && val == 0x5555 && s->running) {
++            wdt_rebase(s);
++            s->running = false;
++        } else if (s->wspr == 0xbbbb && val == 0x4444 && !s->running) {
++            s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++            s->running = true;
++        }
++        s->wspr = val;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "omap3-wdt: bad write at 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    wdt_schedule(s);
++}
++
++static const MemoryRegionOps wdt_ops = {
++    .read = wdt_read,
++    .write = wdt_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 2,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static void wdt_init(Object *obj)
++{
++    Omap3WdtState *s = OMAP3_WDT(obj);
++
++    memory_region_init_io(&s->iomem, obj, &wdt_ops, s, "omap3-wdt", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_expired, s);
++}
++
++static const VMStateDescription wdt_vmstate = {
++    .name = TYPE_OMAP3_WDT,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(timer, Omap3WdtState),
++        VMSTATE_UINT32(sysconfig, Omap3WdtState),
++        VMSTATE_UINT32(wisr, Omap3WdtState),
++        VMSTATE_UINT32(wier, Omap3WdtState),
++        VMSTATE_UINT32(wclr, Omap3WdtState),
++        VMSTATE_UINT32(wldr, Omap3WdtState),
++        VMSTATE_UINT32(wtgr, Omap3WdtState),
++        VMSTATE_UINT32(wspr, Omap3WdtState),
++        VMSTATE_BOOL(running, Omap3WdtState),
++        VMSTATE_UINT32(counter_base, Omap3WdtState),
++        VMSTATE_INT64(base_ns, Omap3WdtState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void wdt_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, wdt_reset);
++    dc->vmsd = &wdt_vmstate;
++    dc->desc = "OMAP3 watchdog timer";
++    set_bit(DEVICE_CATEGORY_WATCHDOG, dc->categories);
++}
++
++static const TypeInfo wdt_info = {
++    .name = TYPE_OMAP3_WDT,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3WdtState),
++    .instance_init = wdt_init,
++    .class_init = wdt_class_init,
++};
++
++static void wdt_register_types(void)
++{
++    type_register_static(&wdt_info);
++}
++
++type_init(wdt_register_types)
+-- 
+2.55.0
+

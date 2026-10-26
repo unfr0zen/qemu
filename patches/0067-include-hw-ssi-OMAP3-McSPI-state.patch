@@ -1,0 +1,73 @@
+From 1b94f59d343b678a4f753ef602b3a80779c67c72 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 67/91] include/hw/ssi: OMAP3 McSPI state
+
+---
+ include/hw/ssi/omap3_mcspi.h | 54 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+ create mode 100644 include/hw/ssi/omap3_mcspi.h
+
+diff --git a/include/hw/ssi/omap3_mcspi.h b/include/hw/ssi/omap3_mcspi.h
+new file mode 100644
+index 0000000..e64ce44
+--- /dev/null
++++ b/include/hw/ssi/omap3_mcspi.h
+@@ -0,0 +1,54 @@
++/*
++ * OMAP3 multichannel SPI controller (McSPI), master mode
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_SSI_OMAP3_MCSPI_H
++#define HW_SSI_OMAP3_MCSPI_H
++
++#include "hw/core/sysbus.h"
++#include "hw/ssi/ssi.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_MCSPI "omap3-mcspi"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3McspiState, OMAP3_MCSPI)
++
++#define OMAP3_MCSPI_CHANNELS 4
++
++/* GPIO outputs: the chip-select pins SPIm_CSn, at their electrical level;
++ * named output "dma": TX and RX DMA requests, 2 * channel + (0 TX, 1 RX) */
++#define OMAP3_MCSPI_DMA "dma"
++
++typedef struct Omap3McspiChannel {
++    uint32_t conf;
++    uint32_t ctrl;
++    uint32_t rx;
++    bool rx_full;
++    uint32_t tx;                /* a word waiting for RXn to be read */
++    bool tx_full;
++    bool cs_level;
++} Omap3McspiChannel;
++
++struct Omap3McspiState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    SSIBus *bus;
++    qemu_irq irq;
++    qemu_irq cs[OMAP3_MCSPI_CHANNELS];
++    qemu_irq dma[2 * OMAP3_MCSPI_CHANNELS];
++
++    uint32_t sysconfig;
++    uint32_t irqstatus;
++    uint32_t irqenable;
++    uint32_t wakeupenable;
++    uint32_t syst;
++    uint32_t modulctrl;
++    uint32_t xferlevel;
++    Omap3McspiChannel ch[OMAP3_MCSPI_CHANNELS];
++};
++
++#endif
+-- 
+2.55.0
+

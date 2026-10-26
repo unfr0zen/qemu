@@ -1,0 +1,100 @@
+From 6f2205a5b25a490649355eb7c2519fb2d709b18f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:41:11 -0400
+Subject: [PATCH] hw/arm: anatop USB_ANALOG overlay + PHY VBUS bits
+
+Report valid PHY VBUS levels and provide the i.MX6SX anatop
+USB_ANALOG VBUS and charger detection registers.
+---
+ hw/arm/fsl-imx6sx.c  | 49 ++++++++++++++++++++++++++++++++++++++++++++
+ hw/usb/imx-usb-phy.c |  7 ++++++-
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index 588932e..ae9eb3f 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -184,6 +184,36 @@ static Notifier fsl_imx6sx_ccm_notifier = {
+     .notify = fsl_imx6sx_ccm_init_done,
+ };
+ 
++/* Anatop USB_ANALOG overlay: VBUS/charger detection for the imx_usb driver */
++static uint32_t usb_analog_regs[64];
++
++static uint64_t usb_analog_read(void *opaque, hwaddr addr, unsigned size)
++{
++    uint32_t *r = opaque;
++    uint32_t idx = addr / 4;
++
++    return (idx < 64) ? r[idx] : 0;
++}
++
++static void usb_analog_write(void *opaque, hwaddr addr,
++                             uint64_t value, unsigned size)
++{
++    uint32_t *r = opaque;
++    uint32_t idx = addr / 4;
++
++    if (idx < 64) {
++        r[idx] = value;
++    }
++}
++
++static const MemoryRegionOps usb_analog_ops = {
++    .read = usb_analog_read,
++    .write = usb_analog_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
+ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+ {
+     MachineState *ms = MACHINE(qdev_get_machine());
+@@ -596,6 +626,25 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+         create_unimplemented_device(nm, fsl_imx6sx_unimplemented[i].addr,
+                                     fsl_imx6sx_unimplemented[i].size);
+     }
++
++    /*
++     * USB charger detection: overlay the anatop USB_ANALOG registers
++     * so the imx_usb_charger driver sees VBUS present.  Without this,
++     * nlclient never detects USB connected and never creates the dropbox.
++     */
++    {
++        static MemoryRegion usb_analog_mr;
++
++        /* USB1_VBUS_DETECT_STAT (anatop+0x1C0): all VBUS thresholds met */
++        usb_analog_regs[0] = BIT(0) | BIT(2) | BIT(3) | BIT(4);
++        /* USB1_CHRG_DETECT_STAT (anatop+0x240): SDP (standard downstream) */
++        usb_analog_regs[0x80 / 4] = BIT(0) | BIT(1) | BIT(2) | BIT(3);
++        memory_region_init_io(&usb_analog_mr, NULL, &usb_analog_ops,
++                              usb_analog_regs, "anatop-usb-analog", 0x100);
++        memory_region_add_subregion(get_system_memory(),
++                                    FSL_IMX6SX_ANATOP_ADDR + 0x1C0,
++                                    &usb_analog_mr);
++    }
+ }
+ 
+ static const Property fsl_imx6sx_properties[] = {
+diff --git a/hw/usb/imx-usb-phy.c b/hw/usb/imx-usb-phy.c
+index c25566d..1ef4957 100644
+--- a/hw/usb/imx-usb-phy.c
++++ b/hw/usb/imx-usb-phy.c
+@@ -38,7 +38,12 @@ static void imx_usbphy_reset(DeviceState *dev)
+ {
+     IMXUSBPHYState *s = IMX_USBPHY(dev);
+ 
+-    s->usbphy[USBPHY_STATUS] = 0x00000000;
++    /*
++     * VBUS_VLD (bit 3) and BVALID (bit 4): report a connected USB cable.
++     * The imx_usb_charger driver reads these to detect VBUS; without them
++     * it fails with "vbus is error" and the dropbox is never created.
++     */
++    s->usbphy[USBPHY_STATUS] = BIT(3) | BIT(4);
+     s->usbphy[USBPHY_DEBUG] = 0x7f180000;
+     s->usbphy[USBPHY_DEBUG0_STATUS] = 0x00000000;
+     s->usbphy[USBPHY_DEBUG1] = 0x00001000;
+-- 
+2.56.0
+

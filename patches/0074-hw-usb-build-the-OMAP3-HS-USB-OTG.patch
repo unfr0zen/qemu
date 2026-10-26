@@ -1,0 +1,21 @@
+From df4be9799ad99736dbc7e103f57f42a25ce5803e Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 74/91] hw/usb: build the OMAP3 HS USB OTG
+
+---
+ hw/usb/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index ba55c28..f734f96 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -91,3 +91,4 @@ endif
+ system_ss.add(when: ['CONFIG_USB', 'CONFIG_XEN_BUS', libusb], if_true: files('xen-usb.c'))
+ 
+ modules += { 'hw-usb': hw_usb_modules }
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_musb.c'))
+-- 
+2.55.0
+

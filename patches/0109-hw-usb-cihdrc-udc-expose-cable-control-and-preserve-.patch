@@ -1,0 +1,250 @@
+From 45ba437f148d437ec347d8dcb85e96923276b55c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:45:45 -0400
+Subject: [PATCH 109/109] hw/usb: cihdrc-udc: expose cable control and preserve OTG on
+ reset
+
+Expose the requested cable state and effective VBUS through machine
+properties. Gate bridge traffic on VBUS, signal gadget disconnects to
+the USB/IP exporter, and report USB1 analog detection from the same
+cable input. Keep the requested cable setting across guest resets.
+
+Preserve the OTG block across a device-controller reset, so the guest
+can keep its VBUS interrupt enabled while resetting the gadget. Only
+write host notifications while the chardev backend is open.
+---
+ hw/arm/flintstone.c         |  5 ++++
+ hw/arm/fsl-imx6sx.c         | 32 +++++++++------------
+ hw/usb/cihdrc-udc.c         | 57 +++++++++++++++++++++++++++++--------
+ include/hw/usb/cihdrc-udc.h |  1 +
+ 4 files changed, 65 insertions(+), 30 deletions(-)
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 5ee2cdc..20cf7e8 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -417,6 +417,11 @@ static void flintstone_init(MachineState *machine)
+         qemu_register_reset(flintstone_rom_boot, rom);
+     }
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
++    object_property_add_alias(OBJECT(machine), "usb-connected",
++                              OBJECT(&FSL_IMX6SX(soc)->usb0),
++                              "cable-connected");
++    object_property_add_alias(OBJECT(machine), "usb-vbus",
++                              OBJECT(&FSL_IMX6SX(soc)->usb0), "vbus");
+ 
+     memory_region_add_subregion(get_system_memory(), FLINTSTONE_RAM_ADDR,
+                                 machine->ram);
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index 1b079e3..83aeacd 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -189,20 +189,27 @@ static uint32_t usb_analog_regs[64];
+ 
+ static uint64_t usb_analog_read(void *opaque, hwaddr addr, unsigned size)
+ {
+-    uint32_t *r = opaque;
++    FslIMX6SXState *s = opaque;
++    bool vbus = object_property_get_bool(OBJECT(&s->usb0), "vbus",
++                                         &error_abort);
+     uint32_t idx = addr / 4;
+ 
+-    return (idx < 64) ? r[idx] : 0;
++    if (idx == 0) {
++        return vbus ? BIT(0) | BIT(2) | BIT(3) | BIT(4) : 0;
++    }
++    if (idx == 0x10 / 4) {
++        return vbus ? BIT(0) : 0;
++    }
++    return (idx < 64) ? usb_analog_regs[idx] : 0;
+ }
+ 
+ static void usb_analog_write(void *opaque, hwaddr addr,
+                              uint64_t value, unsigned size)
+ {
+-    uint32_t *r = opaque;
+     uint32_t idx = addr / 4;
+ 
+-    if (idx < 64) {
+-        r[idx] = value;
++    if (idx < 64 && idx != 0 && idx != 0x10 / 4) {
++        usb_analog_regs[idx] = value;
+     }
+ }
+ 
+@@ -627,23 +634,12 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+                                     fsl_imx6sx_unimplemented[i].size);
+     }
+ 
+-    /*
+-     * USB charger detection: overlay the anatop USB_ANALOG registers
+-     * so the imx_usb_charger driver sees VBUS present.  Without this,
+-     * nlclient never detects USB connected and never creates the dropbox.
+-     */
++    /* USB1 VBUS and charger status are read-only cable inputs. */
+     {
+         static MemoryRegion usb_analog_mr;
+ 
+-        /* USB1_VBUS_DETECT_STAT (anatop+0x1C0): all VBUS thresholds met */
+-        usb_analog_regs[0] = BIT(0) | BIT(2) | BIT(3) | BIT(4);
+-        /*
+-         * USB1_CHRG_DET_STAT (anatop+0x1D0): standard downstream port,
+-         * with plug contact detected, no charger detected, and DM low.
+-         */
+-        usb_analog_regs[0x10 / 4] = BIT(0);
+         memory_region_init_io(&usb_analog_mr, NULL, &usb_analog_ops,
+-                              usb_analog_regs, "anatop-usb-analog", 0x100);
++                              s, "anatop-usb-analog", 0x100);
+         memory_region_add_subregion(get_system_memory(),
+                                     FSL_IMX6SX_ANATOP_ADDR + 0x1C0,
+                                     &usb_analog_mr);
+diff --git a/hw/usb/cihdrc-udc.c b/hw/usb/cihdrc-udc.c
+index a8a774b..4e22952 100644
+--- a/hw/usb/cihdrc-udc.c
++++ b/hw/usb/cihdrc-udc.c
+@@ -73,7 +73,7 @@ static void ci_irq(CIHDRCUDCState *s)
+ 
+ static void ci_send(CIHDRCUDCState *s, const char *text)
+ {
+-    if (qemu_chr_fe_backend_connected(&s->chr)) {
++    if (qemu_chr_fe_backend_open(&s->chr)) {
+         qemu_chr_fe_write_all(&s->chr, (const uint8_t *)text, strlen(text));
+     }
+ }
+@@ -81,7 +81,8 @@ static void ci_send(CIHDRCUDCState *s, const char *text)
+ static void ci_connect(CIHDRCUDCState *s)
+ {
+     bool connected = (REG(s, USBCMD) & CMD_RS) &&
+-                     (REG(s, USBMODE) & 3) == 2;
++                     (REG(s, USBMODE) & 3) == 2 &&
++                     (REG(s, OTGSC) & OTGSC_BSV);
+ 
+     if (s->connected != connected) {
+         s->connected = connected;
+@@ -135,7 +136,7 @@ static void ci_reset(DeviceState *dev)
+     memset(s->regs, 0, sizeof(s->regs));
+     REG(s, PORTSC) = BIT(12) | BIT(0);
+     REG(s, OTGSC) = BIT(8);
+-    if (qemu_chr_fe_backend_open(&s->chr)) {
++    if (s->cable_connected && qemu_chr_fe_backend_open(&s->chr)) {
+         REG(s, OTGSC) |= OTGSC_BSV;
+     }
+     REG(s, EPCTRL) = BIT(7) | BIT(23);
+@@ -408,6 +409,9 @@ static void ci_command(CIHDRCUDCState *s, char *line)
+     unsigned ep, length;
+     g_autofree uint8_t *data = NULL;
+ 
++    if (!(REG(s, OTGSC) & OTGSC_BSV)) {
++        return;
++    }
+     if (argc == 1 && !strcmp(args[0], "RESET")) {
+         ci_flush(s, EP_MASK);
+         REG(s, DEVICEADDR) = 0;
+@@ -523,6 +527,16 @@ static void ci_vbus_edge(CIHDRCUDCState *s, bool present)
+     }
+     REG(s, OTGSC) ^= OTGSC_BSV;
+     REG(s, OTGSC) |= OTGSC_BSVIS;
++    if (!present) {
++        s->line_len = 0;
++        s->discard_line = false;
++        s->status_pending = false;
++        s->setup_pending = false;
++        g_queue_clear_full(&s->out_queue, g_free);
++        timer_del(s->reset_timer);
++        REG(s, PORTSC) &= ~PORT_RESET;
++    }
++    ci_connect(s);
+     ci_irq(s);
+ }
+ 
+@@ -531,18 +545,10 @@ static void ci_event(void *opaque, QEMUChrEvent event)
+     CIHDRCUDCState *s = opaque;
+ 
+     if (event == CHR_EVENT_OPENED) {
+-        ci_vbus_edge(s, true);
+-        if (s->connected) {
+-            ci_send(s, "CONNECT\n");
+-        }
++        ci_vbus_edge(s, s->cable_connected);
+     }
+     if (event == CHR_EVENT_CLOSED) {
+         ci_vbus_edge(s, false);
+-        s->line_len = 0;
+-        s->discard_line = false;
+-        s->status_pending = false;
+-        s->setup_pending = false;
+-        g_queue_clear_full(&s->out_queue, g_free);
+     }
+ }
+ 
+@@ -574,7 +580,11 @@ static void ci_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+     switch (addr) {
+     case USBCMD:
+         if (value & CMD_RST) {
++            uint32_t otgsc = REG(s, OTGSC);
++
++            /* The OTG block is outside the device-controller reset. */
+             ci_reset(DEVICE(s));
++            REG(s, OTGSC) = otgsc;
+         } else {
+             REG(s, USBCMD) = value & (CMD_RS | CMD_SUTW | CMD_ATDTW);
+             ci_setup(s);
+@@ -654,6 +664,24 @@ static const MemoryRegionOps ci_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
++static bool ci_get_cable_connected(Object *obj, Error **errp)
++{
++    return CIHDRC_UDC(obj)->cable_connected;
++}
++
++static void ci_set_cable_connected(Object *obj, bool value, Error **errp)
++{
++    CIHDRCUDCState *s = CIHDRC_UDC(obj);
++
++    s->cable_connected = value;
++    ci_vbus_edge(s, value && qemu_chr_fe_backend_open(&s->chr));
++}
++
++static bool ci_get_vbus(Object *obj, Error **errp)
++{
++    return !!(REG(CIHDRC_UDC(obj), OTGSC) & OTGSC_BSV);
++}
++
+ static void ci_realize(DeviceState *dev, Error **errp)
+ {
+     CIHDRCUDCState *s = CIHDRC_UDC(dev);
+@@ -688,6 +716,7 @@ static void ci_init(Object *obj)
+ 
+     s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ci_reset_done, s);
+     s->high_speed = true;
++    s->cable_connected = true;
+     memory_region_init_io(&s->iomem, obj, &ci_ops, s, TYPE_CIHDRC_UDC, 0x200);
+     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+@@ -711,6 +740,10 @@ static void ci_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    object_class_property_add_bool(klass, "cable-connected",
++                                   ci_get_cable_connected,
++                                   ci_set_cable_connected);
++    object_class_property_add_bool(klass, "vbus", ci_get_vbus, NULL);
+     dc->realize = ci_realize;
+     dc->unrealize = ci_unrealize;
+     device_class_set_legacy_reset(dc, ci_reset);
+diff --git a/include/hw/usb/cihdrc-udc.h b/include/hw/usb/cihdrc-udc.h
+index 93a66a7..c45611d 100644
+--- a/include/hw/usb/cihdrc-udc.h
++++ b/include/hw/usb/cihdrc-udc.h
+@@ -22,6 +22,7 @@ struct CIHDRCUDCState {
+     uint32_t td[CIHDRC_EP_COUNT * 2];
+     uint32_t offset[CIHDRC_EP_COUNT * 2];
+     bool connected;
++    bool cable_connected;
+     bool high_speed;
+     QEMUTimer *reset_timer;
+     GQueue out_queue;
+-- 
+2.56.0
+

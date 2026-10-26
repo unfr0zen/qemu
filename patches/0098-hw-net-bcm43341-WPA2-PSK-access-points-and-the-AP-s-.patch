@@ -1,0 +1,827 @@
+From 5a7f3bc48ce4dfabe766aa8d48e42f1c2a7915b3 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:25:55 -0400
+Subject: [PATCH 98/98] hw/net: bcm43341: WPA2-PSK access points and the AP's
+ 4-way handshake
+
+Lets a guest scan, list and join WPA2-PSK networks, so provisioning an
+SSID and passphrase can be tested; a wrong passphrase fails msg2's MIC.
+---
+ hw/net/bcm43341.c | 542 +++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 493 insertions(+), 49 deletions(-)
+
+diff --git a/hw/net/bcm43341.c b/hw/net/bcm43341.c
+index 5272e17..860ff1e 100644
+--- a/hw/net/bcm43341.c
++++ b/hw/net/bcm43341.c
+@@ -22,9 +22,18 @@
+  *
+  *   wl      enough ioctls/iovars for dhd_preinit_ioctls and wl_cfg80211
+  *           (and for brcmfmac, which the 6.4 firmware loads instead),
+- *           an escan that finds one open access point, a join to it, and a
++ *           an escan that finds a few access points, a join to one, and a
+  *           data path to a QEMU NIC (-nic user,model=bcm43341) once joined.
+  *
++ *   WPA2    the firmware leaves the supplicant to the host: wpa_supplicant
++ *           runs the 4-way handshake over EAPOL data frames and installs
++ *           the keys it derives through "wsec_key". This model is the AP's
++ *           side of that handshake (PMK from the passphrase, PTK, msg1 to
++ *           msg4, the GTK wrapped with the KEK). A msg2 with a wrong MIC is
++ *           dropped, msg1 is resent, and after the last try the AP deauths
++ *           with "4-way handshake timeout", as hostapd does. Frames stay in
++ *           the clear between chip and host either way.
++ *
+  * With trace=on every backplane register access and every ioctl is logged,
+  * so a driver that stalls shows where.
+  *
+@@ -37,6 +46,10 @@
+ #include "qemu/log.h"
+ #include "qemu/timer.h"
+ #include "qemu/units.h"
++#include "qemu/guest-random.h"
++#include "qapi/error.h"
++#include "crypto/cipher.h"
++#include "crypto/hmac.h"
+ #include "hw/core/irq.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/sd/sd.h"
+@@ -202,6 +215,7 @@ static const struct {
+ 
+ /* events */
+ #define WLC_E_SET_SSID          0
++#define WLC_E_DEAUTH_IND        6
+ #define WLC_E_LINK              16
+ #define WLC_E_SCAN_COMPLETE     26
+ #define WLC_E_ESCAN_RESULT      69
+@@ -209,6 +223,7 @@ static const struct {
+ #define WLC_E_STATUS_NO_NETWORKS 3
+ #define WLC_E_STATUS_PARTIAL    8
+ #define WLC_EVENT_MSG_LINK      0x01
++#define DOT11_RC_4WAY_HANDSHAKE_TIMEOUT 15
+ #define WL_EVENTING_MASK_LEN    16
+ #define BCM_EVENT_MSG_VERSION   2
+ #define BCM_EVENT_LEN           (14 + 10 + 48)  /* eth + bcmeth + msg */
+@@ -229,6 +244,45 @@ static const struct {
+ 
+ #define BCM_RXQ_MAX             256
+ 
++#define BCM_MAX_APS             8
++#define ETHER_TYPE_EAPOL        0x888e
++/* EAPOL-Key key information */
++#define WPA_KEY_INFO_HMAC_SHA1_AES 0x0002
++#define WPA_KEY_INFO_PAIRWISE   0x0008
++#define WPA_KEY_INFO_INSTALL    0x0040
++#define WPA_KEY_INFO_ACK        0x0080
++#define WPA_KEY_INFO_MIC        0x0100
++#define WPA_KEY_INFO_SECURE     0x0200
++#define WPA_KEY_INFO_ENC_DATA   0x1000
++/* offsets in an EAPOL-Key frame, its 4-byte EAPOL header included */
++#define EAPOL_KEY_REPLAY        9
++#define EAPOL_KEY_NONCE         17
++#define EAPOL_KEY_MIC           81
++#define EAPOL_KEY_DATA_LEN      97
++#define EAPOL_KEY_LEN           99      /* up to the key data */
++#define BCM_DEFAULT_APS \
++    "Nest-WPA2:1:-55:nestpassword;Neighbour:11:-78:*"
++#define BCM_HS_TRIES            3       /* msg1/msg3 sends before deauth */
++
++/* RSN: CCMP group and pairwise cipher, PSK key management */
++static const uint8_t bcm_rsn_ie[] = {
++    0x30, 20, 1, 0,
++    0x00, 0x0f, 0xac, 4,
++    1, 0, 0x00, 0x0f, 0xac, 4,
++    1, 0, 0x00, 0x0f, 0xac, 2,
++    0, 0,
++};
++
++typedef struct BCMAp {
++    char ssid[33];
++    uint8_t bssid[6];
++    uint8_t channel;
++    int8_t rssi;
++    bool psk;                   /* WPA2-PSK, else open */
++    bool reject;                /* WPA2-PSK that no passphrase joins */
++    uint8_t pmk[32];
++} BCMAp;
++
+ static const uint8_t bcm_rates[] = {
+     0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24,
+ };
+@@ -242,6 +296,7 @@ struct BCM43341State {
+     qemu_irq card_int;
+     char *ssid;
+     uint8_t channel;
++    char *aps_prop;
+     bool trace;
+ 
+     bool powered;
+@@ -273,11 +328,20 @@ struct BCM43341State {
+ 
+     /* wl */
+     uint8_t mac[6];
+-    uint8_t bssid[6];
++    BCMAp aps[BCM_MAX_APS];     /* [0] is ssid/channel, open */
++    unsigned num_aps;
++    int join_ap;                /* what the pending join found, or -1 */
++    unsigned cur;               /* the AP associated with */
+     uint8_t eventmask[WL_EVENTING_MASK_LEN];
+     bool up;
+     bool associated;
+-    bool join_ok;
++    bool authorized;            /* the 4-way handshake completed */
++    unsigned hs_state;          /* 1: msg1 sent, 2: msg3 sent */
++    unsigned hs_tries;
++    uint64_t replay;
++    uint8_t anonce[32];
++    uint8_t ptk[48];            /* KCK, KEK, TK */
++    uint8_t gtk[16];
+     uint32_t infra, auth, wsec, wpa_auth, pm;
+     uint8_t country[12];        /* wl_country_t: abbrev[4], rev, ccode[4] */
+     uint32_t bw_cap_2g;
+@@ -285,6 +349,7 @@ struct BCM43341State {
+     bool scan_legacy;
+     QEMUTimer *scan_timer;
+     QEMUTimer *join_timer;
++    QEMUTimer *hs_timer;
+ };
+ 
+ #define BCM_TRACE(s, fmt, ...)                                              \
+@@ -410,19 +475,19 @@ static void bcm_send_event(BCM43341State *s, uint32_t type, uint32_t status,
+     bcm_queue_bdc(s, SDPCM_EVENT_CHANNEL, ev, BCM_EVENT_LEN + datalen);
+ }
+ 
+-/* -- The access point ------------------------------------------------------ */
++/* -- The access points ----------------------------------------------------- */
+ 
+ /* wl_bss_info_t (version 109, 128 bytes) followed by its IEs. */
+-static size_t bcm_build_bss(BCM43341State *s, uint8_t *p)
++static size_t bcm_build_bss(const BCMAp *ap, uint8_t *p)
+ {
+-    size_t ssid_len = MIN(strlen(s->ssid), 32);
++    size_t ssid_len = strlen(ap->ssid);
+     uint8_t *ie = p + WL_BSS_INFO_LEN;
+     size_t ie_len;
+ 
+     memset(p, 0, WL_BSS_INFO_LEN);
+     ie[0] = 0;                                  /* SSID */
+     ie[1] = ssid_len;
+-    memcpy(ie + 2, s->ssid, ssid_len);
++    memcpy(ie + 2, ap->ssid, ssid_len);
+     ie_len = 2 + ssid_len;
+     ie[ie_len] = 1;                             /* supported rates */
+     ie[ie_len + 1] = sizeof(bcm_rates);
+@@ -430,7 +495,7 @@ static size_t bcm_build_bss(BCM43341State *s, uint8_t *p)
+     ie_len += 2 + sizeof(bcm_rates);
+     ie[ie_len] = 3;                             /* DS parameter set */
+     ie[ie_len + 1] = 1;
+-    ie[ie_len + 2] = s->channel;
++    ie[ie_len + 2] = ap->channel;
+     ie_len += 3;
+     ie[ie_len] = 5;                             /* TIM: DTIM period 1 */
+     ie[ie_len + 1] = 4;
+@@ -439,29 +504,46 @@ static size_t bcm_build_bss(BCM43341State *s, uint8_t *p)
+     ie[ie_len + 4] = 0;
+     ie[ie_len + 5] = 0;
+     ie_len += 6;
++    if (ap->psk) {
++        memcpy(ie + ie_len, bcm_rsn_ie, sizeof(bcm_rsn_ie));
++        ie_len += sizeof(bcm_rsn_ie);
++    }
+ 
+     stl_le_p(p, WL_BSS_INFO_VERSION);
+     stl_le_p(p + 4, WL_BSS_INFO_LEN + ie_len);
+-    memcpy(p + 8, s->bssid, 6);
++    memcpy(p + 8, ap->bssid, 6);
+     stw_le_p(p + 14, 100);                      /* beacon period */
+-    stw_le_p(p + 16, 0x0401);                   /* ESS, short slot */
++    /* ESS, short slot, and privacy for WPA2 */
++    stw_le_p(p + 16, 0x0401 | (ap->psk ? 0x0010 : 0));
+     p[18] = ssid_len;
+-    memcpy(p + 19, s->ssid, ssid_len);
++    memcpy(p + 19, ap->ssid, ssid_len);
+     stl_le_p(p + 52, sizeof(bcm_rates));
+     memcpy(p + 56, bcm_rates, sizeof(bcm_rates));
+-    stw_le_p(p + 72, WL_CHANSPEC_BW_20 | s->channel);
++    stw_le_p(p + 72, WL_CHANSPEC_BW_20 | ap->channel);
+     p[76] = 1;                                  /* DTIM period */
+-    stw_le_p(p + 78, (uint16_t)-40);            /* RSSI */
++    stw_le_p(p + 78, (uint16_t)ap->rssi);
+     p[80] = (uint8_t)-90;                       /* noise */
+-    p[88] = s->channel;                         /* control channel */
++    p[88] = ap->channel;                        /* control channel */
+     p[96] = WL_BSS_FLAGS_RSSI_ONCHANNEL;
+     stw_le_p(p + 116, WL_BSS_INFO_LEN);         /* ie_offset */
+     stl_le_p(p + 120, ie_len);
+-    stw_le_p(p + 124, 50);                      /* SNR */
++    stw_le_p(p + 124, ap->rssi + 90);           /* SNR */
+     return WL_BSS_INFO_LEN + ie_len;
+ }
+ 
+-#define BCM_BSS_MAX     (WL_BSS_INFO_LEN + 64)
++#define BCM_BSS_MAX     (WL_BSS_INFO_LEN + 96)
++
++/* The channel the radio sits on: the AP's once associated. */
++static uint8_t bcm_channel(BCM43341State *s)
++{
++    return s->associated ? s->aps[s->cur].channel : s->channel;
++}
++
++/* Whether data frames pass: open, or WPA2 with the handshake done. */
++static bool bcm_port_open(BCM43341State *s)
++{
++    return s->associated && (!s->aps[s->cur].psk || s->authorized);
++}
+ 
+ static void bcm_scan_done(void *opaque)
+ {
+@@ -477,16 +559,23 @@ static void bcm_scan_done(void *opaque)
+                        NULL, NULL, 0);
+         return;
+     }
+-    /* wl_escan_result_t: buflen, version, sync_id, bss_count, bss_info */
+-    len = bcm_build_bss(s, res + 12);
+-    stl_le_p(res, 12 + len);
+-    stl_le_p(res + 4, WL_BSS_INFO_VERSION);
+-    stw_le_p(res + 8, s->scan_sync_id);
+-    stw_le_p(res + 10, 1);
+-    bcm_send_event(s, WLC_E_ESCAN_RESULT, WLC_E_STATUS_PARTIAL, 0, 0,
+-                   NULL, res, 12 + len);
++    /*
++     * wl_escan_result_t: buflen, version, sync_id, bss_count, bss_info.
++     * bcmdhd takes one BSS per result.
++     */
++    for (unsigned i = 0; i < s->num_aps; i++) {
++        len = bcm_build_bss(&s->aps[i], res + 12);
++        stl_le_p(res, 12 + len);
++        stl_le_p(res + 4, WL_BSS_INFO_VERSION);
++        stw_le_p(res + 8, s->scan_sync_id);
++        stw_le_p(res + 10, 1);
++        bcm_send_event(s, WLC_E_ESCAN_RESULT, WLC_E_STATUS_PARTIAL, 0, 0,
++                       NULL, res, 12 + len);
++    }
+ 
+     stl_le_p(res, 12);
++    stl_le_p(res + 4, WL_BSS_INFO_VERSION);
++    stw_le_p(res + 8, s->scan_sync_id);
+     stw_le_p(res + 10, 0);
+     bcm_send_event(s, WLC_E_ESCAN_RESULT, WLC_E_STATUS_SUCCESS, 0, 0,
+                    NULL, res, 12);
+@@ -500,24 +589,286 @@ static void bcm_start_scan(BCM43341State *s, bool legacy, uint16_t sync_id)
+               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+ }
+ 
++/* -- WPA2: the AP's side of the 4-way handshake --------------------------- */
++
++static void bcm_hmac_sha1(const uint8_t *key, size_t klen,
++                          const struct iovec *iov, size_t niov,
++                          uint8_t out[20])
++{
++    g_autoptr(QCryptoHmac) h = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA1, key,
++                                                klen, &error_abort);
++    size_t olen = 20;
++
++    qcrypto_hmac_bytesv(h, iov, niov, &out, &olen, &error_abort);
++}
++
++/*
++ * PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32). Built on qcrypto's
++ * HMAC, which every crypto backend has, unlike qcrypto_pbkdf2.
++ */
++static void bcm_psk_to_pmk(const char *pass, const char *ssid,
++                           uint8_t pmk[32])
++{
++    for (uint32_t blk = 1; blk <= 2; blk++) {
++        uint8_t cnt[4], u[20], t[20];
++        struct iovec iov[2] = {
++            { (void *)ssid, strlen(ssid) }, { cnt, 4 },
++        };
++
++        stl_be_p(cnt, blk);
++        bcm_hmac_sha1((const uint8_t *)pass, strlen(pass), iov, 2, u);
++        memcpy(t, u, 20);
++        for (int i = 1; i < 4096; i++) {
++            struct iovec ui = { u, 20 };
++
++            bcm_hmac_sha1((const uint8_t *)pass, strlen(pass), &ui, 1, u);
++            for (int j = 0; j < 20; j++) {
++                t[j] ^= u[j];
++            }
++        }
++        memcpy(pmk + 20 * (blk - 1), t, blk == 1 ? 20 : 12);
++    }
++}
++
++/* PTK = PRF-384(PMK, "Pairwise key expansion", AA/SPA, ANonce/SNonce) */
++static void bcm_derive_ptk(BCM43341State *s, const uint8_t *snonce)
++{
++    static const char label[] = "Pairwise key expansion";
++    const uint8_t *aa = s->aps[s->cur].bssid, *spa = s->mac;
++    bool alo = memcmp(aa, spa, 6) < 0;
++    bool nlo = memcmp(s->anonce, snonce, 32) < 0;
++    uint8_t data[76], out[60], i;
++    struct iovec iov[3] = {
++        { (void *)label, sizeof(label) }, { data, sizeof(data) }, { &i, 1 },
++    };
++
++    memcpy(data, alo ? aa : spa, 6);
++    memcpy(data + 6, alo ? spa : aa, 6);
++    memcpy(data + 12, nlo ? s->anonce : snonce, 32);
++    memcpy(data + 44, nlo ? snonce : s->anonce, 32);
++    for (i = 0; i < 3; i++) {
++        bcm_hmac_sha1(s->aps[s->cur].pmk, 32, iov, 3, out + 20 * i);
++    }
++    memcpy(s->ptk, out, sizeof(s->ptk));
++}
++
++/* The MIC of an EAPOL frame (EAPOL header on), with its MIC field zero. */
++static void bcm_eapol_mic(BCM43341State *s, const uint8_t *f, size_t len,
++                          uint8_t mic[16])
++{
++    g_autofree uint8_t *c = g_memdup2(f, len);
++    uint8_t out[20];
++    struct iovec iov = { c, len };
++
++    memset(c + EAPOL_KEY_MIC, 0, 16);
++    bcm_hmac_sha1(s->ptk, 16, &iov, 1, out);
++    memcpy(mic, out, 16);
++}
++
++/* AES Key Wrap (RFC 3394) with the KEK; len a multiple of 8, out len + 8. */
++static void bcm_aes_wrap(BCM43341State *s, const uint8_t *in, size_t len,
++                         uint8_t *out)
++{
++    g_autoptr(QCryptoCipher) c =
++        qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_128,
++                           QCRYPTO_CIPHER_MODE_ECB, s->ptk + 16, 16,
++                           &error_abort);
++    size_t n = len / 8;
++    uint8_t b[16];
++
++    memset(out, 0xa6, 8);
++    memcpy(out + 8, in, len);
++    for (unsigned j = 0; j < 6; j++) {
++        for (size_t i = 1; i <= n; i++) {
++            memcpy(b, out, 8);
++            memcpy(b + 8, out + 8 * i, 8);
++            qcrypto_cipher_encrypt(c, b, b, 16, &error_abort);
++            stq_be_p(out, ldq_be_p(b) ^ (n * j + i));
++            memcpy(out + 8 * i, b + 8, 8);
++        }
++    }
++}
++
++/* An EAPOL-Key frame from the AP to the host, MIC'd with the KCK if asked. */
++static void bcm_eapol_send(BCM43341State *s, uint16_t info,
++                           const uint8_t *data, size_t dlen)
++{
++    size_t len = 14 + EAPOL_KEY_LEN + dlen;
++    g_autofree uint8_t *f = g_malloc0(len);
++    uint8_t *e = f + 14;
++
++    memcpy(f, s->mac, 6);
++    memcpy(f + 6, s->aps[s->cur].bssid, 6);
++    stw_be_p(f + 12, ETHER_TYPE_EAPOL);
++    e[0] = 2;                                   /* 802.1X-2004 */
++    e[1] = 3;                                   /* EAPOL-Key */
++    stw_be_p(e + 2, EAPOL_KEY_LEN - 4 + dlen);
++    e[4] = 2;                                   /* RSN key descriptor */
++    stw_be_p(e + 5, info);
++    stw_be_p(e + 7, 16);                        /* CCMP key length */
++    stq_be_p(e + EAPOL_KEY_REPLAY, s->replay);
++    memcpy(e + EAPOL_KEY_NONCE, s->anonce, 32);
++    stw_be_p(e + EAPOL_KEY_DATA_LEN, dlen);
++    memcpy(e + EAPOL_KEY_LEN, data, dlen);
++    if (info & WPA_KEY_INFO_MIC) {
++        bcm_eapol_mic(s, e, EAPOL_KEY_LEN + dlen, e + EAPOL_KEY_MIC);
++    }
++    bcm_queue_bdc(s, SDPCM_DATA_CHANNEL, f, len);
++}
++
++static void bcm_send_msg1(BCM43341State *s)
++{
++    s->replay++;
++    bcm_eapol_send(s, WPA_KEY_INFO_HMAC_SHA1_AES | WPA_KEY_INFO_PAIRWISE |
++                   WPA_KEY_INFO_ACK, NULL, 0);
++}
++
++/* msg3: the RSN IE and, AES-wrapped with the KEK, a GTK KDE. */
++static void bcm_send_msg3(BCM43341State *s)
++{
++    uint8_t kd[48], wrapped[56];
++    size_t n = 0;
++
++    memcpy(kd, bcm_rsn_ie, sizeof(bcm_rsn_ie));
++    n += sizeof(bcm_rsn_ie);
++    kd[n++] = 0xdd;                             /* GTK KDE */
++    kd[n++] = 6 + sizeof(s->gtk);
++    memcpy(kd + n, "\x00\x0f\xac\x01", 4);
++    n += 4;
++    kd[n++] = 1;                                /* key id 1 */
++    kd[n++] = 0;
++    memcpy(kd + n, s->gtk, sizeof(s->gtk));
++    n += sizeof(s->gtk);
++    kd[n++] = 0xdd;                             /* padding to 8 bytes */
++    kd[n++] = 0;
++    assert(n == sizeof(kd));
++    bcm_aes_wrap(s, kd, n, wrapped);
++
++    s->replay++;
++    bcm_eapol_send(s, WPA_KEY_INFO_HMAC_SHA1_AES | WPA_KEY_INFO_PAIRWISE |
++                   WPA_KEY_INFO_INSTALL | WPA_KEY_INFO_ACK |
++                   WPA_KEY_INFO_MIC | WPA_KEY_INFO_SECURE |
++                   WPA_KEY_INFO_ENC_DATA, wrapped, sizeof(wrapped));
++}
++
++static void bcm_hs_reset(BCM43341State *s)
++{
++    timer_del(s->hs_timer);
++    s->hs_state = 0;
++    s->authorized = false;
++}
++
++/* Resend msg1 or msg3, or give up and deauth the station. */
++static void bcm_hs_timeout(void *opaque)
++{
++    BCM43341State *s = opaque;
++    const uint8_t *bssid = s->aps[s->cur].bssid;
++
++    if (!s->fw_running || !s->associated || !s->hs_state) {
++        return;
++    }
++    if (s->hs_tries >= BCM_HS_TRIES) {
++        BCM_TRACE(s, "4-way handshake timed out");
++        bcm_hs_reset(s);
++        s->associated = false;
++        bcm_send_event(s, WLC_E_DEAUTH_IND, WLC_E_STATUS_SUCCESS,
++                       DOT11_RC_4WAY_HANDSHAKE_TIMEOUT, 0, bssid, NULL, 0);
++        bcm_send_event(s, WLC_E_LINK, WLC_E_STATUS_SUCCESS,
++                       DOT11_RC_4WAY_HANDSHAKE_TIMEOUT, 0, bssid, NULL, 0);
++        return;
++    }
++    s->hs_tries++;
++    if (s->hs_state == 1) {
++        bcm_send_msg1(s);
++    } else {
++        bcm_send_msg3(s);
++    }
++    timer_mod(s->hs_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
++}
++
++static void bcm_hs_start(BCM43341State *s)
++{
++    qemu_guest_getrandom_nofail(s->anonce, sizeof(s->anonce));
++    qemu_guest_getrandom_nofail(s->gtk, sizeof(s->gtk));
++    s->authorized = false;
++    s->hs_state = 1;
++    s->hs_tries = 0;
++    /* msg1 once the host has seen the link come up */
++    timer_mod(s->hs_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
++}
++
++/* An EAPOL frame from the host (EAPOL header on): msg2 or msg4. */
++static void bcm_eapol_rx(BCM43341State *s, const uint8_t *e, size_t len)
++{
++    uint8_t mic[16];
++    uint16_t info;
++
++    if (len < EAPOL_KEY_LEN || e[1] != 3 || e[4] != 2 || !s->hs_state) {
++        return;
++    }
++    len = MIN(len, 4 + (size_t)lduw_be_p(e + 2));
++    if (len < EAPOL_KEY_LEN || ldq_be_p(e + EAPOL_KEY_REPLAY) != s->replay) {
++        BCM_TRACE(s, "EAPOL-Key with a stale replay counter dropped");
++        return;
++    }
++    info = lduw_be_p(e + 5);
++    if (!(info & WPA_KEY_INFO_MIC)) {
++        return;
++    }
++    if (s->hs_state == 1 && !(info & WPA_KEY_INFO_SECURE)) {
++        bcm_derive_ptk(s, e + EAPOL_KEY_NONCE);
++    } else if (s->hs_state != 2 || !(info & WPA_KEY_INFO_SECURE)) {
++        return;
++    }
++    bcm_eapol_mic(s, e, len, mic);
++    if (s->aps[s->cur].reject ||
++        memcmp(mic, e + EAPOL_KEY_MIC, sizeof(mic))) {
++        BCM_TRACE(s, "msg%u MIC mismatch: wrong passphrase",
++                  s->hs_state * 2);
++        return;
++    }
++    if (s->hs_state == 1) {
++        BCM_TRACE(s, "msg2 ok, sending msg3");
++        s->hs_state = 2;
++        s->hs_tries = 1;
++        bcm_send_msg3(s);
++        timer_mod(s->hs_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
++    } else {
++        BCM_TRACE(s, "msg4 ok, port open");
++        timer_del(s->hs_timer);
++        s->hs_state = 0;
++        s->authorized = true;
++        qemu_flush_queued_packets(qemu_get_queue(s->nic));
++    }
++}
++
++/* -- Joining --------------------------------------------------------------- */
++
+ static void bcm_join_done(void *opaque)
+ {
+     BCM43341State *s = opaque;
++    const uint8_t *bssid;
+ 
+     if (!s->fw_running) {
+         return;
+     }
+-    if (!s->join_ok) {
++    if (s->join_ap < 0) {
+         bcm_send_event(s, WLC_E_SET_SSID, WLC_E_STATUS_NO_NETWORKS, 0, 0,
+                        NULL, NULL, 0);
+         return;
+     }
++    s->cur = s->join_ap;
++    bssid = s->aps[s->cur].bssid;
+     s->associated = true;
+     bcm_send_event(s, WLC_E_LINK, WLC_E_STATUS_SUCCESS, 0,
+-                   WLC_EVENT_MSG_LINK, s->bssid, NULL, 0);
++                   WLC_EVENT_MSG_LINK, bssid, NULL, 0);
+     bcm_send_event(s, WLC_E_SET_SSID, WLC_E_STATUS_SUCCESS, 0, 0,
+-                   s->bssid, NULL, 0);
+-    qemu_flush_queued_packets(qemu_get_queue(s->nic));
++                   bssid, NULL, 0);
++    if (s->aps[s->cur].psk) {
++        bcm_hs_start(s);
++    } else {
++        qemu_flush_queued_packets(qemu_get_queue(s->nic));
++    }
+ }
+ 
+ /* Both "join" and WLC_SET_SSID start with a wlc_ssid_t. */
+@@ -528,10 +879,17 @@ static void bcm_start_join(BCM43341State *s, const uint8_t *p, size_t len)
+     if (len < 4 + ssid_len) {
+         ssid_len = 0;
+     }
+-    s->join_ok = ssid_len == strlen(s->ssid) &&
+-                 !memcmp(p + 4, s->ssid, ssid_len);
++    s->join_ap = -1;
++    for (unsigned i = 0; i < s->num_aps; i++) {
++        if (ssid_len == strlen(s->aps[i].ssid) &&
++            !memcmp(p + 4, s->aps[i].ssid, ssid_len)) {
++            s->join_ap = i;
++            break;
++        }
++    }
+     BCM_TRACE(s, "join \"%.*s\" -> %s", (int)ssid_len, p + 4,
+-              s->join_ok ? "ok" : "no network");
++              s->join_ap >= 0 ? "ok" : "no network");
++    bcm_hs_reset(s);
+     s->associated = false;
+     timer_mod(s->join_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 50);
+ }
+@@ -539,10 +897,11 @@ static void bcm_start_join(BCM43341State *s, const uint8_t *p, size_t len)
+ static void bcm_disassoc(BCM43341State *s)
+ {
+     timer_del(s->join_timer);
++    bcm_hs_reset(s);
+     if (s->associated) {
+         s->associated = false;
+         bcm_send_event(s, WLC_E_LINK, WLC_E_STATUS_SUCCESS, 0, 0,
+-                       s->bssid, NULL, 0);
++                       s->aps[s->cur].bssid, NULL, 0);
+     }
+ }
+ 
+@@ -637,7 +996,7 @@ static int bcm_get_var(BCM43341State *s, const char *name,
+         bcm_get_chanspecs(s, vlen >= 2 ? lduw_le_p(val) : 0, out, olen);
+     } else if (!strcmp(name, "chanspec")) {
+         /* the channel the radio sits on, as WLC_GET_CHANNEL has it */
+-        put32(out, olen, WL_CHANSPEC_BW_20 | s->channel);
++        put32(out, olen, WL_CHANSPEC_BW_20 | bcm_channel(s));
+     } else if (!strcmp(name, "bw_cap")) {
+         /* per band, in WLC_BW_*_BIT; there is no 5 GHz band */
+         put32(out, olen, vlen >= 4 && ldl_le_p(val) == WLC_BAND_2G ?
+@@ -720,6 +1079,7 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+     case WLC_DOWN:
+         s->up = false;
+         s->associated = false;
++        bcm_hs_reset(s);
+         timer_del(s->join_timer);
+         timer_del(s->scan_timer);
+         break;
+@@ -764,14 +1124,14 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+             return BCME_NOTASSOCIATED;
+         }
+         if (olen >= 6) {
+-            memcpy(out, s->bssid, 6);
++            memcpy(out, s->aps[s->cur].bssid, 6);
+         }
+         break;
+     case WLC_GET_SSID:
+         if (s->associated && olen >= 36) {
+-            len = MIN(strlen(s->ssid), 32);
++            len = strlen(s->aps[s->cur].ssid);
+             stl_le_p(out, len);
+-            memcpy(out + 4, s->ssid, len);
++            memcpy(out + 4, s->aps[s->cur].ssid, len);
+         }
+         break;
+     case WLC_SET_SSID:
+@@ -779,8 +1139,8 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+         break;
+     case WLC_GET_CHANNEL:
+         if (olen >= 12) {                       /* channel_info_t */
+-            stl_le_p(out, s->channel);
+-            stl_le_p(out + 4, s->channel);
++            stl_le_p(out, bcm_channel(s));
++            stl_le_p(out + 4, bcm_channel(s));
+         }
+         break;
+     case WLC_GET_PHYTYPE:
+@@ -797,11 +1157,14 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+         break;
+     case WLC_SCAN_RESULTS:
+         /* wl_scan_results_t: buflen, version, count, bss_info */
+-        if (olen >= 12 + BCM_BSS_MAX) {
+-            len = bcm_build_bss(s, out + 12);
+-            stl_le_p(out, 12 + len);
++        if (olen >= 12 + s->num_aps * BCM_BSS_MAX) {
++            len = 12;
++            for (unsigned i = 0; i < s->num_aps; i++) {
++                len += bcm_build_bss(&s->aps[i], out + len);
++            }
++            stl_le_p(out, len);
+             stl_le_p(out + 4, WL_BSS_INFO_VERSION);
+-            stl_le_p(out + 8, 1);
++            stl_le_p(out + 8, s->num_aps);
+         }
+         break;
+     case WLC_DISASSOC:
+@@ -824,7 +1187,8 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+         put_country(s, out, olen);
+         break;
+     case WLC_GET_RSSI:
+-        put32(out, olen, (uint32_t)-40);        /* scb_val_t.val */
++        /* scb_val_t.val */
++        put32(out, olen, (int32_t)s->aps[s->associated ? s->cur : 0].rssi);
+         break;
+     case WLC_GET_BSS_INFO:
+         if (!s->associated) {
+@@ -832,7 +1196,7 @@ static int bcm_ioctl(BCM43341State *s, uint32_t cmd, bool set,
+         }
+         if (olen >= 4 + BCM_BSS_MAX) {
+             put32(out, olen, olen);
+-            bcm_build_bss(s, out + 4);
++            bcm_build_bss(&s->aps[s->cur], out + 4);
+         }
+         break;
+     case WLC_GET_BANDLIST:
+@@ -937,6 +1301,13 @@ static void bcm_host_data(BCM43341State *s, const uint8_t *p, size_t len)
+     if (len < off + 14 || !s->associated) {
+         return;
+     }
++    if (s->aps[s->cur].psk && lduw_be_p(p + off + 12) == ETHER_TYPE_EAPOL) {
++        bcm_eapol_rx(s, p + off + 14, len - off - 14);
++        return;
++    }
++    if (!bcm_port_open(s)) {
++        return;
++    }
+     qemu_send_packet(qemu_get_queue(s->nic), p + off, len - off);
+ }
+ 
+@@ -1063,6 +1434,7 @@ static void bcm_arm_stop(BCM43341State *s)
+     s->fw_running = false;
+     timer_del(s->scan_timer);
+     timer_del(s->join_timer);
++    bcm_hs_reset(s);
+     s->associated = false;
+     s->up = false;
+     while (!g_queue_is_empty(s->rxq)) {
+@@ -1376,7 +1748,7 @@ static bool bcm_net_can_receive(NetClientState *nc)
+ {
+     BCM43341State *s = qemu_get_nic_opaque(nc);
+ 
+-    return s->fw_running && s->associated &&
++    return s->fw_running && bcm_port_open(s) &&
+            g_queue_get_length(s->rxq) < BCM_RXQ_MAX;
+ }
+ 
+@@ -1385,7 +1757,7 @@ static ssize_t bcm_net_receive(NetClientState *nc, const uint8_t *buf,
+ {
+     BCM43341State *s = qemu_get_nic_opaque(nc);
+ 
+-    if (s->fw_running && s->associated && size >= 14 && size <= 1536) {
++    if (s->fw_running && bcm_port_open(s) && size >= 14 && size <= 1536) {
+         bcm_queue_bdc(s, SDPCM_DATA_CHANNEL, buf, size);
+     }
+     return size;
+@@ -1470,6 +1842,75 @@ static void bcm_system_reset(void *opaque)
+     bcm_chip_reset(opaque);
+ }
+ 
++/*
++ * The open AP from "ssid" and "channel" first, then "aps":
++ * "SSID:channel:rssi:passphrase;..." where an empty passphrase is an open
++ * network, "*" a WPA2 one that takes none, and anything else (8 to 63
++ * characters, may hold ':') a WPA2-PSK one. BSSIDs count up from the
++ * open AP's, which is locally administered and stable across boots.
++ */
++static bool bcm_add_ap(BCM43341State *s, const char *ssid, unsigned channel,
++                       int rssi, const char *pass, Error **errp)
++{
++    BCMAp *ap = &s->aps[s->num_aps];
++    size_t plen = pass ? strlen(pass) : 0;
++
++    if (s->num_aps == BCM_MAX_APS) {
++        error_setg(errp, "bcm43341: at most %d access points", BCM_MAX_APS);
++        return false;
++    }
++    if (!*ssid || strlen(ssid) > 32 || channel < 1 || channel > 13 ||
++        rssi < -100 || rssi > -20 ||
++        (plen && strcmp(pass, "*") && (plen < 8 || plen > 63))) {
++        error_setg(errp, "bcm43341: bad access point \"%s\" (an SSID of 1-32 "
++                   "bytes, channel 1-13, RSSI -100..-20, a passphrase of "
++                   "8-63 characters, empty or *)", ssid);
++        return false;
++    }
++    memset(ap, 0, sizeof(*ap));
++    pstrcpy(ap->ssid, sizeof(ap->ssid), ssid);
++    memcpy(ap->bssid, "\x02\x43\x34\x10\x00\x01", 6);
++    ap->bssid[5] += s->num_aps;
++    ap->channel = channel;
++    ap->rssi = rssi;
++    ap->psk = plen;
++    ap->reject = plen && !strcmp(pass, "*");
++    if (ap->psk && !ap->reject) {
++        bcm_psk_to_pmk(pass, ssid, ap->pmk);
++    }
++    s->num_aps++;
++    return true;
++}
++
++static bool bcm_parse_aps(BCM43341State *s, Error **errp)
++{
++    g_auto(GStrv) aps = g_strsplit(s->aps_prop ? s->aps_prop : "", ";", -1);
++
++    s->num_aps = 0;
++    if (!bcm_add_ap(s, s->ssid, s->channel, -40, NULL, errp)) {
++        return false;
++    }
++    for (char **a = aps; *a; a++) {
++        g_auto(GStrv) f = g_strsplit(*a, ":", 4);
++        int64_t ch, rssi;
++
++        if (!**a) {
++            continue;
++        }
++        if (g_strv_length(f) < 3 || qemu_strtoi64(f[1], NULL, 10, &ch) ||
++            qemu_strtoi64(f[2], NULL, 10, &rssi)) {
++            error_setg(errp, "bcm43341: aps entry \"%s\" is not "
++                       "SSID:channel:rssi[:passphrase]", *a);
++            return false;
++        }
++        if (!bcm_add_ap(s, f[0], MIN(ch, 255), MAX(MIN(rssi, 0), -128),
++                        f[3], errp)) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static void bcm43341_realize(DeviceState *dev, Error **errp)
+ {
+     BCM43341State *s = BCM43341(dev);
+@@ -1479,10 +1920,11 @@ static void bcm43341_realize(DeviceState *dev, Error **errp)
+     s->txbuf = g_byte_array_new();
+     s->scan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bcm_scan_done, s);
+     s->join_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bcm_join_done, s);
++    s->hs_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bcm_hs_timeout, s);
+     bcm_build_erom(s);
+-
+-    /* The AP's BSSID: locally administered, stable across boots. */
+-    memcpy(s->bssid, "\x02\x43\x34\x10\x00\x01", 6);
++    if (!bcm_parse_aps(s, errp)) {
++        return;
++    }
+     qemu_macaddr_default_if_unset(&s->conf.macaddr);
+     s->nic = qemu_new_nic(&bcm_net_info, &s->conf, TYPE_BCM43341, dev->id,
+                           &dev->mem_reentrancy_guard, s);
+@@ -1501,6 +1943,7 @@ static void bcm43341_realize(DeviceState *dev, Error **errp)
+ static const Property bcm43341_props[] = {
+     DEFINE_PROP_STRING("ssid", BCM43341State, ssid),
+     DEFINE_PROP_UINT8("channel", BCM43341State, channel, 6),
++    DEFINE_PROP_STRING("aps", BCM43341State, aps_prop),
+     DEFINE_PROP_BOOL("trace", BCM43341State, trace, false),
+     DEFINE_NIC_PROPERTIES(BCM43341State, conf),
+ };
+@@ -1510,6 +1953,7 @@ static void bcm43341_instance_init(Object *obj)
+     BCM43341State *s = BCM43341(obj);
+ 
+     s->ssid = g_strdup("QEMU");
++    s->aps_prop = g_strdup(BCM_DEFAULT_APS);
+ }
+ 
+ static void bcm43341_class_init(ObjectClass *oc, const void *data)
+-- 
+2.56.0
+

@@ -1,0 +1,21 @@
+From 3bf19ea5f4cbef69dd659cc4fa78738d970493b3 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 62/91] hw/watchdog: build the OMAP3 watchdog
+
+---
+ hw/watchdog/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/watchdog/meson.build b/hw/watchdog/meson.build
+index 1537056..7948f28 100644
+--- a/hw/watchdog/meson.build
++++ b/hw/watchdog/meson.build
+@@ -8,3 +8,4 @@ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('wdt_aspeed.c'))
+ system_ss.add(when: 'CONFIG_WDT_IMX2', if_true: files('wdt_imx2.c'))
+ system_ss.add(when: 'CONFIG_WDT_SBSA', if_true: files('sbsa_gwdt.c'))
+ specific_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr_watchdog.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_wdt.c'))
+-- 
+2.55.0
+

@@ -1,0 +1,24 @@
+From f9f4f1be7fc5a2b3ed70eeb7cfa0e7a1c1be4338 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 84/91] hw/net: build the WL1271
+
+---
+ hw/net/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/net/meson.build b/hw/net/meson.build
+index a8b280d..9d9cd4c 100644
+--- a/hw/net/meson.build
++++ b/hw/net/meson.build
+@@ -19,6 +19,7 @@ system_ss.add(when: 'CONFIG_VMXNET3_PCI', if_true: files('vmxnet3.c'))
+ 
+ system_ss.add(when: 'CONFIG_SMC91C111', if_true: files('smc91c111.c'))
+ system_ss.add(when: 'CONFIG_BCM43341', if_true: files('bcm43341.c'))
++system_ss.add(when: 'CONFIG_WL1271', if_true: files('wl1271.c'))
+ system_ss.add(when: 'CONFIG_LAN9118', if_true: files('lan9118.c'))
+ system_ss.add(when: 'CONFIG_LAN9118_PHY', if_true: files('lan9118_phy.c'))
+ system_ss.add(when: 'CONFIG_NE2000_ISA', if_true: files('ne2000-isa.c'))
+-- 
+2.55.0
+

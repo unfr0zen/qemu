@@ -1,0 +1,272 @@
+From 3125f88d3d007ebd7c5712d7007c5e0e2a68aacc Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 88/91] hw/arm: the j49 board companion: button and lines over
+ a chardev
+
+---
+ hw/arm/j49_board.c | 252 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 252 insertions(+)
+ create mode 100644 hw/arm/j49_board.c
+
+diff --git a/hw/arm/j49_board.c b/hw/arm/j49_board.c
+new file mode 100644
+index 0000000..86eb22c
+--- /dev/null
++++ b/hw/arm/j49_board.c
+@@ -0,0 +1,252 @@
++/*
++ * The board around the AM3703, as a chardev - Nest gen 2 (j49)
++ *
++ * The other end of the j49's front controls and of the lines its firmware
++ * drives, so something outside QEMU can press the button and watch the
++ * board, with nothing in the guest knowing it is being watched. It speaks
++ * the protocol of the flintstone's board device, which run.sh --ui's page
++ * already understands:
++ *
++ *   HU-BUTTON   (out of this device, into the TPS65921's PWRON) the
++ *               ring's click, twl4030_pwrbutton, KEY_POWER.
++ *   POWEROFF    (GPIO 161) the battery disconnect: Linux's power-off
++ *               raises it to cut the board's power.
++ *   WIFI-ENABLE (GPIO 103) the WL1271's enable.
++ *   BEEPER-EN   (GPIO 58) the piezo's enable (active low).
++ *   BEEPER      the piezo's drive, as its frequency in Hz.
++ *
++ * Lines out, one per change, stamped with guest time in microseconds
++ * (level in permille, 0 and 1000; Hz for BEEPER):
++ *
++ *   POWEROFF out 1000 1234567
++ *   HU-BUTTON in 1000 1234567
++ *
++ * Lines in:
++ *
++ *   set HU-BUTTON 1             press the button (0 = release)
++ *   hold HU-BUTTON 1 3000       press it for 3000 ms of guest time
++ *   dump                        report every line again
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "chardev/char-fe.h"
++#include "hw/arm/j49_board.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "system/runstate.h"
++
++static const char *const j49_board_in_names[J49_BOARD_IN] = {
++    "POWEROFF",
++    "WIFI-ENABLE",
++    "BEEPER-EN",
++};
++
++struct J49BoardState {
++    DeviceState parent_obj;
++
++    CharFrontend chr;
++    QEMUTimer *hold;            /* ends the pending "hold" */
++    int hold_level;
++    GString *cmd;
++
++    bool poweroff_exit;
++
++    qemu_irq button;            /* into the TPS65921's PWRON */
++    bool button_level;
++
++    bool lines[J49_BOARD_IN];
++    int beeper_hz;
++};
++
++static void board_emit(J49BoardState *s, const char *name, char dir, int level)
++{
++    int64_t t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    g_autofree char *line = g_strdup_printf("%s %s %d %" PRId64 "\n", name,
++                                            dir == 'i' ? "in" : "out", level,
++                                            t / SCALE_US);
++
++    qemu_chr_fe_write_all(&s->chr, (const uint8_t *)line, strlen(line));
++}
++
++static void board_set_button(J49BoardState *s, bool level)
++{
++    if (level == s->button_level) {
++        return;
++    }
++    s->button_level = level;
++    qemu_set_irq(s->button, level);
++    board_emit(s, "HU-BUTTON", 'i', level ? 1000 : 0);
++}
++
++static void board_set_line(J49BoardState *s, int line, bool level)
++{
++    if (level == s->lines[line]) {
++        return;
++    }
++    s->lines[line] = level;
++    board_emit(s, j49_board_in_names[line], 'o', level ? 1000 : 0);
++
++    if (line == J49_BOARD_IN_POWEROFF && level && s->poweroff_exit) {
++        /* The firmware believes it just cut the board's power. */
++        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++    }
++}
++
++static void board_hold_end(void *opaque)
++{
++    J49BoardState *s = opaque;
++
++    board_set_button(s, !s->hold_level);
++}
++
++static void board_command(J49BoardState *s, const char *line)
++{
++    g_auto(GStrv) argv = g_strsplit(line, " ", 0);
++    char *end;
++    int64_t ms;
++    int level;
++
++    if (!argv[0] || !*argv[0]) {
++        return;
++    }
++    if (!strcmp(argv[0], "dump")) {
++        board_emit(s, "HU-BUTTON", 'i', s->button_level ? 1000 : 0);
++        for (int i = 0; i < J49_BOARD_IN; i++) {
++            board_emit(s, j49_board_in_names[i], 'o', s->lines[i] ? 1000 : 0);
++        }
++        board_emit(s, "BEEPER", 'o', s->beeper_hz);
++        return;
++    }
++    if ((!strcmp(argv[0], "set") || !strcmp(argv[0], "hold")) &&
++        argv[1] && argv[2] && !strcmp(argv[1], "HU-BUTTON") &&
++        (!strcmp(argv[2], "0") || !strcmp(argv[2], "1"))) {
++        level = argv[2][0] == '1';
++        if (!strcmp(argv[0], "set") && !argv[3]) {
++            board_set_button(s, level);
++            return;
++        }
++        if (!strcmp(argv[0], "hold") && argv[3] && !argv[4] &&
++            (ms = g_ascii_strtoll(argv[3], &end, 10)) > 0 && !*end) {
++            if (timer_pending(s->hold)) {
++                timer_del(s->hold);
++                board_hold_end(s);
++            }
++            s->hold_level = level;
++            board_set_button(s, level);
++            timer_mod(s->hold, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                               ms * SCALE_MS);
++            return;
++        }
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "j49.board: bad command '%s'\n", line);
++}
++
++static int board_chr_can_read(void *opaque)
++{
++    return 256;
++}
++
++static void board_chr_read(void *opaque, const uint8_t *buf, int size)
++{
++    J49BoardState *s = opaque;
++
++    for (int i = 0; i < size; i++) {
++        if (buf[i] == '\n') {
++            board_command(s, s->cmd->str);
++            g_string_truncate(s->cmd, 0);
++        } else if (buf[i] != '\r') {
++            g_string_append_c(s->cmd, buf[i]);
++        }
++    }
++}
++
++static void board_chr_event(void *opaque, QEMUChrEvent event)
++{
++    J49BoardState *s = opaque;
++
++    if (event == CHR_EVENT_OPENED) {
++        g_string_truncate(s->cmd, 0);
++        board_command(s, "dump");
++    }
++}
++
++static void board_gpio_in(void *opaque, int line, int level)
++{
++    board_set_line(opaque, line, level != 0);
++}
++
++static void board_beeper(void *opaque, int n, int hz)
++{
++    J49BoardState *s = opaque;
++
++    if (hz != s->beeper_hz) {
++        s->beeper_hz = hz;
++        board_emit(s, "BEEPER", 'o', hz);
++    }
++}
++
++static void board_reset(DeviceState *dev)
++{
++    J49BoardState *s = J49_BOARD(dev);
++
++    if (s->hold) {
++        timer_del(s->hold);
++    }
++    memset(s->lines, 0, sizeof(s->lines));
++    s->button_level = false;
++    qemu_set_irq(s->button, 0);
++}
++
++static void board_realize(DeviceState *dev, Error **errp)
++{
++    J49BoardState *s = J49_BOARD(dev);
++
++    qdev_init_gpio_out(dev, &s->button, 1);
++    qdev_init_gpio_in(dev, board_gpio_in, J49_BOARD_IN);
++    qdev_init_gpio_in_named(dev, board_beeper, J49_BOARD_BEEPER, 1);
++
++    s->cmd = g_string_new(NULL);
++    s->hold = timer_new_ns(QEMU_CLOCK_VIRTUAL, board_hold_end, s);
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_set_handlers(&s->chr, board_chr_can_read, board_chr_read,
++                                 board_chr_event, NULL, s, NULL, true);
++    }
++}
++
++static const Property board_properties[] = {
++    DEFINE_PROP_CHR("chardev", J49BoardState, chr),
++    /* POWEROFF cuts the board's power; when the UI watches, QEMU exits. */
++    DEFINE_PROP_BOOL("poweroff-exit", J49BoardState, poweroff_exit, false),
++};
++
++static void board_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = board_realize;
++    device_class_set_legacy_reset(dc, board_reset);
++    device_class_set_props(dc, board_properties);
++    dc->desc = "Nest gen 2 board (button and power lines via chardev)";
++}
++
++static const TypeInfo board_info = {
++    .name = TYPE_J49_BOARD,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(J49BoardState),
++    .class_init = board_class_init,
++};
++
++static void board_register_types(void)
++{
++    type_register_static(&board_info);
++}
++
++type_init(board_register_types)
+-- 
+2.55.0
+

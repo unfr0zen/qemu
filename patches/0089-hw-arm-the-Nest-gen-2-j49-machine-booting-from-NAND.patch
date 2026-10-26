@@ -1,0 +1,352 @@
+From 074ec416722aaf387c1079dfdf8712dfa77e30e3 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 89/91] hw/arm: the Nest gen 2 ('j49') machine, booting from
+ NAND
+
+---
+ hw/arm/j49.c | 332 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 332 insertions(+)
+ create mode 100644 hw/arm/j49.c
+
+diff --git a/hw/arm/j49.c b/hw/arm/j49.c
+new file mode 100644
+index 0000000..d0b4b80
+--- /dev/null
++++ b/hw/arm/j49.c
+@@ -0,0 +1,332 @@
++/*
++ * Nest Learning Thermostat gen 2 ("j49", Display-2.x) machine
++ *
++ * An AM3703 (OMAP3630 family) with 64 MiB of mobile DDR, a 256 MiB Micron
++ * MT29F2G16 x16 NAND on GPMC chip select 0 and a TPS65921 on I2C1. The
++ * goal is to boot the unit's own firmware unmodified from its NAND: the
++ * GP-image x-loader, U-Boot 2012.10, the 2.6.37 kernel and its JFFS2 root.
++ *
++ * The NAND drive (-drive if=none,id=nand,format=raw,file=...) is the raw
++ * image: 2112-byte pages, data then OOB.
++ *
++ * Boot ROM: as the AM3703's ROM does for a GP device booting from NAND, the
++ * machine reads the image at block 0 - a little-endian size and load
++ * address, then the code - from the pages' data areas into SRAM, and starts
++ * the CPU in the ROM, which launches it.
++
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/arm/omap3630.h"
++#include "hw/arm/j49_board.h"
++#include "hw/arm/machines-qom.h"
++#include "hw/core/boards.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/core/cpu.h"
++#include "hw/core/split-irq.h"
++#include "hw/misc/em35x_ncp.h"
++#include "hw/misc/tps65921.h"
++#include "hw/net/wl1271.h"
++#include "hw/sd/sd.h"
++#include "net/net.h"
++#include "system/address-spaces.h"
++#include "system/block-backend.h"
++#include "system/blockdev.h"
++#include "system/reset.h"
++#include "system/system.h"
++#include "qemu/error-report.h"
++#include "qemu/timer.h"
++#include "qemu/units.h"
++#include "qapi/visitor.h"
++
++#define J49_RAM_SIZE        (64 * MiB)
++/* The battery reaches ADCIN0 through a divide-by-three (Nest's
++ * nlReadBatteryLevel: volts = 3 * mV / 1000). A charged cell. */
++#define J49_BATTERY_MV      3900
++
++/*
++ * The ring, as the page turns it: /machine/wheel-position counts detents
++ * (as on the flintstone; the page has 24 to the turn), and the ring has
++ * none of its own. The sensor reads the ring's inner edge at the coarse
++ * resolution adbs-a330 sets (OFN_RESOLUTION RES=1, nominally 250 cpi):
++ * about 2400 counts to the turn, so J49_RING_COUNTS a detent. Positive
++ * counts move nlclient's selection counterclockwise, so a clockwise turn
++ * (the position going up) feeds negative ones. The counts go in as a hand
++ * turns a ring, a few at each of the driver's 60 Hz reports, not all at
++ * once: nlclient integrates the stream, and takes one large report as a
++ * flick.
++ */
++#define J49_RING_COUNTS     100
++#define J49_RING_SLEW       34              /* counts per 1/60 s */
++
++struct J49Wheel {
++    int64_t position;
++    Object *ring;
++    int64_t owed;                   /* counts still to turn */
++    QEMUTimer *slew;
++};
++
++static void j49_wheel_slew(void *opaque)
++{
++    struct J49Wheel *w = opaque;
++    int64_t step = MAX(MIN(w->owed, J49_RING_SLEW), -J49_RING_SLEW);
++
++    if (!step) {
++        return;
++    }
++    object_property_set_int(w->ring, "motion", step, &error_abort);
++    w->owed -= step;
++    timer_mod(w->slew, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                       NANOSECONDS_PER_SECOND / 60);
++}
++
++static void j49_get_wheel(Object *obj, Visitor *v, const char *name,
++                          void *opaque, Error **errp)
++{
++    struct J49Wheel *w = opaque;
++
++    visit_type_int64(v, name, &w->position, errp);
++}
++
++static void j49_set_wheel(Object *obj, Visitor *v, const char *name,
++                          void *opaque, Error **errp)
++{
++    struct J49Wheel *w = opaque;
++    int64_t position;
++
++    if (!visit_type_int64(v, name, &position, errp)) {
++        return;
++    }
++    w->owed -= (position - w->position) * J49_RING_COUNTS;
++    w->position = position;
++    if (!timer_pending(w->slew)) {
++        j49_wheel_slew(w);
++    }
++}
++
++struct J49RomBoot {
++    Omap3630State *soc;
++    BlockBackend *blk;
++};
++
++/* Read `len` data bytes from the NAND's data areas, from data offset `off`. */
++static bool j49_nand_read_data(BlockBackend *blk, uint64_t off, uint8_t *buf,
++                               uint32_t len)
++{
++    while (len) {
++        uint64_t page = off / OMAP3_NAND_PAGE, col = off % OMAP3_NAND_PAGE;
++        uint32_t n = MIN(len, OMAP3_NAND_PAGE - col);
++
++        if (blk_pread(blk, page * OMAP3_NAND_PAGE_RAW + col, n, buf, 0) < 0) {
++            return false;
++        }
++        off += n;
++        buf += n;
++        len -= n;
++    }
++    return true;
++}
++
++static void j49_rom_boot(void *opaque)
++{
++    struct J49RomBoot *rom = opaque;
++    uint8_t hdr[8];
++    g_autofree uint8_t *image = NULL;
++    uint32_t size, load;
++
++    /* Nothing else resets the CPU (no arm_load_kernel): a watchdog or
++     * software reboot must not resume with the MMU and caches on. */
++    cpu_reset(first_cpu);
++
++    if (!j49_nand_read_data(rom->blk, 0, hdr, sizeof(hdr))) {
++        error_report("j49: boot ROM could not read the NAND");
++        exit(1);
++    }
++    size = ldl_le_p(hdr);
++    load = ldl_le_p(hdr + 4);
++    if (load < OMAP3630_SRAM_ADDR ||
++        size > OMAP3630_SRAM_ADDR + OMAP3630_SRAM_SIZE - load) {
++        error_report("j49: no GP boot image in NAND block 0 (size 0x%" PRIx32
++                     ", load 0x%" PRIx32 ")", size, load);
++        exit(1);
++    }
++    image = g_malloc(size);
++    if (!j49_nand_read_data(rom->blk, sizeof(hdr), image, size)) {
++        error_report("j49: boot ROM could not read the boot image");
++        exit(1);
++    }
++    cpu_physical_memory_write(load, image, size);
++    omap3630_rom_set_entry(rom->soc, load);
++    cpu_set_pc(first_cpu, OMAP3630_ROM_ADDR);
++}
++
++/*
++ * The wifi module on MMC2: a WL1271 behind an SDIO card. WLAN_EN is GPIO
++ * 103 (the "vmmc2" fixed regulator), which powers both and is reported to
++ * the board; WLAN_IRQ is GPIO 102, level high (board-diamond.c).
++ * -nic user,model=wl1271 is the network behind the access point.
++ */
++static void j49_init_wifi(Omap3630State *soc, DeviceState *board)
++{
++    DeviceState *card = qdev_new(TYPE_SDIO_CARD);
++    DeviceState *chip = qdev_new(TYPE_WL1271);
++    DeviceState *wlan_en = qdev_new(TYPE_SPLIT_IRQ);
++
++    qemu_configure_nic_device(chip, true, NULL);
++    qdev_realize_and_unref(chip, NULL, &error_fatal);
++
++    /* TI's IDs; the driver takes function 2. */
++    qdev_prop_set_uint8(card, "class", 0);
++    qdev_prop_set_uint16(card, "vendor-id", 0x0097);
++    qdev_prop_set_uint16(card, "device-id", 0x4076);
++    qdev_prop_set_uint16(card, "device-id-f2", 0x4076);
++    /* MMC2 runs at 1.8 V (vmmc2), which the WL1271 takes. */
++    qdev_prop_set_uint32(card, "ocr", 0x00ff8080);
++    object_property_set_link(OBJECT(card), "function-device", OBJECT(chip),
++                             &error_fatal);
++    qdev_realize_and_unref(card,
++                           qdev_get_child_bus(DEVICE(&soc->mmc[1].sdhci),
++                                              "sd-bus"),
++                           &error_fatal);
++
++    qdev_prop_set_uint32(wlan_en, "num-lines", 3);
++    qdev_realize_and_unref(wlan_en, NULL, &error_fatal);
++    qdev_connect_gpio_out(DEVICE(&soc->gpio[3]), 7,
++                          qdev_get_gpio_in(wlan_en, 0));
++    qdev_connect_gpio_out(wlan_en, 0,
++                          qdev_get_gpio_in(board, J49_BOARD_IN_WIFI_ENABLE));
++    qdev_connect_gpio_out(wlan_en, 1,
++                          qdev_get_gpio_in_named(card, "power", 0));
++    qdev_connect_gpio_out(wlan_en, 2,
++                          qdev_get_gpio_in_named(chip, "power", 0));
++
++    qdev_connect_gpio_out_named(chip, "irq", 0,
++                                qdev_get_gpio_in(DEVICE(&soc->gpio[3]), 6));
++}
++
++/*
++ * The EM357 radio (board-diamond.c j49_zigbee_device, spidev2.0): on McSPI2
++ * chip select 0, nRESET on GPIO 61 and nHOST_INT into GPIO 182. The j49
++ * wires no nWAKE. -global em35x-ncp.chardev=... attaches qemu/ui/em35x.py.
++ */
++static void j49_init_ncp(Omap3630State *soc)
++{
++    DeviceState *ncp = qdev_new(TYPE_EM35X_NCP);
++
++    qdev_realize_and_unref(ncp, qdev_get_child_bus(DEVICE(&soc->mcspi[1]),
++                                                   "spi"),
++                           &error_fatal);
++    qdev_connect_gpio_out(DEVICE(&soc->mcspi[1]), 0,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NSSEL, 0));
++    qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 29,
++                          qdev_get_gpio_in_named(ncp, EM35X_NCP_NRESET, 0));
++    qdev_connect_gpio_out_named(ncp, EM35X_NCP_NHOST_INT, 0,
++                                qdev_get_gpio_in(DEVICE(&soc->gpio[5]), 22));
++}
++
++static void j49_init(MachineState *machine)
++{
++    Omap3630State *soc;
++    BlockBackend *nand = blk_by_name("nand");
++    struct J49RomBoot *rom;
++    I2CSlave *pmic, *ring;
++    DeviceState *board;
++    struct J49Wheel *wheel;
++
++    if (machine->ram_size != J49_RAM_SIZE) {
++        error_report("j49: this board has %lu MiB of SDRAM",
++                     (unsigned long)(J49_RAM_SIZE / MiB));
++        exit(1);
++    }
++    if (!nand) {
++        error_report("j49: the board boots from its NAND: "
++                     "-drive if=none,id=nand,format=raw,file=NAND.raw");
++        exit(1);
++    }
++
++    soc = OMAP3630(object_new(TYPE_OMAP3630));
++    object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
++    qdev_prop_set_drive_err(DEVICE(&soc->gpmc), "drive", nand, &error_fatal);
++    for (int i = 0; i < OMAP3630_NUM_UART && i < 3; i++) {
++        qdev_prop_set_chr(DEVICE(&soc->uart[i]), "chardev", serial_hd(i));
++    }
++    qdev_realize(DEVICE(soc), NULL, &error_fatal);
++    object_unref(OBJECT(soc));
++
++    memory_region_add_subregion(get_system_memory(), OMAP3630_SDRAM_ADDR,
++                                machine->ram);
++
++    /* The TPS65921 on I2C1, its SYS_NIRQ into the MPU's sys_nirq. */
++    pmic = i2c_slave_new(TYPE_TPS65921, TPS65921_ADDR);
++    object_property_add_child(OBJECT(machine), "pmic", OBJECT(pmic));
++    i2c_slave_realize_and_unref(pmic, soc->i2c[0].bus, &error_fatal);
++    qdev_connect_gpio_out(DEVICE(pmic), 0,
++                          qdev_get_gpio_in(DEVICE(&soc->intc),
++                                           OMAP3630_IRQ_SYS_NIRQ));
++    object_property_set_uint(OBJECT(pmic), "adcin0-mv", J49_BATTERY_MV / 3,
++                             &error_fatal);
++
++    /* The panel backlight driver on I2C3 (board-diamond.c lm3530-backlight). */
++    i2c_slave_create_simple(soc->i2c[2].bus, "lm3530", 0x36);
++
++    /*
++     * The ring: an optical finger navigation sensor on I2C2 at 0x57, its
++     * MOTION_L into GPIO 108 (bank 4, line 12). /machine/ring.motion takes
++     * the turns.
++     */
++    ring = i2c_slave_new("adbs-a330", 0x57);
++    object_property_add_child(OBJECT(machine), "ring", OBJECT(ring));
++    i2c_slave_realize_and_unref(ring, soc->i2c[1].bus, &error_fatal);
++    qdev_connect_gpio_out(DEVICE(ring), 0,
++                          qdev_get_gpio_in(DEVICE(&soc->gpio[3]), 12));
++    wheel = g_new0(struct J49Wheel, 1);
++    wheel->ring = OBJECT(ring);
++    wheel->slew = timer_new_ns(QEMU_CLOCK_VIRTUAL, j49_wheel_slew, wheel);
++    object_property_add(OBJECT(machine), "wheel-position", "int",
++                        j49_get_wheel, j49_set_wheel, NULL, wheel);
++
++    /*
++     * The board around the SoC (j49.board, -global j49.board.chardev=...):
++     * its button is the ring's click on the TPS65921's PWRON; it watches
++     * the battery disconnect (GPIO 161), the WL1271 enable (GPIO 103) and
++     * the piezo enable (GPIO 58).
++     */
++    board = qdev_new(TYPE_J49_BOARD);
++    object_property_add_child(OBJECT(machine), "board", OBJECT(board));
++    qdev_realize_and_unref(board, NULL, &error_fatal);
++    qdev_connect_gpio_out(board, 0, qdev_get_gpio_in(DEVICE(pmic), 0));
++    qdev_connect_gpio_out(DEVICE(&soc->gpio[5]), 1,
++                          qdev_get_gpio_in(board, J49_BOARD_IN_POWEROFF));
++    qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 26,
++                          qdev_get_gpio_in(board, J49_BOARD_IN_BEEPER_ENABLE));
++    /* The piezo: pwm-beeper on GPTIMER11's PWM pin (omap-pwm timer 11). */
++    qdev_connect_gpio_out_named(DEVICE(&soc->gpt[10]), OMAP3_GPTIMER_PWM_HZ, 0,
++                                qdev_get_gpio_in_named(board, J49_BOARD_BEEPER,
++                                                       0));
++    j49_init_wifi(soc, board);
++    j49_init_ncp(soc);
++
++    rom = g_new0(struct J49RomBoot, 1);
++    rom->soc = soc;
++    rom->blk = nand;
++    qemu_register_reset(j49_rom_boot, rom);
++}
++
++static void j49_machine_class_init(MachineClass *mc)
++{
++    mc->desc = "Nest Learning Thermostat gen 2 (AM3703, 'j49')";
++    mc->init = j49_init;
++    mc->min_cpus = 1;
++    mc->max_cpus = 1;
++    mc->default_cpus = 1;
++    mc->default_ram_size = J49_RAM_SIZE;
++    mc->default_ram_id = "j49.ram";
++}
++
++DEFINE_MACHINE_ARM("j49", j49_machine_class_init)
+-- 
+2.55.0
+

@@ -1,0 +1,346 @@
+From 51159c0b5961fe5ee0d20d2b615983ed3023178f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 59/91] hw/gpio: OMAP3 GPIO bank
+
+---
+ hw/gpio/omap3_gpio.c | 327 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 327 insertions(+)
+ create mode 100644 hw/gpio/omap3_gpio.c
+
+diff --git a/hw/gpio/omap3_gpio.c b/hw/gpio/omap3_gpio.c
+new file mode 100644
+index 0000000..4dc4c54
+--- /dev/null
++++ b/hw/gpio/omap3_gpio.c
+@@ -0,0 +1,327 @@
++/*
++ * OMAP3 GPIO bank (32 lines)
++ *
++ * A pin configured as output (OE bit clear) drives DATAOUT on its output
++ * line and reads it back in DATAIN; an input reads the level driven onto
++ * its input line. Edge detection compares DATAIN before and after every
++ * change; level detection keeps the status set while the level holds.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/gpio/omap3_gpio.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define GPIO_REVISION           0x00
++#define GPIO_SYSCONFIG          0x10
++#define GPIO_SYSSTATUS          0x14
++#define GPIO_IRQSTATUS1         0x18
++#define GPIO_IRQENABLE1         0x1c
++#define GPIO_WAKEUPENABLE       0x20
++#define GPIO_IRQSTATUS2         0x28
++#define GPIO_IRQENABLE2         0x2c
++#define GPIO_CTRL               0x30
++#define GPIO_OE                 0x34
++#define GPIO_DATAIN             0x38
++#define GPIO_DATAOUT            0x3c
++#define GPIO_LEVELDETECT0       0x40
++#define GPIO_LEVELDETECT1       0x44
++#define GPIO_RISINGDETECT       0x48
++#define GPIO_FALLINGDETECT      0x4c
++#define GPIO_DEBOUNCENABLE      0x50
++#define GPIO_DEBOUNCINGTIME     0x54
++#define GPIO_CLEARIRQENABLE1    0x60
++#define GPIO_SETIRQENABLE1      0x64
++#define GPIO_CLEARIRQENABLE2    0x70
++#define GPIO_SETIRQENABLE2      0x74
++#define GPIO_CLEARWKUENA        0x80
++#define GPIO_SETWKUENA          0x84
++#define GPIO_CLEARDATAOUT       0x90
++#define GPIO_SETDATAOUT         0x94
++
++static uint32_t gpio_datain(Omap3GpioState *s)
++{
++    return (s->inputs & s->oe) | (s->dataout & ~s->oe);
++}
++
++static void gpio_update(Omap3GpioState *s)
++{
++    uint32_t in = gpio_datain(s);
++    uint32_t changed = in ^ s->datain_last;
++    uint32_t events = (changed & in & s->risingdetect) |
++                      (changed & ~in & s->fallingdetect) |
++                      (in & s->leveldetect1) | (~in & s->leveldetect0);
++
++    s->datain_last = in;
++    for (int i = 0; i < 2; i++) {
++        s->irqstatus[i] |= events & s->irqenable[i];
++        qemu_set_irq(s->irq[i], !!(s->irqstatus[i] & s->irqenable[i]));
++    }
++}
++
++static void gpio_drive_outputs(Omap3GpioState *s, uint32_t old_out, uint32_t old_oe)
++{
++    for (int i = 0; i < 32; i++) {
++        uint32_t bit = 1u << i;
++        bool was = !(old_oe & bit), is = !(s->oe & bit);
++
++        if (is && (!was || ((old_out ^ s->dataout) & bit))) {
++            qemu_set_irq(s->out[i], !!(s->dataout & bit));
++        }
++    }
++    gpio_update(s);
++}
++
++static void gpio_set_input(void *opaque, int line, int level)
++{
++    Omap3GpioState *s = opaque;
++
++    if (level) {
++        s->inputs |= 1u << line;
++    } else {
++        s->inputs &= ~(1u << line);
++    }
++    gpio_update(s);
++}
++
++static uint64_t gpio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3GpioState *s = opaque;
++
++    switch (addr) {
++    case GPIO_REVISION:
++        return 0x25;
++    case GPIO_SYSCONFIG:
++        return s->sysconfig;
++    case GPIO_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case GPIO_IRQSTATUS1:
++        return s->irqstatus[0];
++    case GPIO_IRQENABLE1:
++    case GPIO_SETIRQENABLE1:
++    case GPIO_CLEARIRQENABLE1:
++        return s->irqenable[0];
++    case GPIO_WAKEUPENABLE:
++    case GPIO_SETWKUENA:
++    case GPIO_CLEARWKUENA:
++        return s->wakeupenable;
++    case GPIO_IRQSTATUS2:
++        return s->irqstatus[1];
++    case GPIO_IRQENABLE2:
++    case GPIO_SETIRQENABLE2:
++    case GPIO_CLEARIRQENABLE2:
++        return s->irqenable[1];
++    case GPIO_CTRL:
++        return s->ctrl;
++    case GPIO_OE:
++        return s->oe;
++    case GPIO_DATAIN:
++        return gpio_datain(s);
++    case GPIO_DATAOUT:
++    case GPIO_SETDATAOUT:
++    case GPIO_CLEARDATAOUT:
++        return s->dataout;
++    case GPIO_LEVELDETECT0:
++        return s->leveldetect0;
++    case GPIO_LEVELDETECT1:
++        return s->leveldetect1;
++    case GPIO_RISINGDETECT:
++        return s->risingdetect;
++    case GPIO_FALLINGDETECT:
++        return s->fallingdetect;
++    case GPIO_DEBOUNCENABLE:
++        return s->debounceenable;
++    case GPIO_DEBOUNCINGTIME:
++        return s->debouncingtime;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-gpio: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void gpio_reset(DeviceState *dev)
++{
++    Omap3GpioState *s = OMAP3_GPIO(dev);
++
++    s->sysconfig = 0;
++    s->irqstatus[0] = s->irqstatus[1] = 0;
++    s->irqenable[0] = s->irqenable[1] = 0;
++    s->wakeupenable = 0;
++    s->ctrl = 2;
++    s->oe = ~0u;
++    s->dataout = 0;
++    s->leveldetect0 = 0;
++    s->leveldetect1 = 0;
++    s->risingdetect = 0;
++    s->fallingdetect = 0;
++    s->debounceenable = 0;
++    s->debouncingtime = 0;
++    s->datain_last = gpio_datain(s);
++    gpio_update(s);
++}
++
++static void gpio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3GpioState *s = opaque;
++    uint32_t old_out = s->dataout, old_oe = s->oe;
++
++    switch (addr) {
++    case GPIO_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            gpio_reset(DEVICE(s));
++            return;
++        }
++        s->sysconfig = val;
++        return;
++    case GPIO_IRQSTATUS1:
++        s->irqstatus[0] &= ~val;
++        break;
++    case GPIO_IRQENABLE1:
++        s->irqenable[0] = val;
++        break;
++    case GPIO_SETIRQENABLE1:
++        s->irqenable[0] |= val;
++        break;
++    case GPIO_CLEARIRQENABLE1:
++        s->irqenable[0] &= ~val;
++        break;
++    case GPIO_IRQSTATUS2:
++        s->irqstatus[1] &= ~val;
++        break;
++    case GPIO_IRQENABLE2:
++        s->irqenable[1] = val;
++        break;
++    case GPIO_SETIRQENABLE2:
++        s->irqenable[1] |= val;
++        break;
++    case GPIO_CLEARIRQENABLE2:
++        s->irqenable[1] &= ~val;
++        break;
++    case GPIO_WAKEUPENABLE:
++        s->wakeupenable = val;
++        return;
++    case GPIO_SETWKUENA:
++        s->wakeupenable |= val;
++        return;
++    case GPIO_CLEARWKUENA:
++        s->wakeupenable &= ~val;
++        return;
++    case GPIO_CTRL:
++        s->ctrl = val & 7;
++        return;
++    case GPIO_OE:
++        s->oe = val;
++        gpio_drive_outputs(s, old_out, old_oe);
++        return;
++    case GPIO_DATAOUT:
++        s->dataout = val;
++        gpio_drive_outputs(s, old_out, old_oe);
++        return;
++    case GPIO_SETDATAOUT:
++        s->dataout |= val;
++        gpio_drive_outputs(s, old_out, old_oe);
++        return;
++    case GPIO_CLEARDATAOUT:
++        s->dataout &= ~val;
++        gpio_drive_outputs(s, old_out, old_oe);
++        return;
++    case GPIO_LEVELDETECT0:
++        s->leveldetect0 = val;
++        break;
++    case GPIO_LEVELDETECT1:
++        s->leveldetect1 = val;
++        break;
++    case GPIO_RISINGDETECT:
++        s->risingdetect = val;
++        return;
++    case GPIO_FALLINGDETECT:
++        s->fallingdetect = val;
++        return;
++    case GPIO_DEBOUNCENABLE:
++        s->debounceenable = val;
++        return;
++    case GPIO_DEBOUNCINGTIME:
++        s->debouncingtime = val & 0xff;
++        return;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "omap3-gpio: bad write at 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    gpio_update(s);
++}
++
++static const MemoryRegionOps gpio_ops = {
++    .read = gpio_read,
++    .write = gpio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void gpio_init(Object *obj)
++{
++    Omap3GpioState *s = OMAP3_GPIO(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &gpio_ops, s, "omap3-gpio", 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq[0]);
++    sysbus_init_irq(sbd, &s->irq[1]);
++    qdev_init_gpio_in(DEVICE(obj), gpio_set_input, 32);
++    qdev_init_gpio_out(DEVICE(obj), s->out, 32);
++}
++
++static const VMStateDescription gpio_vmstate = {
++    .name = TYPE_OMAP3_GPIO,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(inputs, Omap3GpioState),
++        VMSTATE_UINT32(sysconfig, Omap3GpioState),
++        VMSTATE_UINT32_ARRAY(irqstatus, Omap3GpioState, 2),
++        VMSTATE_UINT32_ARRAY(irqenable, Omap3GpioState, 2),
++        VMSTATE_UINT32(wakeupenable, Omap3GpioState),
++        VMSTATE_UINT32(ctrl, Omap3GpioState),
++        VMSTATE_UINT32(oe, Omap3GpioState),
++        VMSTATE_UINT32(dataout, Omap3GpioState),
++        VMSTATE_UINT32(leveldetect0, Omap3GpioState),
++        VMSTATE_UINT32(leveldetect1, Omap3GpioState),
++        VMSTATE_UINT32(risingdetect, Omap3GpioState),
++        VMSTATE_UINT32(fallingdetect, Omap3GpioState),
++        VMSTATE_UINT32(debounceenable, Omap3GpioState),
++        VMSTATE_UINT32(debouncingtime, Omap3GpioState),
++        VMSTATE_UINT32(datain_last, Omap3GpioState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void gpio_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, gpio_reset);
++    dc->vmsd = &gpio_vmstate;
++    dc->desc = "OMAP3 GPIO bank";
++}
++
++static const TypeInfo gpio_info = {
++    .name = TYPE_OMAP3_GPIO,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3GpioState),
++    .instance_init = gpio_init,
++    .class_init = gpio_class_init,
++};
++
++static void gpio_register_types(void)
++{
++    type_register_static(&gpio_info);
++}
++
++type_init(gpio_register_types)
+-- 
+2.55.0
+

@@ -1,0 +1,49 @@
+From 4fc5979cc8e20a6f5573d07e079bb9a771c5480e Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 87/91] include/hw/arm: the j49 board companion's lines
+
+---
+ include/hw/arm/j49_board.h | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+ create mode 100644 include/hw/arm/j49_board.h
+
+diff --git a/include/hw/arm/j49_board.h b/include/hw/arm/j49_board.h
+new file mode 100644
+index 0000000..ec3d0a5
+--- /dev/null
++++ b/include/hw/arm/j49_board.h
+@@ -0,0 +1,30 @@
++/*
++ * The board around the AM3703, as a chardev - Nest gen 2 (j49)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_ARM_J49_BOARD_H
++#define HW_ARM_J49_BOARD_H
++
++#include "qom/object.h"
++
++#define TYPE_J49_BOARD "j49.board"
++
++typedef struct J49BoardState J49BoardState;
++DECLARE_INSTANCE_CHECKER(J49BoardState, J49_BOARD, TYPE_J49_BOARD)
++
++/* GPIO inputs: lines the firmware drives */
++enum {
++    J49_BOARD_IN_POWEROFF = 0,      /* GPIO 161, battery disconnect */
++    J49_BOARD_IN_WIFI_ENABLE,       /* GPIO 103, WL1271 enable */
++    J49_BOARD_IN_BEEPER_ENABLE,     /* GPIO 58, piezo enable (active low) */
++    J49_BOARD_IN
++};
++
++/* named GPIO input: the piezo's drive frequency in Hz */
++#define J49_BOARD_BEEPER "beeper"
++
++#endif /* HW_ARM_J49_BOARD_H */
+-- 
+2.55.0
+

@@ -1,0 +1,57 @@
+From 70d28eb03dd41162f87269df834ef67af70b2365 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 66/91] hw/sd: an SDIO card voltage window, and function 0
+ vendor space past the card's own
+
+---
+ hw/sd/sd.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index f43c3be..b3fe216 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -227,6 +227,7 @@ struct SDState {
+     uint16_t sdio_vendor;
+     uint16_t sdio_device;
+     bool sdio_powered;          /* the chip's power/reset line */
++    uint32_t sdio_ocr;          /* the voltage window CMD5 reports */
+ };
+ 
+ static void sd_realize(DeviceState *dev, Error **errp);
+@@ -3446,7 +3447,7 @@ static sd_rsp_type_t sdio_cmd_IO_SEND_OP_COND(SDState *sd, SDRequest req)
+      */
+     sd->ocr = (1 << 31)                     /* card ready */
+             | (SDIO_NUM_FUNCS << 28)        /* number of I/O functions */
+-            | 0x00ff8000;                   /* the usual 2.0-3.6 V window */
++            | (sd->sdio_ocr & 0x00ffff80);  /* the voltage window */
+     if (sd->state == sd_inactive_state) {
+         sd->state = sd_idle_state;
+     }
+@@ -3480,9 +3481,11 @@ static sd_rsp_type_t sdio_cmd_IO_RW_DIRECT(SDState *sd, SDRequest req)
+ 
+     /*
+      * CCCR 0xf0-0xff is vendor space (Broadcom keeps its card control and
+-     * the out-of-band interrupt setup there), so the chip model sees it.
++     * the out-of-band interrupt setup there), and so is function 0's space
++     * past the card's own (TI's WL1271 has its ELP control at 0x1fffc), so
++     * the chip model sees both.
+      */
+-    if (!fn && addr >= 0xf0 && addr < 0x100) {
++    if (!fn && ((addr >= 0xf0 && addr < 0x100) || addr >= sd->sdio_io_size)) {
+         fc = sdio_fn_class(sd);
+     }
+     if (fc && fc->rw) {
+@@ -3663,6 +3666,8 @@ static const Property sdio_card_props[] = {
+     DEFINE_PROP_UINT16("vendor-id", SDState, sdio_vendor, 0xc8a1),
+     DEFINE_PROP_UINT16("device-id", SDState, sdio_device, 0x0082),
+     DEFINE_PROP_UINT16("device-id-f2", SDState, sdio_device_f2, 0x0182),
++    /* The usual 2.0-3.6 V; bit 7 is 1.65-1.95 V. */
++    DEFINE_PROP_UINT32("ocr", SDState, sdio_ocr, 0x00ff8000),
+     DEFINE_PROP_LINK("function-device", SDState, sdio_fn_dev,
+                      TYPE_SDIO_FUNCTION, DeviceState *),
+ };
+-- 
+2.55.0
+

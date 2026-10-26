@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 17:30:00 -0500
+Subject: [PATCH 110/110] hw/timer: imx_gpt: count on the virtual clock, not
+ the ptimer
+
+The counter was read as the next timeout less the ptimer's remaining
+count. At a timeout the ptimer stops at zero until its callback runs,
+and while a device model holds the vCPU thread through a long operation
+(the Vivante model's software draws take tens of milliseconds) the
+callback waits, so the count stood still and the guest lost that time:
+with the UI drawing, the guest's clock ran at about two thirds of real
+time, and its animations and timeouts stretched with it.
+
+The count is now the ticks of the virtual clock since the counter was
+last zero, rebased when the frequency changes and held while the timer
+is disabled; the ptimer only times the next compare, as before. A
+restart-mode compare zeroes the count as of the compare, and a rollover
+is the count wrapping.
+---
+  hw/timer/imx_gpt.c         | 66 +++++++++++++++++++++++++++++++++++++---------
+  include/hw/timer/imx_gpt.h |  1 +
+  2 files changed, 55 insertions(+), 12 deletions(-)
+
+diff --git a/hw/timer/imx_gpt.c b/hw/timer/imx_gpt.c
+index 168cadc..6fb9e6e 100644
+--- a/hw/timer/imx_gpt.c
++++ b/hw/timer/imx_gpt.c
+@@ -18,6 +18,7 @@
+ #include "migration/vmstate.h"
+ #include "qemu/module.h"
+ #include "qemu/log.h"
++#include "qemu/timer.h"
+ #include "trace.h"
+ 
+ static const char *imx_gpt_reg_name(uint32_t reg)
+@@ -50,8 +51,8 @@ static const char *imx_gpt_reg_name(uint32_t reg)
+ 
+ static const VMStateDescription vmstate_imx_timer_gpt = {
+     .name = TYPE_IMX_GPT,
+-    .version_id = 3,
+-    .minimum_version_id = 3,
++    .version_id = 4,
++    .minimum_version_id = 4,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT32(cr, IMXGPTState),
+         VMSTATE_UINT32(pr, IMXGPTState),
+@@ -63,6 +64,7 @@ static const VMStateDescription vmstate_imx_timer_gpt = {
+         VMSTATE_UINT32(icr1, IMXGPTState),
+         VMSTATE_UINT32(icr2, IMXGPTState),
+         VMSTATE_UINT32(cnt, IMXGPTState),
++        VMSTATE_INT64(zero_ns, IMXGPTState),
+         VMSTATE_UINT32(next_timeout, IMXGPTState),
+         VMSTATE_UINT32(next_int, IMXGPTState),
+         VMSTATE_UINT32(freq, IMXGPTState),
+@@ -161,9 +163,36 @@ static void imx_gpt_update_int(IMXGPTState *s)
+     }
+ }
+ 
++/*
++ * The counter runs on the virtual clock from when it was last zero, the
++ * ptimer only timing the next compare: read from the ptimer alone the
++ * count stops at a timeout until its callback runs, and all the time
++ * QEMU stalls between (a device model holding the BQL through a long
++ * operation, as a software GPU does over a draw) was lost to the guest.
++ */
++static void imx_gpt_zero_count(IMXGPTState *s)
++{
++    s->cnt = 0;
++    s->zero_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++}
++
++/* Keeps the count where it is as the frequency changes or it resumes. */
++static void imx_gpt_rebase_count(IMXGPTState *s)
++{
++    if (s->freq) {
++        s->zero_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
++            muldiv64(s->cnt, NANOSECONDS_PER_SECOND, s->freq);
++    }
++}
++
+ static uint32_t imx_gpt_update_count(IMXGPTState *s)
+ {
+-    s->cnt = s->next_timeout - (uint32_t)ptimer_get_count(s->timer);
++    if (s->freq && (s->cr & GPT_CR_EN)) {
++        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++        s->cnt = (uint32_t)muldiv64(now - s->zero_ns, s->freq,
++                                    NANOSECONDS_PER_SECOND);
++    }
+ 
+     return s->cnt;
+ }
+@@ -195,17 +224,21 @@ static void imx_gpt_compute_next_timeout(IMXGPTState *s, bool event)
+ 
+     if (event) {
+         /*
+-         * This is an event (the ptimer reached 0 and stopped), and the
+-         * timer counter is now equal to s->next_timeout.
++         * This is an event (the ptimer reached 0 and stopped): the timer
++         * counter reached s->next_timeout, and may be past it by now.
+          */
+-        if (!(s->cr & GPT_CR_FRR) && (count == s->ocr1)) {
++        if (!(s->cr & GPT_CR_FRR) && (s->next_timeout == s->ocr1)) {
+             /* We are in restart mode and we crossed the compare channel 1
+-             * value. We need to reset the counter to 0.
++             * value. We need to reset the counter to 0, as of then.
+              */
+-            count = s->cnt = s->next_timeout = 0;
+-        } else if (count == GPT_TIMER_MAX) {
+-            /* We reached GPT_TIMER_MAX so we need to rollover */
+-            count = s->cnt = s->next_timeout = 0;
++            imx_gpt_zero_count(s);
++            s->zero_ns -= muldiv64(count - s->ocr1, NANOSECONDS_PER_SECOND,
++                                   s->freq);
++            count = imx_gpt_update_count(s);
++            s->next_timeout = 0;
++        } else if (s->next_timeout == GPT_TIMER_MAX) {
++            /* We reached GPT_TIMER_MAX: the count has rolled over. */
++            s->next_timeout = 0;
+         }
+     }
+ 
+@@ -349,6 +382,7 @@ static void imx_gpt_reset_common(IMXGPTState *s, bool is_soft_reset)
+     s->ocr3 = GPT_TIMER_MAX;
+     s->icr1 = 0;
+     s->icr2 = 0;
++    imx_gpt_zero_count(s);
+ 
+     s->next_timeout = GPT_TIMER_MAX;
+     s->next_int = 0;
+@@ -396,18 +430,23 @@ static void imx_gpt_write(void *opaque, hwaddr offset, uint64_t value,
+         } else {
+             /* set our freq, as the source might have changed */
+             ptimer_transaction_begin(s->timer);
++            if (oldreg & GPT_CR_EN) {
++                imx_gpt_update_count(s);
++            }
+             imx_gpt_set_freq(s);
++            imx_gpt_rebase_count(s);
+ 
+             if ((oldreg ^ s->cr) & GPT_CR_EN) {
+                 if (s->cr & GPT_CR_EN) {
+                     if (s->cr & GPT_CR_ENMOD) {
+                         s->next_timeout = GPT_TIMER_MAX;
++                        imx_gpt_zero_count(s);
+                         ptimer_set_count(s->timer, GPT_TIMER_MAX);
+                         imx_gpt_compute_next_timeout(s, false);
+                     }
+                     ptimer_run(s->timer, 1);
+                 } else {
+-                    /* stop timer */
++                    /* stop timer, the count held where it is */
+                     ptimer_stop(s->timer);
+                 }
+             }
+@@ -418,7 +457,9 @@ static void imx_gpt_write(void *opaque, hwaddr offset, uint64_t value,
+     case 1: /* Prescaler */
+         s->pr = value & 0xfff;
+         ptimer_transaction_begin(s->timer);
++        imx_gpt_update_count(s);
+         imx_gpt_set_freq(s);
++        imx_gpt_rebase_count(s);
+         ptimer_transaction_commit(s->timer);
+         break;
+ 
+@@ -444,6 +485,7 @@ static void imx_gpt_write(void *opaque, hwaddr offset, uint64_t value,
+         /* In non-freerun mode, reset count when this register is written */
+         if (!(s->cr & GPT_CR_FRR)) {
+             s->next_timeout = GPT_TIMER_MAX;
++            imx_gpt_zero_count(s);
+             ptimer_set_limit(s->timer, GPT_TIMER_MAX, 1);
+         }
+ 
+diff --git a/include/hw/timer/imx_gpt.h b/include/hw/timer/imx_gpt.h
+index 7f0d55b..672dc46 100644
+--- a/include/hw/timer/imx_gpt.h
++++ b/include/hw/timer/imx_gpt.h
+@@ -107,6 +107,7 @@ struct IMXGPTState {
+     uint32_t icr1;
+     uint32_t icr2;
+     uint32_t cnt;
++    int64_t zero_ns;
+ 
+     uint32_t next_timeout;
+     uint32_t next_int;
+-- 
+2.39.3
+

@@ -1,0 +1,475 @@
+From 50661b4ff083c7caadd3eaee85819b10fed90055 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 71/91] hw/dma: OMAP3 system DMA controller (SDMA)
+
+---
+ hw/dma/omap3_sdma.c | 456 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 456 insertions(+)
+ create mode 100644 hw/dma/omap3_sdma.c
+
+diff --git a/hw/dma/omap3_sdma.c b/hw/dma/omap3_sdma.c
+new file mode 100644
+index 0000000..05cf98c
+--- /dev/null
++++ b/hw/dma/omap3_sdma.c
+@@ -0,0 +1,456 @@
++/*
++ * OMAP3 system DMA controller (SDMA, "DMA4")
++ *
++ * 32 logical channels moving data through the system address space, so a
++ * peripheral's data register is a source or destination like memory. A
++ * channel with no synchronisation runs its whole block as soon as it is
++ * enabled; a synchronised one (CCR.SYNCHRO_CONTROL) moves an element, a
++ * frame (CCR.FS) or the block (CCR.BS) each time its DMA request is
++ * active, which the peripheral holds while it has data or room - the
++ * request lines are level inputs, numbered as Linux numbers them.
++ *
++ * Addressing: constant, post-increment, single index (CSEI) and double
++ * index (CSEI within a frame, CSFI between frames), for 8, 16 and 32-bit
++ * elements, or a constant fill. Channel status (CSR) and interrupt status
++ * (IRQSTATUS_Lj) clear by writing ones; each line j raises its interrupt
++ * for the channels its IRQENABLE_Lj selects. A finished channel can start
++ * the one its CLNK_CTRL links. Transfers are instantaneous, but a request
++ * is served from a bottom half rather than inside the access that raised
++ * it: the peripheral asserting it is mid-access, and the transfer goes
++ * through that same peripheral's registers.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/dma/omap3_sdma.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "system/address-spaces.h"
++
++#define SDMA_REVISION       0x00
++#define SDMA_IRQSTATUS(j)   (0x08 + 4 * (j))
++#define SDMA_IRQENABLE(j)   (0x18 + 4 * (j))
++#define SDMA_SYSSTATUS      0x28
++#define SDMA_OCP_SYSCONFIG  0x2c
++#define SDMA_CAPS_0         0x64
++#define SDMA_CAPS_2         0x6c
++#define SDMA_CAPS_3         0x70
++#define SDMA_CAPS_4         0x74
++#define SDMA_GCR            0x78
++#define SDMA_CH_BASE        0x80
++#define SDMA_CH_STRIDE      0x60
++
++enum {
++    CCR = 0x00, CLNK_CTRL = 0x04, CICR = 0x08, CSR = 0x0c, CSDP = 0x10,
++    CEN = 0x14, CFN = 0x18, CSSA = 0x1c, CDSA = 0x20, CSEI = 0x24,
++    CSFI = 0x28, CDEI = 0x2c, CDFI = 0x30, CSAC = 0x34, CDAC = 0x38,
++    CCEN = 0x3c, CCFN = 0x40, COLOR = 0x44,
++};
++
++#define CCR_SYNC(v)         (((v) & 0x1f) | (((v) >> 19) & 3) << 5)
++#define CCR_FS              (1 << 5)
++#define CCR_ENABLE          (1 << 7)
++#define CCR_SRC_AMODE(v)    (((v) >> 12) & 3)
++#define CCR_DST_AMODE(v)    (((v) >> 14) & 3)
++#define CCR_CONST_FILL      (1 << 16)
++#define CCR_BS              (1 << 18)
++
++#define CSR_HALF            (1 << 2)
++#define CSR_FRAME           (1 << 3)
++#define CSR_LAST            (1 << 4)
++#define CSR_BLOCK           (1 << 5)
++
++#define CLNK_ENABLE         (1 << 15)
++
++enum { AMODE_CONST, AMODE_POST_INC, AMODE_SINGLE_IDX, AMODE_DOUBLE_IDX };
++
++static void sdma_update_irq(Omap3SdmaState *s)
++{
++    for (int j = 0; j < OMAP3_SDMA_LINES; j++) {
++        qemu_set_irq(s->irq[j], !!(s->irqstatus[j] & s->irqenable[j]));
++    }
++}
++
++static void sdma_event(Omap3SdmaState *s, int n, uint32_t bits)
++{
++    Omap3SdmaChannel *ch = &s->ch[n];
++
++    ch->csr |= bits;
++    if (bits & ch->cicr) {
++        for (int j = 0; j < OMAP3_SDMA_LINES; j++) {
++            if (s->irqenable[j] & (1u << n)) {
++                s->irqstatus[j] |= 1u << n;
++            }
++        }
++        sdma_update_irq(s);
++    }
++}
++
++static uint32_t sdma_step(uint32_t addr, int amode, int es, bool last_in_frame,
++                          int16_t ei, int32_t fi)
++{
++    switch (amode) {
++    case AMODE_POST_INC:
++        return addr + es;
++    case AMODE_SINGLE_IDX:
++        return addr + es + ei - 1;
++    case AMODE_DOUBLE_IDX:
++        return addr + es + (last_in_frame ? fi : ei) - 1;
++    default:
++        return addr;
++    }
++}
++
++static void sdma_start(Omap3SdmaState *s, int n);
++
++/* Move one element; true when it ended the block. */
++static bool sdma_element(Omap3SdmaState *s, int n)
++{
++    Omap3SdmaChannel *ch = &s->ch[n];
++    int es = 1 << (ch->csdp & 3);
++    uint32_t cen = MAX(ch->cen & 0xffffff, 1), cfn = MAX(ch->cfn & 0xffff, 1);
++    bool last_in_frame = ch->elem + 1 >= cen;
++    uint8_t buf[4];
++
++    if (ch->ccr & CCR_CONST_FILL) {
++        stl_le_p(buf, ch->color);
++    } else {
++        address_space_read(&address_space_memory, ch->src,
++                           MEMTXATTRS_UNSPECIFIED, buf, es);
++    }
++    address_space_write(&address_space_memory, ch->dst, MEMTXATTRS_UNSPECIFIED,
++                        buf, es);
++    ch->csac = ch->src;
++    ch->cdac = ch->dst;
++    ch->src = sdma_step(ch->src, CCR_SRC_AMODE(ch->ccr), es, last_in_frame,
++                        ch->csei, ch->csfi);
++    ch->dst = sdma_step(ch->dst, CCR_DST_AMODE(ch->ccr), es, last_in_frame,
++                        ch->cdei, ch->cdfi);
++    ch->ccen = ++ch->elem;
++    if (ch->elem < cen) {
++        return false;
++    }
++
++    ch->elem = 0;
++    ch->ccfn = ++ch->frame;
++    if (ch->frame < cfn) {
++        sdma_event(s, n, CSR_FRAME | (ch->frame == cfn / 2 ? CSR_HALF : 0) |
++                         (ch->frame == cfn - 1 ? CSR_LAST : 0));
++        return false;
++    }
++    ch->ccr &= ~CCR_ENABLE;
++    sdma_event(s, n, CSR_FRAME | CSR_BLOCK);
++    if (ch->clnk_ctrl & CLNK_ENABLE) {
++        int next = ch->clnk_ctrl & 0x1f;
++
++        s->ch[next].ccr |= CCR_ENABLE;
++        sdma_start(s, next);
++    }
++    return true;
++}
++
++/* One synchronised unit: an element, a frame or the block. */
++static void sdma_unit(Omap3SdmaState *s, int n)
++{
++    Omap3SdmaChannel *ch = &s->ch[n];
++    bool frame_sync = ch->ccr & CCR_FS, block_sync = ch->ccr & CCR_BS;
++
++    do {
++        if (sdma_element(s, n)) {
++            return;
++        }
++    } while (block_sync || (frame_sync && ch->elem != 0));
++}
++
++/* Serve every enabled, requested channel until none can move. */
++static void sdma_run(Omap3SdmaState *s)
++{
++    bool moved;
++
++    if (s->busy) {
++        return;                         /* the outer loop will see it */
++    }
++    s->busy = true;
++    do {
++        moved = false;
++        for (int n = 0; n < OMAP3_SDMA_CHANNELS; n++) {
++            Omap3SdmaChannel *ch = &s->ch[n];
++            int sync = CCR_SYNC(ch->ccr);
++
++            if ((ch->ccr & CCR_ENABLE) && sync &&
++                sync < OMAP3_SDMA_REQUESTS && s->request[sync]) {
++                sdma_unit(s, n);
++                moved = true;
++            }
++        }
++    } while (moved);
++    s->busy = false;
++}
++
++static void sdma_start(Omap3SdmaState *s, int n)
++{
++    Omap3SdmaChannel *ch = &s->ch[n];
++
++    ch->src = ch->cssa;
++    ch->dst = ch->cdsa;
++    ch->elem = ch->frame = 0;
++    ch->ccen = ch->ccfn = 0;
++    if (!CCR_SYNC(ch->ccr)) {
++        /* software triggered: the whole block now */
++        while (!sdma_element(s, n)) {
++        }
++        return;
++    }
++    qemu_bh_schedule(s->bh);
++}
++
++static void sdma_bh(void *opaque)
++{
++    sdma_run(opaque);
++}
++
++static void sdma_request(void *opaque, int line, int level)
++{
++    Omap3SdmaState *s = opaque;
++
++    s->request[line] = level;
++    if (level) {
++        qemu_bh_schedule(s->bh);
++    }
++}
++
++static uint64_t sdma_ch_read(Omap3SdmaChannel *ch, hwaddr reg)
++{
++    switch (reg) {
++    case CCR:       return ch->ccr;
++    case CLNK_CTRL: return ch->clnk_ctrl;
++    case CICR:      return ch->cicr;
++    case CSR:       return ch->csr;
++    case CSDP:      return ch->csdp;
++    case CEN:       return ch->cen;
++    case CFN:       return ch->cfn;
++    case CSSA:      return ch->cssa;
++    case CDSA:      return ch->cdsa;
++    case CSEI:      return ch->csei;
++    case CSFI:      return ch->csfi;
++    case CDEI:      return ch->cdei;
++    case CDFI:      return ch->cdfi;
++    case CSAC:      return ch->csac;
++    case CDAC:      return ch->cdac;
++    case CCEN:      return ch->ccen;
++    case CCFN:      return ch->ccfn;
++    case COLOR:     return ch->color;
++    }
++    return 0;
++}
++
++static uint64_t sdma_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3SdmaState *s = opaque;
++
++    if (addr >= SDMA_CH_BASE &&
++        addr < SDMA_CH_BASE + SDMA_CH_STRIDE * OMAP3_SDMA_CHANNELS) {
++        int n = (addr - SDMA_CH_BASE) / SDMA_CH_STRIDE;
++
++        return sdma_ch_read(&s->ch[n], (addr - SDMA_CH_BASE) % SDMA_CH_STRIDE);
++    }
++    switch (addr) {
++    case SDMA_REVISION:
++        return 0x40;
++    case SDMA_IRQSTATUS(0) ... SDMA_IRQSTATUS(3):
++        return s->irqstatus[(addr - SDMA_IRQSTATUS(0)) / 4];
++    case SDMA_IRQENABLE(0) ... SDMA_IRQENABLE(3):
++        return s->irqenable[(addr - SDMA_IRQENABLE(0)) / 4];
++    case SDMA_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case SDMA_OCP_SYSCONFIG:
++        return s->ocp_sysconfig;
++    case SDMA_CAPS_0:
++        return 0x000c0000;              /* constant fill, transparent copy */
++    case SDMA_CAPS_2:
++        return 0x000001ff;
++    case SDMA_CAPS_3:
++        return 0x000000f3;
++    case SDMA_CAPS_4:
++        return 0x00003ffe;
++    case SDMA_GCR:
++        return s->gcr;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-sdma: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void sdma_reset(DeviceState *dev)
++{
++    Omap3SdmaState *s = OMAP3_SDMA(dev);
++
++    memset(s->irqstatus, 0, sizeof(s->irqstatus));
++    memset(s->irqenable, 0, sizeof(s->irqenable));
++    memset(s->ch, 0, sizeof(s->ch));
++    s->ocp_sysconfig = 0;
++    s->gcr = 0x00010010;
++    s->busy = false;
++    sdma_update_irq(s);
++}
++
++static void sdma_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3SdmaState *s = opaque;
++
++    if (addr >= SDMA_CH_BASE &&
++        addr < SDMA_CH_BASE + SDMA_CH_STRIDE * OMAP3_SDMA_CHANNELS) {
++        int n = (addr - SDMA_CH_BASE) / SDMA_CH_STRIDE;
++        Omap3SdmaChannel *ch = &s->ch[n];
++        bool was_enabled = ch->ccr & CCR_ENABLE;
++
++        switch ((addr - SDMA_CH_BASE) % SDMA_CH_STRIDE) {
++        case CCR:
++            ch->ccr = val & ~0x600;     /* RD/WR_ACTIVE are status */
++            if ((val & CCR_ENABLE) && !was_enabled) {
++                sdma_start(s, n);
++            }
++            return;
++        case CLNK_CTRL: ch->clnk_ctrl = val; return;
++        case CICR:      ch->cicr = val; return;
++        case CSR:       ch->csr &= ~val; return;
++        case CSDP:      ch->csdp = val; return;
++        case CEN:       ch->cen = val; return;
++        case CFN:       ch->cfn = val; return;
++        case CSSA:      ch->cssa = val; return;
++        case CDSA:      ch->cdsa = val; return;
++        case CSEI:      ch->csei = val; return;
++        case CSFI:      ch->csfi = val; return;
++        case CDEI:      ch->cdei = val; return;
++        case CDFI:      ch->cdfi = val; return;
++        case CSAC:      ch->csac = val; return;
++        case CDAC:      ch->cdac = val; return;
++        case COLOR:     ch->color = val; return;
++        }
++        return;
++    }
++    switch (addr) {
++    case SDMA_IRQSTATUS(0) ... SDMA_IRQSTATUS(3):
++        s->irqstatus[(addr - SDMA_IRQSTATUS(0)) / 4] &= ~val;
++        break;
++    case SDMA_IRQENABLE(0) ... SDMA_IRQENABLE(3):
++        s->irqenable[(addr - SDMA_IRQENABLE(0)) / 4] = val;
++        break;
++    case SDMA_OCP_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            sdma_reset(DEVICE(s));
++            return;
++        }
++        s->ocp_sysconfig = val;
++        return;
++    case SDMA_GCR:
++        s->gcr = val;
++        return;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "omap3-sdma: bad write at 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    sdma_update_irq(s);
++}
++
++static const MemoryRegionOps sdma_ops = {
++    .read = sdma_read,
++    .write = sdma_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 2,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static void sdma_init(Object *obj)
++{
++    Omap3SdmaState *s = OMAP3_SDMA(obj);
++
++    memory_region_init_io(&s->iomem, obj, &sdma_ops, s, "omap3-sdma", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    for (int j = 0; j < OMAP3_SDMA_LINES; j++) {
++        sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[j]);
++    }
++    qdev_init_gpio_in(DEVICE(obj), sdma_request, OMAP3_SDMA_REQUESTS);
++    s->bh = qemu_bh_new_guarded(sdma_bh, s,
++                                &DEVICE(obj)->mem_reentrancy_guard);
++}
++
++static const VMStateDescription sdma_channel_vmstate = {
++    .name = "omap3-sdma-channel",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(ccr, Omap3SdmaChannel),
++        VMSTATE_UINT32(clnk_ctrl, Omap3SdmaChannel),
++        VMSTATE_UINT32(cicr, Omap3SdmaChannel),
++        VMSTATE_UINT32(csr, Omap3SdmaChannel),
++        VMSTATE_UINT32(csdp, Omap3SdmaChannel),
++        VMSTATE_UINT32(cen, Omap3SdmaChannel),
++        VMSTATE_UINT32(cfn, Omap3SdmaChannel),
++        VMSTATE_UINT32(cssa, Omap3SdmaChannel),
++        VMSTATE_UINT32(cdsa, Omap3SdmaChannel),
++        VMSTATE_UINT32(csei, Omap3SdmaChannel),
++        VMSTATE_UINT32(csfi, Omap3SdmaChannel),
++        VMSTATE_UINT32(cdei, Omap3SdmaChannel),
++        VMSTATE_UINT32(cdfi, Omap3SdmaChannel),
++        VMSTATE_UINT32(csac, Omap3SdmaChannel),
++        VMSTATE_UINT32(cdac, Omap3SdmaChannel),
++        VMSTATE_UINT32(ccen, Omap3SdmaChannel),
++        VMSTATE_UINT32(ccfn, Omap3SdmaChannel),
++        VMSTATE_UINT32(color, Omap3SdmaChannel),
++        VMSTATE_UINT32(src, Omap3SdmaChannel),
++        VMSTATE_UINT32(dst, Omap3SdmaChannel),
++        VMSTATE_UINT32(elem, Omap3SdmaChannel),
++        VMSTATE_UINT32(frame, Omap3SdmaChannel),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static const VMStateDescription sdma_vmstate = {
++    .name = TYPE_OMAP3_SDMA,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(irqstatus, Omap3SdmaState, OMAP3_SDMA_LINES),
++        VMSTATE_UINT32_ARRAY(irqenable, Omap3SdmaState, OMAP3_SDMA_LINES),
++        VMSTATE_UINT32(ocp_sysconfig, Omap3SdmaState),
++        VMSTATE_UINT32(gcr, Omap3SdmaState),
++        VMSTATE_STRUCT_ARRAY(ch, Omap3SdmaState, OMAP3_SDMA_CHANNELS, 1,
++                             sdma_channel_vmstate, Omap3SdmaChannel),
++        VMSTATE_BOOL_ARRAY(request, Omap3SdmaState, OMAP3_SDMA_REQUESTS),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void sdma_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, sdma_reset);
++    dc->vmsd = &sdma_vmstate;
++    dc->desc = "OMAP3 system DMA controller";
++}
++
++static const TypeInfo sdma_info = {
++    .name = TYPE_OMAP3_SDMA,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3SdmaState),
++    .instance_init = sdma_init,
++    .class_init = sdma_class_init,
++};
++
++static void sdma_register_types(void)
++{
++    type_register_static(&sdma_info);
++}
++
++type_init(sdma_register_types)
+-- 
+2.55.0
+

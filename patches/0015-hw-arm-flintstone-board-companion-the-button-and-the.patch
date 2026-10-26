@@ -1,0 +1,460 @@
+From ee614d425f788530c1ac2590046ad501c83dca06 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:36:42 -0400
+Subject: [PATCH 15/20] =?UTF-8?q?hw/arm:=20flintstone=20board=20companion?=
+ =?UTF-8?q?=20=E2=80=94=20the=20button=20and=20the=20board=20lines=20over?=
+ =?UTF-8?q?=20a=20chardev?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The physical product around the SoC, as a chardev so something outside
+QEMU can press the button and watch what the firmware drives, with
+nothing in the guest knowing it is watched:
+
+  HU-BUTTON   out of this device, into GPIO2_IO18 — the gpio-keys "HU
+              Button" (active high, KEY_ENTER). set/hold/dump over the
+              chardev, hold timed in guest time so long presses survive
+              -icount.
+  POWEROFF    GPIO1_IO11 (gpio-poweroff), reported; with poweroff-exit=on
+              the rising line shuts QEMU down like the PMIC would.
+  WIFI-RESET  GPIO1_IO04, the Broadcom module's reset.
+  HALL-ENABLE GPIO7_IO02, the wheel's Hall power (also feeds the ADC's
+              gate line, through a split irq).
+  VBATT-EN    GPIO6_IO16, the battery divider's enable (likewise).
+
+Every change goes out as "NAME in|out 0|1000 <guest-us>" — the machine
+wires the banks in flintstone_init and exposes /machine/wheel-position
+so the UI reaches the wheel at a stable QOM path.
+---
+ hw/arm/flintstone.c               |  70 +++++++-
+ hw/arm/flintstone_board.c         | 260 ++++++++++++++++++++++++++++++
+ hw/arm/meson.build                |   3 +-
+ include/hw/arm/flintstone_board.h |  27 ++++
+ 4 files changed, 358 insertions(+), 2 deletions(-)
+ create mode 100644 hw/arm/flintstone_board.c
+ create mode 100644 include/hw/arm/flintstone_board.h
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 1069746..36d513d 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -18,19 +18,23 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
++#include "hw/adc/imx6_adc.h"
++#include "hw/arm/flintstone_board.h"
+ #include "hw/arm/fsl-imx6sx.h"
+ #include "hw/arm/machines-qom.h"
++#include "hw/core/irq.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/qdev-properties-system.h"
+ #include "hw/core/sysbus.h"
+ #include "hw/core/cpu.h"
++#include "hw/core/split-irq.h"
+ #include "system/address-spaces.h"
+ #include "system/block-backend-io.h"
+-#include "system/block-backend-io.h"
+ #include "system/blockdev.h"
+ #include "system/reset.h"
+ #include "system/system.h"
++#include "qom/object.h"
+ #include "qemu/error-report.h"
+ #include "qemu/units.h"
+ 
+@@ -75,6 +79,8 @@ static void flintstone_init(MachineState *machine)
+ {
+     DeviceState *soc;
+     DeviceState *gpmi;
++    DeviceState *board;
++    DeviceState *gpio6, *gpio7, *adc1, *adc2;
+     BlockBackend *nand;
+ 
+     if (machine->ram_size != FLINTSTONE_RAM_SIZE) {
+@@ -99,6 +105,68 @@ static void flintstone_init(MachineState *machine)
+ 
+     memory_region_add_subregion(get_system_memory(), FLINTSTONE_RAM_ADDR,
+                                 machine->ram);
++
++    /*
++     * The board around the SoC: the front button drives GPIO2_IO18 (the
++     * gpio-keys "HU Button"), and the firmware's own driven lines are
++     * reported back — poweroff on GPIO1_IO11, the wifi module reset on
++     * GPIO1_IO04, the wheel's Hall power on GPIO7_IO02 and the battery
++     * divider enable on GPIO6_IO16. The chardev is attached with
++     * -global flintstone.board.chardev=... (run.sh --ui); without it the
++     * board is just there, unobserved.
++     */
++    board = qdev_new(TYPE_FLINTSTONE_BOARD);
++    qdev_realize_and_unref(board, NULL, &error_fatal);
++
++    gpio6 = DEVICE(object_resolve_path_component(OBJECT(soc), "gpio6"));
++    gpio7 = DEVICE(object_resolve_path_component(OBJECT(soc), "gpio7"));
++    adc1 = DEVICE(object_resolve_path_component(OBJECT(soc), "adc1"));
++    adc2 = DEVICE(object_resolve_path_component(OBJECT(soc), "adc2"));
++
++    /*
++     * GPIO7_IO02 (the wheel's hall-enable) and GPIO6_IO16 (the battery
++     * divider enable) each feed two listeners: the matching ADC's gate
++     * line, and the board report over the chardev.
++     */
++    DeviceState *hall_split = qdev_new(TYPE_SPLIT_IRQ);
++    DeviceState *vbatt_split = qdev_new(TYPE_SPLIT_IRQ);
++    DeviceState *gpio1;
++
++    qdev_prop_set_uint32(hall_split, "num-lines", 2);
++    qdev_prop_set_uint32(vbatt_split, "num-lines", 2);
++    qdev_realize_and_unref(hall_split, NULL, &error_fatal);
++    qdev_realize_and_unref(vbatt_split, NULL, &error_fatal);
++
++    gpio1 = DEVICE(object_resolve_path_component(OBJECT(soc), "gpio1"));
++
++    qdev_connect_gpio_out(board, 0,
++                          qdev_get_gpio_in(DEVICE(object_resolve_path_component(
++                              OBJECT(soc), "gpio2")), 18));
++    qdev_connect_gpio_out(gpio1, 11,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_POWEROFF));
++    qdev_connect_gpio_out(gpio1, 4,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_WIFI_RESET));
++    qdev_connect_gpio_out(gpio7, 2, qdev_get_gpio_in(hall_split, 0));
++    qdev_connect_gpio_out(hall_split, 0, qdev_get_gpio_in(adc1, 0));
++    qdev_connect_gpio_out(hall_split, 1,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_HALL_ENABLE));
++    qdev_connect_gpio_out(gpio6, 16, qdev_get_gpio_in(vbatt_split, 0));
++    qdev_connect_gpio_out(vbatt_split, 0, qdev_get_gpio_in(adc2, 0));
++    qdev_connect_gpio_out(vbatt_split, 1,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_VBATT_ENABLE));
++
++    /*
++     * The wheel, as the UI turns it: /machine/wheel-position counts
++     * detents. The property lives on the machine so its QOM path is
++     * stable; the storage is the adc's own, sampled per conversion.
++     */
++    object_property_add_uint64_ptr(OBJECT(machine), "wheel-position",
++                                   &IMX6_ADC(adc1)->wheel_position,
++                                   OBJ_PROP_FLAG_READWRITE);
+ }
+ 
+ static void flintstone_machine_class_init(MachineClass *mc)
+diff --git a/hw/arm/flintstone_board.c b/hw/arm/flintstone_board.c
+new file mode 100644
+index 0000000..25a2e9d
+--- /dev/null
++++ b/hw/arm/flintstone_board.c
+@@ -0,0 +1,260 @@
++/*
++ * The board around the i.MX6SX, as a chardev — Nest Display-3.4.
++ *
++ * Every physical control on this product is wired to a GPIO bank, and the
++ * stock firmware knows them only through those banks (gpio-keys, device
++ * tree exporters, gpio-poweroff). This device is the other end of those
++ * wires — a chardev so something outside QEMU can press the button and
++ * watch what the firmware drives, with nothing in the guest knowing it is
++ * being watched:
++ *
++ *   HU-BUTTON   (out of this device, into GPIO2_IO18) the front button,
++ *               gpio-keys "HU Button", active high, KEY_ENTER.
++ *   POWEROFF    (GPIO1_IO11) gpio-poweroff: the firmware raises it to cut
++ *               the board's power.
++ *   WIFI-RESET  (GPIO1_IO04) the Broadcom wifi module's reset line.
++ *   HALL-ENABLE (GPIO7_IO02) the wheel's Hall sensor power (active low).
++ *   VBATT-EN    (GPIO6_IO16) the battery divider's ADC input enable.
++ *
++ * Lines out, one per change, stamped with guest time in microseconds
++ * (level in permille, 0 and 1000 — the lines are plain GPIO):
++ *
++ *   POWEROFF out 1000 1234567   firmware is powering the board off
++ *   HU-BUTTON in 1000 1234567   the button level the SoC sees
++ *
++ * Lines in:
++ *
++ *   set HU-BUTTON 1             press the button (0 = release)
++ *   hold HU-BUTTON 1 3000       press it for exactly 3000 ms of guest
++ *                               time, then release
++ *   dump                        report every line again
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "chardev/char-fe.h"
++#include "hw/arm/flintstone_board.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/core/sysbus.h"
++#include "qemu/error-report.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "system/runstate.h"
++
++static const char *const flintstone_board_in_names[FLINTSTONE_BOARD_IN] = {
++    "POWEROFF",
++    "WIFI-RESET",
++    "HALL-ENABLE",
++    "VBATT-EN",
++};
++
++struct FlintstoneBoardState {
++    DeviceState parent_obj;
++
++    CharFrontend chr;
++    QEMUTimer *hold;            /* ends the pending "hold" */
++    int hold_level;
++    GString *cmd;
++
++    bool poweroff_exit;
++
++    qemu_irq button;            /* into GPIO2_IO18 */
++    bool button_level;
++
++    bool lines[FLINTSTONE_BOARD_IN];
++};
++
++static void board_send_line(FlintstoneBoardState *s, const char *line)
++{
++    qemu_chr_fe_write_all(&s->chr, (const uint8_t *)line, strlen(line));
++}
++
++static void board_emit(FlintstoneBoardState *s, const char *name,
++                       char dir, int level)
++{
++    int64_t t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    g_autofree char *line = g_strdup_printf("%s %c %d %" PRId64 "\n",
++                                            name, dir, level, t / SCALE_US);
++    board_send_line(s, line);
++}
++
++static void board_set_button(FlintstoneBoardState *s, bool level)
++{
++    if (level == s->button_level) {
++        return;
++    }
++    s->button_level = level;
++    qemu_set_irq(s->button, level);
++    board_emit(s, "HU-BUTTON", 'i', level ? 1000 : 0);
++}
++
++static void board_set_line(FlintstoneBoardState *s, int line, bool level)
++{
++    assert(line >= 0 && line < FLINTSTONE_BOARD_IN);
++
++    if (level == s->lines[line]) {
++        return;
++    }
++    s->lines[line] = level;
++    board_emit(s, flintstone_board_in_names[line], 'o', level ? 1000 : 0);
++
++    if (line == FLINTSTONE_BOARD_IN_POWEROFF && level && s->poweroff_exit) {
++        /* The firmware believes it just cut the board's power. */
++        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++    }
++}
++
++static void flintstone_board_hold_end(void *opaque)
++{
++    FlintstoneBoardState *s = opaque;
++
++    board_set_button(s, !s->hold_level);
++}
++
++static void board_command(FlintstoneBoardState *s, const char *line)
++{
++    g_auto(GStrv) argv = g_strsplit(line, " ", 0);
++    char *end;
++    int64_t ms;
++    int level;
++
++    if (!argv[0] || !*argv[0]) {
++        return;
++    }
++    if (!strcmp(argv[0], "dump")) {
++        /* A new listener starts from the whole picture. */
++        board_emit(s, "HU-BUTTON", 'i', s->button_level ? 1000 : 0);
++        for (int i = 0; i < FLINTSTONE_BOARD_IN; i++) {
++            board_emit(s, flintstone_board_in_names[i], 'o',
++                       s->lines[i] ? 1000 : 0);
++        }
++        return;
++    }
++    if ((!strcmp(argv[0], "set") || !strcmp(argv[0], "hold")) &&
++        argv[1] && argv[2] && !strcmp(argv[1], "HU-BUTTON") &&
++        (!strcmp(argv[2], "0") || !strcmp(argv[2], "1"))) {
++        level = argv[2][0] == '1';
++        if (!strcmp(argv[0], "set") && !argv[3]) {
++            board_set_button(s, level);
++            return;
++        }
++        if (!strcmp(argv[0], "hold") && argv[3] && !argv[4] &&
++            (ms = g_ascii_strtoll(argv[3], &end, 10)) > 0 && !*end) {
++            /* One hold at a time: a new one first lets the last go. */
++            if (timer_pending(s->hold)) {
++                timer_del(s->hold);
++                flintstone_board_hold_end(s);
++            }
++            s->hold_level = level;
++            board_set_button(s, level);
++            timer_mod(s->hold, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                               ms * SCALE_MS);
++            return;
++        }
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "flintstone.board: bad command '%s'\n",
++                  line);
++}
++
++static int board_chr_can_read(void *opaque)
++{
++    return 256;
++}
++
++static void board_chr_read(void *opaque, const uint8_t *buf, int size)
++{
++    FlintstoneBoardState *s = opaque;
++
++    for (int i = 0; i < size; i++) {
++        if (buf[i] == '\n') {
++            board_command(s, s->cmd->str);
++            g_string_truncate(s->cmd, 0);
++        } else if (buf[i] != '\r') {
++            g_string_append_c(s->cmd, buf[i]);
++        }
++    }
++}
++
++static void board_chr_event(void *opaque, QEMUChrEvent event)
++{
++    FlintstoneBoardState *s = opaque;
++
++    if (event == CHR_EVENT_OPENED) {
++        g_string_truncate(s->cmd, 0);
++        board_command(s, "dump");
++    }
++}
++
++static void flintstone_board_gpio_in(void *opaque, int line, int level)
++{
++    FlintstoneBoardState *s = opaque;
++
++    board_set_line(s, line, level != 0);
++}
++
++static void flintstone_board_reset(DeviceState *dev)
++{
++    FlintstoneBoardState *s = FLINTSTONE_BOARD(dev);
++
++    if (s->hold) {
++        timer_del(s->hold);
++    }
++    memset(s->lines, 0, sizeof(s->lines));
++    /* The button rests unpressed: active high, idle low. */
++    s->button_level = false;
++    qemu_set_irq(s->button, 0);
++}
++
++static void flintstone_board_realize(DeviceState *dev, Error **errp)
++{
++    FlintstoneBoardState *s = FLINTSTONE_BOARD(dev);
++
++    qdev_init_gpio_out(dev, &s->button, 1);
++    qdev_init_gpio_in(dev, flintstone_board_gpio_in, FLINTSTONE_BOARD_IN);
++
++    s->cmd = g_string_new(NULL);
++    s->hold = timer_new_ns(QEMU_CLOCK_VIRTUAL, flintstone_board_hold_end, s);
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_set_handlers(&s->chr, board_chr_can_read, board_chr_read,
++                                 board_chr_event, NULL, s, NULL, true);
++    }
++}
++
++static const Property flintstone_board_properties[] = {
++    DEFINE_PROP_CHR("chardev", FlintstoneBoardState, chr),
++    /*
++     * The firmware raises POWEROFF to cut the board's power; when the UI
++     * is watching, QEMU follows it and exits.
++     */
++    DEFINE_PROP_BOOL("poweroff-exit", FlintstoneBoardState, poweroff_exit,
++                     false),
++};
++
++static void flintstone_board_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = flintstone_board_realize;
++    device_class_set_legacy_reset(dc, flintstone_board_reset);
++    device_class_set_props(dc, flintstone_board_properties);
++    dc->desc = "Nest Display-3.4 board (button and power lines via chardev)";
++}
++
++static const TypeInfo flintstone_board_info = {
++    .name = TYPE_FLINTSTONE_BOARD,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(FlintstoneBoardState),
++    .class_init = flintstone_board_class_init,
++};
++
++static void flintstone_board_register_types(void)
++{
++    type_register_static(&flintstone_board_info);
++}
++
++type_init(flintstone_board_register_types)
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index f3c4b12..36bcf92 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -40,7 +40,8 @@ arm_common_ss.add(when: 'CONFIG_FSL_IMX25', if_true: files('fsl-imx25.c', 'imx25
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX31', if_true: files('fsl-imx31.c', 'kzm.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6', if_true: files('fsl-imx6.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6SX', if_true: files('fsl-imx6sx.c'))
+-arm_common_ss.add(when: 'CONFIG_FLINTSTONE', if_true: files('flintstone.c'))
++arm_common_ss.add(when: 'CONFIG_FLINTSTONE', if_true: files('flintstone.c',
++                                                            'flintstone_board.c'))
+ arm_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files(
+   'aspeed.c',
+   'aspeed_soc_common.c',
+diff --git a/include/hw/arm/flintstone_board.h b/include/hw/arm/flintstone_board.h
+new file mode 100644
+index 0000000..0824c79
+--- /dev/null
++++ b/include/hw/arm/flintstone_board.h
+@@ -0,0 +1,27 @@
++/*
++ * Nest Display-3.4 board companion — the button, the power lines and the
++ * module enables as a chardev, see flintstone_board.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_ARM_FLINTSTONE_BOARD_H
++#define HW_ARM_FLINTSTONE_BOARD_H
++
++#include "qom/object.h"
++
++#define TYPE_FLINTSTONE_BOARD "flintstone.board"
++
++typedef struct FlintstoneBoardState FlintstoneBoardState;
++DECLARE_INSTANCE_CHECKER(FlintstoneBoardState, FLINTSTONE_BOARD,
++                         TYPE_FLINTSTONE_BOARD)
++
++/* Lines the board (not the SoC) drives, reported over the chardev. */
++enum {
++    FLINTSTONE_BOARD_IN_POWEROFF = 0,   /* GPIO1_IO11, gpio-poweroff */
++    FLINTSTONE_BOARD_IN_WIFI_RESET,     /* GPIO1_IO04, brcm wifi reset */
++    FLINTSTONE_BOARD_IN_HALL_ENABLE,    /* GPIO7_IO02, wheel hall power */
++    FLINTSTONE_BOARD_IN_VBATT_ENABLE,   /* GPIO6_IO16, battery divider */
++    FLINTSTONE_BOARD_IN
++};
++
++#endif /* HW_ARM_FLINTSTONE_BOARD_H */
+-- 
+2.55.0
+

@@ -1,0 +1,57 @@
+From 1b46b71f7563f13089ec180d476abf0842e8fa34 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 37/91] include/hw/intc: OMAP3 interrupt controller state
+
+---
+ include/hw/intc/omap3_intc.h | 38 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+ create mode 100644 include/hw/intc/omap3_intc.h
+
+diff --git a/include/hw/intc/omap3_intc.h b/include/hw/intc/omap3_intc.h
+new file mode 100644
+index 0000000..8cf6eff
+--- /dev/null
++++ b/include/hw/intc/omap3_intc.h
+@@ -0,0 +1,38 @@
++/*
++ * OMAP3 MPU subsystem interrupt controller (INTCPS)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_INTC_OMAP3_INTC_H
++#define HW_INTC_OMAP3_INTC_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_INTC "omap3-intc"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3IntcState, OMAP3_INTC)
++
++#define OMAP3_INTC_NUM_IRQS 96
++#define OMAP3_INTC_BANKS    (OMAP3_INTC_NUM_IRQS / 32)
++
++struct Omap3IntcState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    qemu_irq fiq;
++
++    uint32_t level[OMAP3_INTC_BANKS];   /* input lines */
++    uint32_t swi[OMAP3_INTC_BANKS];     /* ISR_SET software interrupts */
++    uint32_t mir[OMAP3_INTC_BANKS];     /* mask: 1 = masked */
++    uint32_t ilr[OMAP3_INTC_NUM_IRQS];  /* priority << 2 | FIQnIRQ */
++    uint32_t sysconfig;
++    uint32_t idle;
++    uint32_t threshold;
++    uint32_t protection;
++};
++
++#endif
+-- 
+2.55.0
+

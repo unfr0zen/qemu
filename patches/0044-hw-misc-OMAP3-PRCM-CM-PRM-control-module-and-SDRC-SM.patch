@@ -1,0 +1,635 @@
+From 0d8bdf2607602b80482f08247e5e46f13fab907f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 44/91] hw/misc: OMAP3 PRCM (CM, PRM), control module and
+ SDRC/SMS
+
+---
+ hw/misc/omap3_prcm.c | 615 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 615 insertions(+)
+ create mode 100644 hw/misc/omap3_prcm.c
+
+diff --git a/hw/misc/omap3_prcm.c b/hw/misc/omap3_prcm.c
+new file mode 100644
+index 0000000..610d216
+--- /dev/null
++++ b/hw/misc/omap3_prcm.c
+@@ -0,0 +1,615 @@
++/*
++ * OMAP3 power, reset and clock management (CM and PRM), the system
++ * control module (SCM, with the TAP identification block) and the SDRAM
++ * controller with its memory scheduler (SDRC, SMS)
++ *
++ * These are register files: clocks are not modelled, only what software
++ * waits on or reads back. A DPLL reports lock when its enable field asks
++ * for lock mode; every module reports itself functional; every power
++ * domain is on and never in transition; the SDRC's DLLs are locked. The
++ * PRM resets the system on RST_DPLL3/RST_GS, and the CM drives each GP
++ * timer's clock-source selection.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/omap3_prcm.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "system/runstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++/* CM: one block per domain */
++#define CM_IVA2         0x0000
++#define CM_MPU          0x0900
++#define CM_CORE         0x0a00
++#define CM_WKUP         0x0c00
++#define CM_CKGEN        0x0d00
++#define CM_PER          0x1000
++
++#define CM_IDLEST1      0x20
++#define CM_IDLEST2      0x24
++#define CM_IDLEST3      0x28
++#define CM_CLKSEL       0x40
++#define CM_CLKSTST      0x4c
++
++#define CM_CLKEN_PLL_IVA2       (CM_IVA2 + 0x04)
++#define CM_IDLEST_PLL_IVA2      (CM_IVA2 + 0x24)
++#define CM_CLKEN_PLL_MPU        (CM_MPU + 0x04)
++#define CM_IDLEST_PLL_MPU       (CM_MPU + 0x24)
++#define CM_CLKEN_PLL            (CM_CKGEN + 0x00)
++#define CM_CLKEN2_PLL           (CM_CKGEN + 0x04)
++#define CM_IDLEST_CKGEN         (CM_CKGEN + 0x20)
++#define CM_IDLEST2_CKGEN        (CM_CKGEN + 0x24)
++#define CM_CLKSEL_CORE          (CM_CORE + CM_CLKSEL)
++#define CM_CLKSEL_WKUP          (CM_WKUP + CM_CLKSEL)
++#define CM_CLKSEL_PER           (CM_PER + CM_CLKSEL)
++
++#define DPLL_LOCKED(en)         (((en) & 7) == 7)
++
++static uint32_t cm_gpt_clksel(Omap3CmState *s, int gpt)
++{
++    switch (gpt) {
++    case 0:
++        return s->regs[CM_CLKSEL_WKUP / 4] & 1;
++    case 1 ... 8:
++        return (s->regs[CM_CLKSEL_PER / 4] >> (gpt - 1)) & 1;
++    case 9 ... 10:
++        return (s->regs[CM_CLKSEL_CORE / 4] >> (gpt - 3)) & 1;
++    default:
++        return 0;               /* GPTIMER12: the 32 kHz secure clock */
++    }
++}
++
++static void cm_update_gpt(Omap3CmState *s)
++{
++    for (int i = 0; i < OMAP3_NUM_GPT; i++) {
++        qemu_set_irq(s->gpt_clksel[i], cm_gpt_clksel(s, i));
++    }
++}
++
++/*
++ * In CORE, WKUP and PER a module's IDLEST bit sits at the position of its
++ * FCLKEN/ICLKEN bits: it reads idle (1) once both its clocks are gated
++ * (the kernel's SRAM code idles the SDRC that way), functional (0)
++ * otherwise. Other domains' IDLEST bits mean idle/standby of the domain's
++ * single module: always functional.
++ */
++static uint32_t cm_idlest(Omap3CmState *s, hwaddr addr)
++{
++    hwaddr dom = addr & ~0xff;
++    int n = ((addr & 0xff) - CM_IDLEST1) / 4;   /* IDLEST1..3 */
++    static const uint8_t fclken[] = { 0x00, 0x04, 0x08 };
++    static const uint8_t iclken[] = { 0x10, 0x14, 0x18 };
++
++    if (dom != CM_CORE && dom != CM_WKUP && dom != CM_PER) {
++        return 0;
++    }
++    return ~(s->regs[(dom + fclken[n]) / 4] | s->regs[(dom + iclken[n]) / 4]);
++}
++
++static uint64_t cm_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3CmState *s = opaque;
++    uint32_t en;
++
++    switch (addr) {
++    case CM_IDLEST_PLL_IVA2:
++        return DPLL_LOCKED(s->regs[CM_CLKEN_PLL_IVA2 / 4]);
++    case CM_IDLEST_PLL_MPU:
++        return DPLL_LOCKED(s->regs[CM_CLKEN_PLL_MPU / 4]);
++    case CM_IDLEST_CKGEN:
++        en = s->regs[CM_CLKEN_PLL / 4];
++        /* ST_CORE_CLK: DPLL3; ST_PERIPH_CLK and the clocks it makes: DPLL4 */
++        return DPLL_LOCKED(en) | (DPLL_LOCKED(en >> 16) ? 0x3f3e : 0);
++    case CM_IDLEST2_CKGEN:
++        return DPLL_LOCKED(s->regs[CM_CLKEN2_PLL / 4]) ? 0x3 : 0;
++    }
++    switch (addr & 0xff) {
++    case CM_IDLEST1:
++    case CM_IDLEST2:
++    case CM_IDLEST3:
++        return cm_idlest(s, addr);
++    case CM_CLKSTST:
++        return 1;               /* clock active */
++    }
++    return s->regs[addr / 4];
++}
++
++static void cm_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3CmState *s = opaque;
++
++    s->regs[addr / 4] = val;
++    switch (addr) {
++    case CM_CLKSEL_CORE:
++    case CM_CLKSEL_WKUP:
++    case CM_CLKSEL_PER:
++        cm_update_gpt(s);
++        break;
++    }
++}
++
++static const MemoryRegionOps cm_ops = {
++    .read = cm_read,
++    .write = cm_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void cm_reset(DeviceState *dev)
++{
++    Omap3CmState *s = OMAP3_CM(dev);
++
++    /* The TRM's reset values (OMAP3630 where they differ from 3430):
++     * every clock-select field must name a valid parent, or Linux's clock
++     * framework finds none. The boot software locks the DPLLs. */
++    static const struct {
++        uint16_t reg;
++        uint32_t val;
++    } reset[] = {
++        { CM_CLKEN_PLL_IVA2,    0x00000011 },
++        { CM_IVA2 + 0x40,       0x00080000 },   /* CM_CLKSEL1_PLL_IVA2 */
++        { CM_IVA2 + 0x44,       0x00000001 },   /* CM_CLKSEL2_PLL_IVA2 */
++        { 0x0800,               0x00000010 },   /* CM_REVISION */
++        { 0x0810,               0x00000001 },   /* CM_SYSCONFIG */
++        { CM_CLKEN_PLL_MPU,     0x00000015 },
++        { CM_MPU + 0x40,        0x00080000 },   /* CM_CLKSEL1_PLL_MPU */
++        { CM_MPU + 0x44,        0x00000001 },   /* CM_CLKSEL2_PLL_MPU */
++        { CM_CORE + 0x10,       0x00000042 },   /* CM_ICLKEN1_CORE */
++        { CM_CLKSEL_CORE,       0x00001105 },
++        { CM_CLKSEL_WKUP,       0x00000012 },
++        { CM_CLKEN_PLL,         0x00110015 },
++        { CM_CLKEN2_PLL,        0x00000011 },
++        { CM_CKGEN + 0x40,      0x08000040 },   /* CM_CLKSEL1_PLL */
++        { CM_CKGEN + 0x44,      0x02400000 },   /* CM_CLKSEL2_PLL */
++        { CM_CKGEN + 0x48,      0x00000001 },   /* CM_CLKSEL3_PLL */
++        { CM_CKGEN + 0x50,      0x00000001 },   /* CM_CLKSEL5_PLL */
++        { CM_CKGEN + 0x70,      0x00000003 },   /* CM_CLKOUT_CTRL */
++        { 0x0e40,               0x00000410 },   /* CM_CLKSEL_DSS */
++        { 0x0f40,               0x00000004 },   /* CM_CLKSEL_CAM */
++        { 0x1140,               0x10100a50 },   /* CM_CLKSEL1_EMU */
++        { 0x1148,               0x00000002 },   /* CM_CLKSTCTRL_EMU */
++    };
++
++    memset(s->regs, 0, sizeof(s->regs));
++    for (int i = 0; i < ARRAY_SIZE(reset); i++) {
++        s->regs[reset[i].reg / 4] = reset[i].val;
++    }
++    cm_update_gpt(s);
++}
++
++static void cm_init(Object *obj)
++{
++    Omap3CmState *s = OMAP3_CM(obj);
++
++    memory_region_init_io(&s->iomem, obj, &cm_ops, s, "omap3-cm", OMAP3_CM_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    qdev_init_gpio_out_named(DEVICE(obj), s->gpt_clksel, OMAP3_CM_GPT_CLKSEL,
++                             OMAP3_NUM_GPT);
++}
++
++static const VMStateDescription cm_vmstate = {
++    .name = TYPE_OMAP3_CM,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, Omap3CmState, OMAP3_CM_SIZE / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void cm_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, cm_reset);
++    dc->vmsd = &cm_vmstate;
++    dc->desc = "OMAP3 clock manager";
++}
++
++/* PRM */
++#define PRM_REVISION            0x0804
++#define PRM_IRQSTATUS_MPU       0x0818
++#define PRM_CLKSEL              0x0d40
++#define PRM_VC_BYPASS_VAL       0x123c
++#define PRM_RSTCTRL             0x1250
++#define PRM_RSTST               0x1258
++#define PRM_CLKSRC_CTRL         0x1270
++#define PRM_VP1_CONFIG          0x12b0
++#define PRM_VP1_STATUS          0x12c4
++#define PRM_VP2_CONFIG          0x12d0
++#define PRM_VP2_STATUS          0x12e4
++#define VP_CONFIG_FORCEUPDATE   (1 << 2)
++#define IRQ_VP1_TRANXDONE       (1 << 15)
++#define IRQ_VP2_TRANXDONE       (1 << 21)
++
++#define PM_PWSTST               0xe4
++#define PM_PREPWSTST            0xe8
++#define RM_RSTST                0x58
++
++#define PRM_CLKSEL_19M2         2
++#define VC_BYPASS_VALID         (1 << 24)
++#define RSTCTRL_RST_DPLL3       (1 << 2)
++#define RSTCTRL_RST_GS          (1 << 1)
++
++static uint64_t prm_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3PrmState *s = opaque;
++
++    switch (addr) {
++    case PRM_REVISION:
++        return 0x10;
++    case PRM_VP1_STATUS:
++    case PRM_VP2_STATUS:
++        return 1;               /* VPINIDLE */
++    }
++    if (addr < 0x1200 || addr >= 0x1300) {
++        switch (addr & 0xff) {
++        case PM_PWSTST:
++        case PM_PREPWSTST:
++            return 0x7;         /* ON, logic retained, not in transition */
++        }
++    }
++    return s->regs[addr / 4];
++}
++
++static void prm_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3PrmState *s = opaque;
++
++    switch (addr) {
++    case PRM_IRQSTATUS_MPU:
++    case PRM_RSTST:
++        s->regs[addr / 4] &= ~val;
++        return;
++    case PRM_VC_BYPASS_VAL:
++        s->regs[addr / 4] = val & ~VC_BYPASS_VALID;   /* sent at once */
++        return;
++    case PRM_VP1_CONFIG:
++    case PRM_VP2_CONFIG:
++        /* a forced update completes at once */
++        s->regs[addr / 4] = val;
++        if (val & VP_CONFIG_FORCEUPDATE) {
++            s->regs[PRM_IRQSTATUS_MPU / 4] |=
++                addr == PRM_VP1_CONFIG ? IRQ_VP1_TRANXDONE : IRQ_VP2_TRANXDONE;
++        }
++        return;
++    case PRM_RSTCTRL:
++        if (val & (RSTCTRL_RST_DPLL3 | RSTCTRL_RST_GS)) {
++            qemu_log_mask(CPU_LOG_RESET, "omap3-prm: software reset\n");
++            s->regs[PRM_RSTST / 4] = val & RSTCTRL_RST_GS ? 0x2 : 0x4;
++            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++        }
++        return;
++    }
++    if ((addr < 0x1200 || addr >= 0x1300) && (addr & 0xff) == RM_RSTST) {
++        s->regs[addr / 4] &= ~val;
++        return;
++    }
++    s->regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps prm_ops = {
++    .read = prm_read,
++    .write = prm_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void prm_reset(DeviceState *dev)
++{
++    Omap3PrmState *s = OMAP3_PRM(dev);
++    uint32_t rstst = s->regs[PRM_RSTST / 4];
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->regs[PRM_CLKSEL / 4] = PRM_CLKSEL_19M2;
++    s->regs[PRM_CLKSRC_CTRL / 4] = 0x40;          /* SYSCLKDIV: /1 */
++    /* A software reset keeps its cause; power-on is a cold reset. */
++    s->regs[PRM_RSTST / 4] = rstst ? rstst : 0x1;
++}
++
++static void prm_init(Object *obj)
++{
++    Omap3PrmState *s = OMAP3_PRM(obj);
++
++    memory_region_init_io(&s->iomem, obj, &prm_ops, s, "omap3-prm",
++                          OMAP3_PRM_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static const VMStateDescription prm_vmstate = {
++    .name = TYPE_OMAP3_PRM,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, Omap3PrmState, OMAP3_PRM_SIZE / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void prm_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, prm_reset);
++    dc->vmsd = &prm_vmstate;
++    dc->desc = "OMAP3 power and reset manager";
++}
++
++/* SCM and the TAP identification registers */
++#define CONTROL_PADCONF_OFF     0x270
++#define CONTROL_GENERAL_PURPOSE_STATUS 0x2f4
++#define CONTROL_STATUS          0x2f0
++#define CONTROL_OMAP_STATUS     0x44c
++
++#define TAP_IDCODE              0x204
++#define TAP_PRODUCTION_ID       0x208
++#define TAP_DIE_ID              0x218
++
++#define CONTROL_STATUS_GP       (3 << 8)
++#define START_PADCONF_SAVE      (1 << 1)
++#define PADCONF_SAVE_DONE       (1 << 0)
++
++static uint64_t scm_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3ScmState *s = opaque;
++    uint32_t word;
++
++    switch (addr & ~3) {
++    case CONTROL_STATUS:
++        word = CONTROL_STATUS_GP | s->sys_boot;
++        break;
++    case CONTROL_OMAP_STATUS:
++        word = s->omap_status;
++        break;
++    default:
++        word = s->regs[addr / 4];
++    }
++    return extract32(word, (addr & 3) * 8, size * 8);
++}
++
++static void scm_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3ScmState *s = opaque;
++
++    s->regs[addr / 4] = deposit32(s->regs[addr / 4], (addr & 3) * 8, size * 8,
++                                  val);
++    /*
++     * The pad configuration save (before the core domain goes off)
++     * completes at once: the kernel polls for it.
++     */
++    if ((addr & ~3) == CONTROL_PADCONF_OFF &&
++        (s->regs[CONTROL_PADCONF_OFF / 4] & START_PADCONF_SAVE)) {
++        s->regs[CONTROL_GENERAL_PURPOSE_STATUS / 4] |= PADCONF_SAVE_DONE;
++    }
++}
++
++static const MemoryRegionOps scm_ops = {
++    .read = scm_read,
++    .write = scm_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static uint64_t tap_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3ScmState *s = opaque;
++
++    switch (addr) {
++    case TAP_IDCODE:
++        return s->idcode;
++    case TAP_PRODUCTION_ID:
++        return 0x000000f0;
++    case TAP_DIE_ID ... TAP_DIE_ID + 0xc:
++        return s->die_id[(addr - TAP_DIE_ID) / 4];
++    }
++    return 0;
++}
++
++static void tap_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-tap: write to read-only 0x%" HWADDR_PRIx
++                  "\n", addr);
++}
++
++static const MemoryRegionOps tap_ops = {
++    .read = tap_read,
++    .write = tap_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void scm_reset(DeviceState *dev)
++{
++    Omap3ScmState *s = OMAP3_SCM(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++}
++
++static void scm_init(Object *obj)
++{
++    Omap3ScmState *s = OMAP3_SCM(obj);
++
++    memory_region_init_io(&s->iomem, obj, &scm_ops, s, "omap3-scm", 0x1000);
++    memory_region_init_io(&s->tap, obj, &tap_ops, s, "omap3-tap", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->tap);
++}
++
++static const Property scm_properties[] = {
++    /* OMAP3630 ES1.2 (hawkeye 0xb891), the AM3703's die */
++    DEFINE_PROP_UINT32("idcode", Omap3ScmState, idcode, 0x2b89102f),
++    /* AM3703: no SGX, no IVA, 256 KiB L2, ISP and NEON */
++    DEFINE_PROP_UINT32("omap-status", Omap3ScmState, omap_status, 0x5c00),
++    DEFINE_PROP_UINT32("sys-boot", Omap3ScmState, sys_boot, 0x2f),
++    DEFINE_PROP_UINT32("die-id0", Omap3ScmState, die_id[0], 0),
++    DEFINE_PROP_UINT32("die-id1", Omap3ScmState, die_id[1], 0),
++    DEFINE_PROP_UINT32("die-id2", Omap3ScmState, die_id[2], 0),
++    DEFINE_PROP_UINT32("die-id3", Omap3ScmState, die_id[3], 0),
++};
++
++static const VMStateDescription scm_vmstate = {
++    .name = TYPE_OMAP3_SCM,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, Omap3ScmState, 0x1000 / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void scm_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, scm_reset);
++    device_class_set_props(dc, scm_properties);
++    dc->vmsd = &scm_vmstate;
++    dc->desc = "OMAP3 system control module";
++}
++
++/* SDRC and SMS */
++#define SDRC_SYSSTATUS          0x14
++#define SDRC_DLLA_CTRL          0x60
++#define SDRC_DLLA_STATUS        0x64
++#define SDRC_DLLB_CTRL          0x68
++#define SDRC_DLLB_STATUS        0x6c
++#define SDRC_DLL_LOCKED         (1 << 2)
++#define SDRC_DLL_IDLE           (1 << 2)
++#define SMS_SYSSTATUS           0x14
++
++static uint64_t sdrc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3SdrcState *s = opaque;
++
++    switch (addr) {
++    case 0x00:
++        return 0x40;            /* REVISION */
++    case SDRC_SYSSTATUS:
++        return 1;               /* RESETDONE */
++    case SDRC_DLLA_STATUS:
++    case SDRC_DLLB_STATUS:
++        /* locked unless its control register idles it */
++        return s->sdrc_regs[(addr - 4) / 4] & SDRC_DLL_IDLE ? 0 : SDRC_DLL_LOCKED;
++    }
++    return s->sdrc_regs[addr / 4];
++}
++
++static void sdrc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3SdrcState *s = opaque;
++
++    s->sdrc_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps sdrc_ops = {
++    .read = sdrc_read,
++    .write = sdrc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static uint64_t sms_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3SdrcState *s = opaque;
++
++    if (addr == SMS_SYSSTATUS) {
++        return 1;
++    }
++    return s->sms_regs[addr / 4];
++}
++
++static void sms_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3SdrcState *s = opaque;
++
++    s->sms_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps sms_ops = {
++    .read = sms_read,
++    .write = sms_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void sdrc_reset(DeviceState *dev)
++{
++    Omap3SdrcState *s = OMAP3_SDRC(dev);
++
++    memset(s->sdrc_regs, 0, sizeof(s->sdrc_regs));
++    memset(s->sms_regs, 0, sizeof(s->sms_regs));
++}
++
++static void sdrc_init(Object *obj)
++{
++    Omap3SdrcState *s = OMAP3_SDRC(obj);
++
++    memory_region_init_io(&s->sdrc, obj, &sdrc_ops, s, "omap3-sdrc", 0x400);
++    memory_region_init_io(&s->sms, obj, &sms_ops, s, "omap3-sms", 0x400);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->sdrc);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->sms);
++}
++
++static const VMStateDescription sdrc_vmstate = {
++    .name = TYPE_OMAP3_SDRC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(sdrc_regs, Omap3SdrcState, 0x400 / 4),
++        VMSTATE_UINT32_ARRAY(sms_regs, Omap3SdrcState, 0x400 / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void sdrc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, sdrc_reset);
++    dc->vmsd = &sdrc_vmstate;
++    dc->desc = "OMAP3 SDRAM controller and memory scheduler";
++}
++
++static const TypeInfo omap3_prcm_types[] = {
++    {
++        .name = TYPE_OMAP3_CM,
++        .parent = TYPE_SYS_BUS_DEVICE,
++        .instance_size = sizeof(Omap3CmState),
++        .instance_init = cm_init,
++        .class_init = cm_class_init,
++    }, {
++        .name = TYPE_OMAP3_PRM,
++        .parent = TYPE_SYS_BUS_DEVICE,
++        .instance_size = sizeof(Omap3PrmState),
++        .instance_init = prm_init,
++        .class_init = prm_class_init,
++    }, {
++        .name = TYPE_OMAP3_SCM,
++        .parent = TYPE_SYS_BUS_DEVICE,
++        .instance_size = sizeof(Omap3ScmState),
++        .instance_init = scm_init,
++        .class_init = scm_class_init,
++    }, {
++        .name = TYPE_OMAP3_SDRC,
++        .parent = TYPE_SYS_BUS_DEVICE,
++        .instance_size = sizeof(Omap3SdrcState),
++        .instance_init = sdrc_init,
++        .class_init = sdrc_class_init,
++    },
++};
++
++DEFINE_TYPES(omap3_prcm_types)
+-- 
+2.55.0
+

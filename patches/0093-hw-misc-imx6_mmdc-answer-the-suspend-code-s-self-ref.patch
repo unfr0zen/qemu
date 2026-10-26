@@ -1,0 +1,67 @@
+From 3319724a9fa1a3bb53fdc00b697fea261cf0965b Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:09:11 -0400
+Subject: [PATCH 93/93] hw/misc: imx6_mmdc: answer the suspend code's
+ self-refresh handshake
+
+DVACK follows DVFS, and ZQ_HW_FOR and RST_RD_FIFO clear at once, so the
+suspend and resume code's polls finish.
+---
+ hw/misc/imx6_mmdc.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/hw/misc/imx6_mmdc.c b/hw/misc/imx6_mmdc.c
+index bd8c2f0..de7cbb8 100644
+--- a/hw/misc/imx6_mmdc.c
++++ b/hw/misc/imx6_mmdc.c
+@@ -14,6 +14,13 @@
+  * enabled (PSD clear), 0 while the driver disables it. Everything else is
+  * a plain register file.
+  *
++ * The suspend code (suspend-imx6.S) puts the DDR in self-refresh by setting
++ * DVFS (bit 21) and spinning until DVACK (bit 25) sets, then clears DVFS
++ * and waits for DVACK to clear on resume; DVACK follows DVFS. On resume it
++ * also starts a ZQ calibration (MPZQHWCTRL.ZQ_HW_FOR) and a read FIFO reset
++ * (MPDGCTRL0.RST_RD_FIFO) and polls each bit until the hardware clears it:
++ * both complete at once.
++ *
+  * Driver: arch/arm/mach-imx/mmdc.c v4.1 (MMDC_MAPSR 0x404, PSD bit 0,
+  * PSS bit 4), i.MX6SX Reference Manual ch. 47.
+  *
+@@ -37,6 +44,12 @@
+ #define MMDC_MAPSR      0x404
+ #define BP_MAPSR_PSD    0       /* power saving disable (RW) */
+ #define BP_MAPSR_PSS    4       /* power saving status (RO, follows !PSD) */
++#define BP_MAPSR_DVFS   21      /* self-refresh request (RW) */
++#define BP_MAPSR_DVACK  25      /* self-refresh ack (RO, follows DVFS) */
++#define MMDC_MPZQHWCTRL 0x800
++#define BP_ZQ_HW_FOR    16      /* force ZQ calibration (self-clearing) */
++#define MMDC_MPDGCTRL0  0x83c
++#define BP_RST_RD_FIFO  31      /* read FIFO reset (self-clearing) */
+ 
+ static uint64_t imx6_mmdc_read(void *opaque, hwaddr off, unsigned size)
+ {
+@@ -51,6 +64,8 @@ static uint64_t imx6_mmdc_read(void *opaque, hwaddr off, unsigned size)
+     if (off == MMDC_MAPSR) {
+         val = deposit32(val, BP_MAPSR_PSS, 1,
+                         !extract32(val, BP_MAPSR_PSD, 1));
++        val = deposit32(val, BP_MAPSR_DVACK, 1,
++                        extract32(val, BP_MAPSR_DVFS, 1));
+     }
+     return val;
+ }
+@@ -60,6 +75,11 @@ static void imx6_mmdc_write(void *opaque, hwaddr off, uint64_t val,
+ {
+     Imx6MmdcState *s = IMX6_MMDC(opaque);
+ 
++    if (off == MMDC_MPZQHWCTRL) {
++        val = deposit32(val, BP_ZQ_HW_FOR, 1, 0);
++    } else if (off == MMDC_MPDGCTRL0) {
++        val = deposit32(val, BP_RST_RD_FIFO, 1, 0);
++    }
+     if (off < sizeof(s->regs)) {
+         s->regs[off / 4] = val;
+     }
+-- 
+2.56.0
+
