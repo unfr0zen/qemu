@@ -1,0 +1,21 @@
+From 30326d60b8f9dfef56872f9a0339e175d7ab15dd Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 51/91] hw/misc: build the OMAP3 PRCM, GPMC and the TPS65921
+
+---
+ hw/misc/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 5bd9086..426b2e1 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -171,3 +171,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+ system_ss.add(when: 'CONFIG_EM35X_NCP', if_true: files('em35x_ncp.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_prcm.c', 'omap3_gpmc.c', 'omap3_bch.c', 'tps65921.c'))
+-- 
+2.55.0
+

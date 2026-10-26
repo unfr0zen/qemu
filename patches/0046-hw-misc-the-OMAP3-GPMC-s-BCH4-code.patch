@@ -1,0 +1,137 @@
+From 0e5b0e2fdc2909432ab78fc87cf05d008bec55bb Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 46/91] hw/misc: the OMAP3 GPMC's BCH4 code
+
+---
+ hw/misc/omap3_bch.c | 118 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+ create mode 100644 hw/misc/omap3_bch.c
+
+diff --git a/hw/misc/omap3_bch.c b/hw/misc/omap3_bch.c
+new file mode 100644
+index 0000000..de00131
+--- /dev/null
++++ b/hw/misc/omap3_bch.c
+@@ -0,0 +1,118 @@
++/*
++ * BCH parity for the OMAP3 GPMC ECC engine
++ *
++ * The GPMC's 4-bit BCH code: GF(2^13) with the primitive polynomial
++ * x^13 + x^4 + x^3 + x + 1 (0x201b), generator g(x) = lcm of the minimal
++ * polynomials of a, a^3, a^5, a^7 (degree 52). The parity of a sector is
++ * the remainder of data(x) * x^52 by g(x), data bits taken most
++ * significant bit of the first byte first.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/omap3_bch.h"
++
++#define GF_M        13
++#define GF_N        ((1 << GF_M) - 1)
++#define GF_POLY     0x201b
++
++static uint64_t bch4_generator;     /* bit i: coefficient of x^i, i < 52 */
++
++static void omap3_bch4_init(void)
++{
++    uint16_t exp[2 * GF_N], log[GF_N + 1];
++    uint8_t g[64] = { 1 };          /* GF(2) coefficients, g[0] = 1 */
++    int deg = 0;
++    int done[GF_N] = { 0 };
++
++    for (int i = 0, x = 1; i < GF_N; i++) {
++        exp[i] = exp[i + GF_N] = x;
++        log[x] = i;
++        x <<= 1;
++        if (x & (1 << GF_M)) {
++            x ^= GF_POLY;
++        }
++    }
++
++    for (int r = 1; r <= 7; r += 2) {
++        /* minimal polynomial of a^r: product over its cyclotomic coset */
++        uint16_t m[GF_M + 2] = { 1 };   /* coefficients in GF(2^13) */
++        int mdeg = 0;
++
++        if (done[r]) {
++            continue;
++        }
++        for (int j = r; !done[j]; j = (j * 2) % GF_N) {
++            done[j] = 1;
++            /* m(x) *= (x + a^j) */
++            for (int k = mdeg + 1; k >= 0; k--) {
++                uint16_t prev = k ? m[k - 1] : 0;
++                uint16_t mul = m[k] ? exp[log[m[k]] + j] : 0;
++
++                m[k] = prev ^ mul;
++            }
++            mdeg++;
++        }
++        /* g(x) *= m(x); m's coefficients are all 0 or 1 */
++        {
++            uint8_t prod[64] = { 0 };
++
++            for (int a = 0; a <= deg; a++) {
++                for (int b = 0; b <= mdeg; b++) {
++                    prod[a + b] ^= g[a] & (m[b] & 1);
++                }
++            }
++            memcpy(g, prod, sizeof(g));
++            deg += mdeg;
++        }
++    }
++
++    bch4_generator = 0;
++    for (int i = 0; i < OMAP3_BCH4_BITS; i++) {
++        bch4_generator |= (uint64_t)g[i] << i;
++    }
++}
++
++uint64_t omap3_bch4_parity(const uint8_t *data, size_t len)
++{
++    const uint64_t top = 1ull << (OMAP3_BCH4_BITS - 1);
++    const uint64_t mask = (1ull << OMAP3_BCH4_BITS) - 1;
++    uint64_t r = 0;
++
++    if (!bch4_generator) {
++        omap3_bch4_init();
++    }
++    for (size_t i = 0; i < len; i++) {
++        for (int b = 7; b >= 0; b--) {
++            uint64_t feedback = ((r & top) != 0) ^ ((data[i] >> b) & 1);
++
++            r = (r << 1) & mask;
++            if (feedback) {
++                r ^= bch4_generator;
++            }
++        }
++    }
++    return r;
++}
++
++uint64_t omap3_bch4_mulx52(uint64_t r)
++{
++    const uint64_t top = 1ull << (OMAP3_BCH4_BITS - 1);
++    const uint64_t mask = (1ull << OMAP3_BCH4_BITS) - 1;
++
++    if (!bch4_generator) {
++        omap3_bch4_init();
++    }
++    for (int i = 0; i < OMAP3_BCH4_BITS; i++) {
++        bool feedback = r & top;
++
++        r = (r << 1) & mask;
++        if (feedback) {
++            r ^= bch4_generator;
++        }
++    }
++    return r;
++}
+-- 
+2.55.0
+

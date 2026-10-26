@@ -1,0 +1,45 @@
+From 8e36e1290345ea93cf04e66940d84d37dc7d5d00 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 91/91] hw/arm: OMAP3630 and J49 configuration
+
+---
+ hw/arm/Kconfig | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 8f7b631..6eb8d77 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -207,6 +207,14 @@ config FLINTSTONE
+     select LM3695
+     select EM35X_NCP
+ 
++config J49
++    bool
++    default y
++    depends on TCG && ARM
++    select OMAP3630
++    select WL1271
++    select EM35X_NCP
++
+ config STELLARIS
+     bool
+     default y
+@@ -535,6 +543,13 @@ config FSL_IMX6
+     select USB_CHIPIDEA
+     select OR_IRQ
+ 
++config OMAP3630
++    bool
++    select I2C
++    select SDHCI
++    select SSI
++    select UNIMP
++
+ config FSL_IMX6SX
+     bool
+     imply I2C_DEVICES
+-- 
+2.55.0
+

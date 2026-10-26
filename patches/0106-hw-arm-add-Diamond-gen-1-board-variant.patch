@@ -1,0 +1,234 @@
+From 3c228b3f5dacbfd7fa783120b756b949de1ec343 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 07:33:58 -0400
+Subject: [PATCH] hw/arm: add Diamond gen 1 board variant
+
+---
+ hw/arm/j49.c         | 64 +++++++++++++++++++++++++++++++++++---------
+ hw/input/adbs_a330.c | 11 ++++++--
+ 2 files changed, 60 insertions(+), 15 deletions(-)
+
+diff --git a/hw/arm/j49.c b/hw/arm/j49.c
+index 791a363..07cc128 100644
+--- a/hw/arm/j49.c
++++ b/hw/arm/j49.c
+@@ -1,5 +1,5 @@
+ /*
+- * Nest Learning Thermostat gen 2 ("j49", Display-2.x) machine
++ * Nest Learning Thermostat gen 1 (Diamond) and gen 2 (j49) machines
+  *
+  * An AM3703 (OMAP3630 family) with 64 MiB of mobile DDR, a 256 MiB Micron
+  * MT29F2G16 x16 NAND on GPMC chip select 0 and a TPS65921 on I2C1. The
+@@ -70,6 +70,7 @@
+ struct J49Wheel {
+     int64_t position;
+     Object *ring;
++    int direction;
+     int64_t owed;                   /* counts still to turn */
+     QEMUTimer *slew;
+ };
+@@ -105,7 +106,7 @@ static void j49_set_wheel(Object *obj, Visitor *v, const char *name,
+     if (!visit_type_int64(v, name, &position, errp)) {
+         return;
+     }
+-    w->owed -= (position - w->position) * J49_RING_COUNTS;
++    w->owed += (position - w->position) * J49_RING_COUNTS * w->direction;
+     w->position = position;
+     if (!timer_pending(w->slew)) {
+         j49_wheel_slew(w);
+@@ -115,6 +116,7 @@ static void j49_set_wheel(Object *obj, Visitor *v, const char *name,
+ struct J49RomBoot {
+     Omap3630State *soc;
+     BlockBackend *blk;
++    const char *machine;
+ };
+ 
+ /* Read `len` data bytes from the NAND's data areas, from data offset `off`. */
+@@ -147,20 +149,21 @@ static void j49_rom_boot(void *opaque)
+     cpu_reset(first_cpu);
+ 
+     if (!j49_nand_read_data(rom->blk, 0, hdr, sizeof(hdr))) {
+-        error_report("j49: boot ROM could not read the NAND");
++        error_report("%s: boot ROM could not read the NAND", rom->machine);
+         exit(1);
+     }
+     size = ldl_le_p(hdr);
+     load = ldl_le_p(hdr + 4);
+     if (load < OMAP3630_SRAM_ADDR ||
+         size > OMAP3630_SRAM_ADDR + OMAP3630_SRAM_SIZE - load) {
+-        error_report("j49: no GP boot image in NAND block 0 (size 0x%" PRIx32
+-                     ", load 0x%" PRIx32 ")", size, load);
++        error_report("%s: no GP boot image in NAND block 0 (size 0x%" PRIx32
++                     ", load 0x%" PRIx32 ")", rom->machine, size, load);
+         exit(1);
+     }
+     image = g_malloc(size);
+     if (!j49_nand_read_data(rom->blk, sizeof(hdr), image, size)) {
+-        error_report("j49: boot ROM could not read the boot image");
++        error_report("%s: boot ROM could not read the boot image",
++                     rom->machine);
+         exit(1);
+     }
+     cpu_physical_memory_write(load, image, size);
+@@ -232,7 +235,7 @@ static void j49_init_ncp(Omap3630State *soc)
+                                 qdev_get_gpio_in(DEVICE(&soc->gpio[5]), 22));
+ }
+ 
+-static void j49_init(MachineState *machine)
++static void nest_omap_init(MachineState *machine, bool diamond)
+ {
+     Omap3630State *soc;
+     BlockBackend *nand = blk_by_name("nand");
+@@ -242,14 +245,16 @@ static void j49_init(MachineState *machine)
+     struct J49Wheel *wheel;
+ 
+     if (machine->ram_size != J49_RAM_SIZE) {
+-        error_report("j49: this board has %lu MiB of SDRAM",
++        error_report("%s: this board has %lu MiB of SDRAM",
++                     diamond ? "diamond" : "j49",
+                      (unsigned long)(J49_RAM_SIZE / MiB));
+         exit(1);
+     }
+     /* qtest builds the machine without a firmware to boot. */
+     if (!nand && !qtest_enabled()) {
+-        error_report("j49: the board boots from its NAND: "
+-                     "-drive if=none,id=nand,format=raw,file=NAND.raw");
++        error_report("%s: the board boots from its NAND: "
++                     "-drive if=none,id=nand,format=raw,file=NAND.raw",
++                     diamond ? "diamond" : "j49");
+         exit(1);
+     }
+ 
+@@ -278,8 +283,10 @@ static void j49_init(MachineState *machine)
+     object_property_set_uint(OBJECT(pmic), "adcin0-mv", J49_BATTERY_MV / 3,
+                              &error_fatal);
+ 
+-    /* The panel backlight driver on I2C3 (board-diamond.c lm3530-backlight). */
+-    i2c_slave_create_simple(soc->i2c[2].bus, "lm3530", 0x36);
++    /* Diamond drives its backlight with PWM; j49 has an I2C LM3530. */
++    if (!diamond) {
++        i2c_slave_create_simple(soc->i2c[2].bus, "lm3530", 0x36);
++    }
+ 
+     /*
+      * The ring: an optical finger navigation sensor on I2C2 at 0x57, its
+@@ -287,12 +294,16 @@ static void j49_init(MachineState *machine)
+      * the turns.
+      */
+     ring = i2c_slave_new("adbs-a330", 0x57);
++    if (diamond) {
++        qdev_prop_set_bit(DEVICE(ring), "delta-x", true);
++    }
+     object_property_add_child(OBJECT(machine), "ring", OBJECT(ring));
+     i2c_slave_realize_and_unref(ring, soc->i2c[1].bus, &error_fatal);
+     qdev_connect_gpio_out(DEVICE(ring), 0,
+                           qdev_get_gpio_in(DEVICE(&soc->gpio[3]), 12));
+     wheel = g_new0(struct J49Wheel, 1);
+     wheel->ring = OBJECT(ring);
++    wheel->direction = diamond ? 1 : -1;
+     wheel->slew = timer_new_ns(QEMU_CLOCK_VIRTUAL, j49_wheel_slew, wheel);
+     object_property_add(OBJECT(machine), "wheel-position", "int",
+                         j49_get_wheel, j49_set_wheel, NULL, wheel);
+@@ -316,16 +327,30 @@ static void j49_init(MachineState *machine)
+                                 qdev_get_gpio_in_named(board, J49_BOARD_BEEPER,
+                                                        0));
+     j49_init_wifi(soc, board);
+-    j49_init_ncp(soc);
++    /* Diamond's CC2530 uses UART2 (serial_hd(1)); the host owns its peer. */
++    if (!diamond) {
++        j49_init_ncp(soc);
++    }
+ 
+     if (nand) {
+         rom = g_new0(struct J49RomBoot, 1);
+         rom->soc = soc;
+         rom->blk = nand;
++        rom->machine = diamond ? "diamond" : "j49";
+         qemu_register_reset(j49_rom_boot, rom);
+     }
+ }
+ 
++static void j49_init(MachineState *machine)
++{
++    nest_omap_init(machine, false);
++}
++
++static void diamond_init(MachineState *machine)
++{
++    nest_omap_init(machine, true);
++}
++
+ static void j49_machine_class_init(MachineClass *mc)
+ {
+     mc->desc = "Nest Learning Thermostat gen 2 (AM3703, 'j49')";
+@@ -338,3 +363,16 @@ static void j49_machine_class_init(MachineClass *mc)
+ }
+ 
+ DEFINE_MACHINE_ARM("j49", j49_machine_class_init)
++
++static void diamond_machine_class_init(MachineClass *mc)
++{
++    mc->desc = "Nest Learning Thermostat gen 1 (AM3703, 'diamond')";
++    mc->init = diamond_init;
++    mc->min_cpus = 1;
++    mc->max_cpus = 1;
++    mc->default_cpus = 1;
++    mc->default_ram_size = J49_RAM_SIZE;
++    mc->default_ram_id = "diamond.ram";
++}
++
++DEFINE_MACHINE_ARM("diamond", diamond_machine_class_init)
+diff --git a/hw/input/adbs_a330.c b/hw/input/adbs_a330.c
+index dda122f..044c7cf 100644
+--- a/hw/input/adbs_a330.c
++++ b/hw/input/adbs_a330.c
+@@ -19,6 +19,7 @@
+ #include "qemu/osdep.h"
+ #include "hw/i2c/i2c.h"
+ #include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
+ #include "migration/vmstate.h"
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+@@ -49,6 +50,7 @@ struct AdbsA330State {
+     uint8_t regs[256];
+     uint8_t cur;
+     bool first_byte;
++    bool delta_x;
+     int32_t pending;            /* counts not yet read out */
+ };
+ 
+@@ -80,9 +82,9 @@ static uint8_t adbs_read(AdbsA330State *s, uint8_t reg)
+     case REG_MOTION:
+         return s->pending ? MOTION_MOT : 0;
+     case REG_DELTA_X:
+-        return 0;
++        return s->delta_x ? adbs_take(s) : 0;
+     case REG_DELTA_Y:
+-        return adbs_take(s);
++        return s->delta_x ? 0 : adbs_take(s);
+     case REG_SQUAL:
+         return 0x40;                    /* a finger on the ring's surface */
+     }
+@@ -174,6 +176,10 @@ static const VMStateDescription adbs_vmstate = {
+     },
+ };
+ 
++static const Property adbs_props[] = {
++    DEFINE_PROP_BOOL("delta-x", AdbsA330State, delta_x, false),
++};
++
+ static void adbs_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -182,6 +188,7 @@ static void adbs_class_init(ObjectClass *klass, const void *data)
+     device_class_set_legacy_reset(dc, adbs_reset);
+     dc->vmsd = &adbs_vmstate;
+     dc->desc = "Avago ADBS-A320 optical finger navigation sensor";
++    device_class_set_props(dc, adbs_props);
+     k->event = adbs_event;
+     k->send = adbs_send;
+     k->recv = adbs_recv;
+-- 
+2.56.0
+

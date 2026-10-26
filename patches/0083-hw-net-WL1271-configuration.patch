@@ -1,0 +1,27 @@
+From 9e52f1d0489ea6bd9389b880c0ee4401fd04344a Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 83/91] hw/net: WL1271 configuration
+
+---
+ hw/net/Kconfig | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/hw/net/Kconfig b/hw/net/Kconfig
+index 87e19af..96a2cbf 100644
+--- a/hw/net/Kconfig
++++ b/hw/net/Kconfig
+@@ -59,6 +59,10 @@ config VMXNET3_PCI
+     default y if PCI_DEVICES
+     depends on PCI
+ 
++config WL1271
++    bool
++    select SD
++
+ config BCM43341
+     bool
+ 
+-- 
+2.55.0
+

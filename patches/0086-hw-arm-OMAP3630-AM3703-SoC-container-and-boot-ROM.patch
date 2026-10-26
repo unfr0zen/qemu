@@ -1,0 +1,407 @@
+From eec1c55a4c63b9dc9cc82bd042b08c4dc7aa8b65 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 86/91] hw/arm: OMAP3630 / AM3703 SoC container and boot ROM
+
+---
+ hw/arm/omap3630.c | 388 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 388 insertions(+)
+ create mode 100644 hw/arm/omap3630.c
+
+diff --git a/hw/arm/omap3630.c b/hw/arm/omap3630.c
+new file mode 100644
+index 0000000..8c520bd
+--- /dev/null
++++ b/hw/arm/omap3630.c
+@@ -0,0 +1,388 @@
++/*
++ * TI OMAP3630 / AM3703 SoC
++ *
++ * The Cortex-A8 (r3p2, with the security extensions) and the parts of the
++ * L3/L4 interconnect the Nest gen 2 firmware uses: interrupt controller,
++ * GP timers and the 32 kHz counter, PRCM, control module, SDRC, GPMC with
++ * its NAND, UARTs, I2C, GPIO and the MPU watchdog. Everything else in the
++ * L3 and L4 windows reads as zero and logs (-d unimp).
++ *
++ * The public boot ROM is a stand-in with the ROM's interface: exception and
++ * monitor vectors, the GP-device SMC services (L2 and auxiliary control)
++ * and a launcher that enters the boot image with r0 at the booting
++ * parameter structure. Loading the image is the machine's job (it knows
++ * the boot device).
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/arm/omap3630.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/misc/unimp.h"
++#include "system/address-spaces.h"
++#include "qemu/module.h"
++#include "qemu/units.h"
++
++/*
++ * The boot ROM stand-in, assembled from:
++ *
++ *   0x000  b launch; then b . for each other exception
++ *   0x040  image:  .word entry       @ set by the machine
++ *   0x060  monitor vectors (MVBAR): b . except SMC: b smc
++ *   0x080  booting parameters: reserved, device descriptor, device 2 (NAND)
++ *   0x0c0  smc:    cmp r12, #2; mcreq p15, 1, r0, c9, c0, 2   @ L2 aux ctrl
++ *                  cmp r12, #3; mcreq p15, 0, r0, c1, c0, 1   @ aux ctrl
++ *                  movs pc, lr
++ *   0x100  launch: ldr sp, =0x4020fff0
++ *                  ldr r0, =0x40014000; mcr p15, 0, r0, c12, c0, 0  @ VBAR
++ *                  add r0, r0, #0x60;   mcr p15, 0, r0, c12, c0, 1  @ MVBAR
++ *                  ldr r1, image; ldr r0, =boot_params; bx r1
++ */
++static const uint32_t omap3630_rom[] = {
++    [0x000 / 4] = 0xea00003e,  /* b launch */
++    [0x004 / 4] = 0xeafffffe,  /* b . (undefined) */
++    [0x008 / 4] = 0xeafffffe,  /* b . (SWI) */
++    [0x00c / 4] = 0xeafffffe,  /* b . (prefetch abort) */
++    [0x010 / 4] = 0xeafffffe,  /* b . (data abort) */
++    [0x014 / 4] = 0xeafffffe,  /* b . */
++    [0x018 / 4] = 0xeafffffe,  /* b . (IRQ) */
++    [0x01c / 4] = 0xeafffffe,  /* b . (FIQ) */
++    [0x060 / 4] = 0xeafffffe,  /* monitor: b . */
++    [0x064 / 4] = 0xeafffffe,  /* b . */
++    [0x068 / 4] = 0xea000014,  /* b smc */
++    [0x06c / 4] = 0xeafffffe,  /* b . */
++    [0x070 / 4] = 0xeafffffe,  /* b . */
++    [0x074 / 4] = 0xeafffffe,  /* b . */
++    [0x078 / 4] = 0xeafffffe,  /* b . */
++    [0x07c / 4] = 0xeafffffe,  /* b . */
++    [0x088 / 4] = 0x00000002,  /* booting device: NAND */
++    [0x0c0 / 4] = 0xe35c0002,  /* cmp ip, #2 */
++    [0x0c4 / 4] = 0x0e290f50,  /* mcreq 15, 1, r0, cr9, cr0, {2} */
++    [0x0c8 / 4] = 0xe35c0003,  /* cmp ip, #3 */
++    [0x0cc / 4] = 0x0e010f30,  /* mcreq 15, 0, r0, cr1, cr0, {1} */
++    [0x0d0 / 4] = 0xe1b0f00e,  /* movs pc, lr */
++    [0x100 / 4] = 0xe59fd018,  /* ldr sp, [pc, #24] */
++    [0x104 / 4] = 0xe59f0018,  /* ldr r0, [pc, #24] */
++    [0x108 / 4] = 0xee0c0f10,  /* mcr 15, 0, r0, cr12, cr0, {0} */
++    [0x10c / 4] = 0xe2800060,  /* add r0, r0, #96 */
++    [0x110 / 4] = 0xee0c0f30,  /* mcr 15, 0, r0, cr12, cr0, {1} */
++    [0x114 / 4] = 0xe51f10dc,  /* ldr r1, [pc, #-220] */
++    [0x118 / 4] = 0xe59f0008,  /* ldr r0, [pc, #8] */
++    [0x11c / 4] = 0xe12fff11,  /* bx r1 */
++    [0x120 / 4] = 0x4020fff0,
++    [0x124 / 4] = 0x40014000,
++    [0x128 / 4] = 0x40014080,
++};
++
++static const hwaddr omap3630_gpt_addr[OMAP3_NUM_GPT] = {
++    0x48318000, 0x49032000, 0x49034000, 0x49036000, 0x49038000, 0x4903a000,
++    0x4903c000, 0x4903e000, 0x49040000, 0x48086000, 0x48088000, 0x48304000,
++};
++static const int omap3630_gpt_irq[OMAP3_NUM_GPT] = {
++    37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 95,
++};
++static const hwaddr omap3630_uart_addr[OMAP3630_NUM_UART] = {
++    0x4806a000, 0x4806c000, 0x49020000, 0x49042000,
++};
++static const int omap3630_uart_irq[OMAP3630_NUM_UART] = { 72, 73, 74, 80 };
++static const hwaddr omap3630_i2c_addr[OMAP3630_NUM_I2C] = {
++    0x48070000, 0x48072000, 0x48060000,
++};
++static const int omap3630_i2c_irq[OMAP3630_NUM_I2C] = { 56, 57, 61 };
++static const hwaddr omap3630_gpio_addr[OMAP3630_NUM_GPIO] = {
++    0x48310000, 0x49050000, 0x49052000, 0x49054000, 0x49056000, 0x49058000,
++};
++static const int omap3630_gpio_irq[OMAP3630_NUM_GPIO] = { 29, 30, 31, 32, 33, 34 };
++static const hwaddr omap3630_mmc_addr[OMAP3630_NUM_MMC] = {
++    0x4809c000, 0x480b4000, 0x480ad000,
++};
++static const int omap3630_mmc_irq[OMAP3630_NUM_MMC] = { 83, 86, 94 };
++static const hwaddr omap3630_mcspi_addr[OMAP3630_NUM_MCSPI] = {
++    0x48098000, 0x4809a000, 0x480b8000, 0x480ba000,
++};
++static const int omap3630_mcspi_irq[OMAP3630_NUM_MCSPI] = { 65, 66, 91, 48 };
++/* DMA requests (TX, RX), numbered as the SDMA's inputs: S_DMA_n + 1 */
++static const int omap3630_mmc_dma[OMAP3630_NUM_MMC][2] = {
++    { 61, 62 }, { 47, 48 }, { 77, 78 },
++};
++static const int omap3630_mcspi_dma[OMAP3630_NUM_MCSPI][2 * OMAP3_MCSPI_CHANNELS] = {
++    { 35, 36, 37, 38, 39, 40, 41, 42 },
++    { 43, 44, 45, 46 },
++    { 15, 16, 23, 24 },
++    { 70, 71 },
++};
++#define OMAP3630_SDMA_ADDR      0x48056000
++static const int omap3630_sdma_irq[OMAP3_SDMA_LINES] = { 12, 13, 14, 15 };
++
++#define OMAP3630_INTC_ADDR      0x48200000
++#define OMAP3630_SYNCTIMER_ADDR 0x48320000
++#define OMAP3630_CM_ADDR        0x48004000
++#define OMAP3630_PRM_ADDR       0x48306000
++#define OMAP3630_PRM_IRQ        11
++#define OMAP3630_SCM_ADDR       0x48002000
++#define OMAP3630_TAP_ADDR       0x4830a000
++#define OMAP3630_SDRC_ADDR      0x6d000000
++#define OMAP3630_SMS_ADDR       0x6c000000
++#define OMAP3630_GPMC_ADDR      0x6e000000
++#define OMAP3630_GPMC_IRQ       20
++#define OMAP3630_WDT2_ADDR      0x48314000
++#define OMAP3630_MUSB_ADDR      0x480ab000
++#define OMAP3630_DSS_ADDR       0x48050000
++#define OMAP3630_DSI_ADDR       0x4804fc00
++#define OMAP3630_DSS_IRQ        25
++#define OMAP3630_MUSB_IRQ       92
++
++void omap3630_rom_set_entry(Omap3630State *s, uint32_t entry)
++{
++    uint8_t *rom = memory_region_get_ram_ptr(&s->rom);
++
++    stl_le_p(rom + (OMAP3630_ROM_ENTRY - OMAP3630_ROM_ADDR), entry);
++}
++
++static void omap3630_init(Object *obj)
++{
++    Omap3630State *s = OMAP3630(obj);
++
++    object_initialize_child(obj, "cpu", &s->cpu, ARM_CPU_TYPE_NAME("cortex-a8"));
++    object_initialize_child(obj, "intc", &s->intc, TYPE_OMAP3_INTC);
++    for (int i = 0; i < OMAP3_NUM_GPT; i++) {
++        g_autofree char *name = g_strdup_printf("gpt%d", i + 1);
++
++        object_initialize_child(obj, name, &s->gpt[i], TYPE_OMAP3_GPTIMER);
++    }
++    object_initialize_child(obj, "synctimer", &s->synctimer, TYPE_OMAP3_SYNCTIMER);
++    object_initialize_child(obj, "cm", &s->cm, TYPE_OMAP3_CM);
++    object_initialize_child(obj, "prm", &s->prm, TYPE_OMAP3_PRM);
++    object_initialize_child(obj, "scm", &s->scm, TYPE_OMAP3_SCM);
++    object_initialize_child(obj, "sdrc", &s->sdrc, TYPE_OMAP3_SDRC);
++    object_initialize_child(obj, "gpmc", &s->gpmc, TYPE_OMAP3_GPMC);
++    object_initialize_child(obj, "sdma", &s->sdma, TYPE_OMAP3_SDMA);
++    for (int i = 0; i < OMAP3630_NUM_UART; i++) {
++        g_autofree char *name = g_strdup_printf("uart%d", i + 1);
++
++        object_initialize_child(obj, name, &s->uart[i], TYPE_OMAP3_UART);
++    }
++    for (int i = 0; i < OMAP3630_NUM_I2C; i++) {
++        g_autofree char *name = g_strdup_printf("i2c%d", i + 1);
++
++        object_initialize_child(obj, name, &s->i2c[i], TYPE_OMAP3_I2C);
++    }
++    for (int i = 0; i < OMAP3630_NUM_GPIO; i++) {
++        g_autofree char *name = g_strdup_printf("gpio%d", i + 1);
++
++        object_initialize_child(obj, name, &s->gpio[i], TYPE_OMAP3_GPIO);
++    }
++    for (int i = 0; i < OMAP3630_NUM_MMC; i++) {
++        g_autofree char *name = g_strdup_printf("mmc%d", i + 1);
++
++        object_initialize_child(obj, name, &s->mmc[i], TYPE_OMAP3_HSMMC);
++    }
++    for (int i = 0; i < OMAP3630_NUM_MCSPI; i++) {
++        g_autofree char *name = g_strdup_printf("mcspi%d", i + 1);
++
++        object_initialize_child(obj, name, &s->mcspi[i], TYPE_OMAP3_MCSPI);
++    }
++    object_initialize_child(obj, "dss", &s->dss, TYPE_OMAP3_DSS);
++    s->wdt2 = qdev_new("omap3-wdt");
++    s->musb = qdev_new("omap3-musb");
++    object_property_add_child(obj, "musb", OBJECT(s->musb));
++    object_property_add_child(obj, "wdt2", OBJECT(s->wdt2));
++}
++
++static void omap3630_map(SysBusDevice *sbd, int n, hwaddr addr)
++{
++    sysbus_mmio_map(sbd, n, addr);
++}
++
++static void omap3630_realize(DeviceState *dev, Error **errp)
++{
++    Omap3630State *s = OMAP3630(dev);
++    MemoryRegion *sysmem = get_system_memory();
++    DeviceState *intc = DEVICE(&s->intc);
++    uint8_t *rom;
++
++    /* Cortex-A8 r3p2, as on the 3630 */
++    object_property_set_int(OBJECT(&s->cpu), "midr", 0x413fc082, &error_abort);
++    if (!qdev_realize(DEVICE(&s->cpu), NULL, errp)) {
++        return;
++    }
++
++    memory_region_init_rom(&s->rom, OBJECT(dev), "omap3630.rom",
++                           OMAP3630_ROM_SIZE, errp);
++    rom = memory_region_get_ram_ptr(&s->rom);
++    memset(rom, 0, OMAP3630_ROM_SIZE);
++    for (int i = 0; i < ARRAY_SIZE(omap3630_rom); i++) {
++        stl_le_p(rom + 4 * i, omap3630_rom[i]);
++    }
++    memory_region_add_subregion(sysmem, OMAP3630_ROM_ADDR, &s->rom);
++    memory_region_init_ram(&s->sram, OBJECT(dev), "omap3630.sram",
++                           OMAP3630_SRAM_SIZE, errp);
++    memory_region_add_subregion(sysmem, OMAP3630_SRAM_ADDR, &s->sram);
++
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->intc), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(&s->intc), 0, OMAP3630_INTC_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->intc), 0,
++                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_IRQ));
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->intc), 1,
++                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_FIQ));
++
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->cm), errp) ||
++        !sysbus_realize(SYS_BUS_DEVICE(&s->prm), errp) ||
++        !sysbus_realize(SYS_BUS_DEVICE(&s->scm), errp) ||
++        !sysbus_realize(SYS_BUS_DEVICE(&s->sdrc), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(&s->cm), 0, OMAP3630_CM_ADDR);
++    omap3630_map(SYS_BUS_DEVICE(&s->prm), 0, OMAP3630_PRM_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->prm), 0,
++                       qdev_get_gpio_in(intc, OMAP3630_PRM_IRQ));
++    omap3630_map(SYS_BUS_DEVICE(&s->scm), 0, OMAP3630_SCM_ADDR);
++    omap3630_map(SYS_BUS_DEVICE(&s->scm), 1, OMAP3630_TAP_ADDR);
++    omap3630_map(SYS_BUS_DEVICE(&s->sdrc), 0, OMAP3630_SDRC_ADDR);
++    omap3630_map(SYS_BUS_DEVICE(&s->sdrc), 1, OMAP3630_SMS_ADDR);
++
++    for (int i = 0; i < OMAP3_NUM_GPT; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpt[i]), errp)) {
++            return;
++        }
++        omap3630_map(SYS_BUS_DEVICE(&s->gpt[i]), 0, omap3630_gpt_addr[i]);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpt[i]), 0,
++                           qdev_get_gpio_in(intc, omap3630_gpt_irq[i]));
++        qdev_connect_gpio_out_named(DEVICE(&s->cm), OMAP3_CM_GPT_CLKSEL, i,
++                                    qdev_get_gpio_in_named(DEVICE(&s->gpt[i]),
++                                                           OMAP3_GPTIMER_CLKSEL,
++                                                           0));
++    }
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->synctimer), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(&s->synctimer), 0, OMAP3630_SYNCTIMER_ADDR);
++
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpmc), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(&s->gpmc), 0, OMAP3630_GPMC_ADDR);
++    /* The chip-select space sits under everything else at 0. */
++    memory_region_add_subregion_overlap(sysmem, 0,
++        sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->gpmc), 1), -1);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmc), 0,
++                       qdev_get_gpio_in(intc, OMAP3630_GPMC_IRQ));
++
++    for (int i = 0; i < OMAP3630_NUM_UART; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart[i]), errp)) {
++            return;
++        }
++        omap3630_map(SYS_BUS_DEVICE(&s->uart[i]), 0, omap3630_uart_addr[i]);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart[i]), 0,
++                           qdev_get_gpio_in(intc, omap3630_uart_irq[i]));
++    }
++    for (int i = 0; i < OMAP3630_NUM_I2C; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->i2c[i]), errp)) {
++            return;
++        }
++        omap3630_map(SYS_BUS_DEVICE(&s->i2c[i]), 0, omap3630_i2c_addr[i]);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
++                           qdev_get_gpio_in(intc, omap3630_i2c_irq[i]));
++    }
++    for (int i = 0; i < OMAP3630_NUM_GPIO; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio[i]), errp)) {
++            return;
++        }
++        omap3630_map(SYS_BUS_DEVICE(&s->gpio[i]), 0, omap3630_gpio_addr[i]);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio[i]), 0,
++                           qdev_get_gpio_in(intc, omap3630_gpio_irq[i]));
++    }
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdma), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(&s->sdma), 0, OMAP3630_SDMA_ADDR);
++    for (int j = 0; j < OMAP3_SDMA_LINES; j++) {
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdma), j,
++                           qdev_get_gpio_in(intc, omap3630_sdma_irq[j]));
++    }
++    for (int i = 0; i < OMAP3630_NUM_MMC; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->mmc[i]), errp)) {
++            return;
++        }
++        omap3630_map(SYS_BUS_DEVICE(&s->mmc[i]), 0, omap3630_mmc_addr[i]);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->mmc[i]), 0,
++                           qdev_get_gpio_in(intc, omap3630_mmc_irq[i]));
++        for (int k = 0; k < 2; k++) {
++            qdev_connect_gpio_out_named(DEVICE(&s->mmc[i]), OMAP3_HSMMC_DMA, k,
++                qdev_get_gpio_in(DEVICE(&s->sdma), omap3630_mmc_dma[i][k]));
++        }
++    }
++    for (int i = 0; i < OMAP3630_NUM_MCSPI; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->mcspi[i]), errp)) {
++            return;
++        }
++        omap3630_map(SYS_BUS_DEVICE(&s->mcspi[i]), 0, omap3630_mcspi_addr[i]);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->mcspi[i]), 0,
++                           qdev_get_gpio_in(intc, omap3630_mcspi_irq[i]));
++        for (int k = 0; k < 2 * OMAP3_MCSPI_CHANNELS; k++) {
++            if (omap3630_mcspi_dma[i][k]) {
++                qdev_connect_gpio_out_named(DEVICE(&s->mcspi[i]),
++                    OMAP3_MCSPI_DMA, k,
++                    qdev_get_gpio_in(DEVICE(&s->sdma),
++                                     omap3630_mcspi_dma[i][k]));
++            }
++        }
++    }
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dss), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(&s->dss), 0, OMAP3630_DSS_ADDR);
++    omap3630_map(SYS_BUS_DEVICE(&s->dss), 1, OMAP3630_DSI_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->dss), 0,
++                       qdev_get_gpio_in(intc, OMAP3630_DSS_IRQ));
++    if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(s->wdt2), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(s->wdt2), 0, OMAP3630_WDT2_ADDR);
++    if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(s->musb), errp)) {
++        return;
++    }
++    omap3630_map(SYS_BUS_DEVICE(s->musb), 0, OMAP3630_MUSB_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(s->musb), 0,
++                       qdev_get_gpio_in(intc, OMAP3630_MUSB_IRQ));
++
++    /* The rest of the interconnect: reads as zero, logged with -d unimp. */
++    create_unimplemented_device("omap3630.secure-rom", 0x40000000, 0x14000);
++    create_unimplemented_device("omap3630.l3", 0x68000000, 16 * MiB);
++    create_unimplemented_device("omap3630.l4-core", 0x48000000, 16 * MiB);
++    create_unimplemented_device("omap3630.l4-per", 0x49000000, 1 * MiB);
++    /* The SDRC's 1 GiB: where no SDRAM is fitted, accesses do not fault
++     * (U-Boot's mem_ok() probes chip select 1 with a test pattern). */
++    create_unimplemented_device("omap3630.sdrc-unpopulated",
++                                OMAP3630_SDRAM_ADDR, 1 * GiB);
++}
++
++static void omap3630_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = omap3630_realize;
++    dc->desc = "TI OMAP3630 / AM3703 SoC";
++    dc->user_creatable = false;
++}
++
++static const TypeInfo omap3630_info = {
++    .name = TYPE_OMAP3630,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(Omap3630State),
++    .instance_init = omap3630_init,
++    .class_init = omap3630_class_init,
++};
++
++static void omap3630_register_types(void)
++{
++    type_register_static(&omap3630_info);
++}
++
++type_init(omap3630_register_types)
+-- 
+2.55.0
+

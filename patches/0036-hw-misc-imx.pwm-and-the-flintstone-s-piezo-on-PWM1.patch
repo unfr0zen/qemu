@@ -1,0 +1,469 @@
+From a91e3db1f6b8fd58a9a308ed6225d82a151b0cf4 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 21:30:01 -0400
+Subject: [PATCH 36/36] hw/misc: imx.pwm, and the flintstone's piezo on PWM1
+
+The Display-3.4 clicks through a piezo on PWM1 (fdt pwm-beeper, enable
+on GPIO1_IO05, active low): nlclient plays a click as a 2 kHz tone for
+3 ms (product.config clickfrequency/clickduration), through the input
+driver onto pwm-imx. PWM1-4 were an unimplemented region, so the driver
+wrote into nothing and the unit was silent.
+
+Model the i.MX27-style PWM the 4.1 pwm-imx v2 path programs: PWMCR (a
+software reset completes before the next read), PWMSR (the sample FIFO
+takes each write at once, so it reads empty), PWMIR, PWMSAR, PWMPR. Its
+"tone" output carries the frequency the pin toggles at, clock /
+(prescaler + 1) / (period + 2), 0 while it is still; the clock is the
+kernel's perclk, the 24 MHz oscillator. PWM1-4 join the i.MX6SX; 5-8
+stay unimplemented.
+
+flintstone.board reports PWM1 as BEEPER (the level in Hz, guest-time
+stamped, so a listener can play a click for exactly as long) and the
+enable as BEEPER-EN.
+---
+ hw/arm/flintstone.c               |   8 ++
+ hw/arm/flintstone_board.c         |  20 +++
+ hw/arm/fsl-imx6sx.c               |  14 +-
+ hw/misc/imx_pwm.c                 | 204 ++++++++++++++++++++++++++++++
+ hw/misc/meson.build               |   1 +
+ include/hw/arm/flintstone_board.h |   4 +
+ include/hw/arm/fsl-imx6sx.h       |   3 +
+ include/hw/misc/imx_pwm.h         |  29 +++++
+ 8 files changed, 282 insertions(+), 1 deletion(-)
+ create mode 100644 hw/misc/imx_pwm.c
+ create mode 100644 include/hw/misc/imx_pwm.h
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 3bca755..59af276 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -431,6 +431,14 @@ static void flintstone_init(MachineState *machine)
+                                            FLINTSTONE_BOARD_IN_POWEROFF));
+     flintstone_init_wifi(soc, board);
+     flintstone_init_ncp(soc);
++    /* The piezo: pwm-beeper on PWM1, its enable on GPIO1_IO05. */
++    qdev_connect_gpio_out_named(DEVICE(&FSL_IMX6SX(soc)->pwm[0]), "tone", 0,
++                                qdev_get_gpio_in_named(board,
++                                                       FLINTSTONE_BOARD_BEEPER,
++                                                       0));
++    qdev_connect_gpio_out(gpio1, 5,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_BEEPER_ENABLE));
+     /* The panel backlight driver, i2c2 0x63 (the DT's lm3695@63). */
+     i2c_slave_create_simple(FSL_IMX6SX(soc)->i2c[1].bus, "lm3695", 0x63);
+     qdev_connect_gpio_out(gpio7, 2, qdev_get_gpio_in(hall_split, 0));
+diff --git a/hw/arm/flintstone_board.c b/hw/arm/flintstone_board.c
+index 25a2e9d..2000e97 100644
+--- a/hw/arm/flintstone_board.c
++++ b/hw/arm/flintstone_board.c
+@@ -15,12 +15,17 @@
+  *   WIFI-RESET  (GPIO1_IO04) the Broadcom wifi module's reset line.
+  *   HALL-ENABLE (GPIO7_IO02) the wheel's Hall sensor power (active low).
+  *   VBATT-EN    (GPIO6_IO16) the battery divider's ADC input enable.
++ *   BEEPER-EN   (GPIO1_IO05) the piezo's enable (pwm-beeper, active low).
++ *   BEEPER      (PWM1) the piezo's drive, as the frequency PWM1 runs at:
++ *               pwm-beeper plays a click as 2 kHz for 3 ms.
+  *
+  * Lines out, one per change, stamped with guest time in microseconds
+  * (level in permille, 0 and 1000 — the lines are plain GPIO):
+  *
+  *   POWEROFF out 1000 1234567   firmware is powering the board off
+  *   HU-BUTTON in 1000 1234567   the button level the SoC sees
++ *   BEEPER out 2000 1234567     the piezo is driven at 2000 Hz (0: still;
++ *                               the level is in Hz for this one)
+  *
+  * Lines in:
+  *
+@@ -50,6 +55,7 @@ static const char *const flintstone_board_in_names[FLINTSTONE_BOARD_IN] = {
+     "WIFI-RESET",
+     "HALL-ENABLE",
+     "VBATT-EN",
++    "BEEPER-EN",
+ };
+ 
+ struct FlintstoneBoardState {
+@@ -66,6 +72,7 @@ struct FlintstoneBoardState {
+     bool button_level;
+ 
+     bool lines[FLINTSTONE_BOARD_IN];
++    int beeper_hz;
+ };
+ 
+ static void board_send_line(FlintstoneBoardState *s, const char *line)
+@@ -133,6 +140,7 @@ static void board_command(FlintstoneBoardState *s, const char *line)
+             board_emit(s, flintstone_board_in_names[i], 'o',
+                        s->lines[i] ? 1000 : 0);
+         }
++        board_emit(s, "BEEPER", 'o', s->beeper_hz);
+         return;
+     }
+     if ((!strcmp(argv[0], "set") || !strcmp(argv[0], "hold")) &&
+@@ -197,6 +205,16 @@ static void flintstone_board_gpio_in(void *opaque, int line, int level)
+     board_set_line(s, line, level != 0);
+ }
+ 
++static void flintstone_board_beeper(void *opaque, int n, int hz)
++{
++    FlintstoneBoardState *s = opaque;
++
++    if (hz != s->beeper_hz) {
++        s->beeper_hz = hz;
++        board_emit(s, "BEEPER", 'o', hz);
++    }
++}
++
+ static void flintstone_board_reset(DeviceState *dev)
+ {
+     FlintstoneBoardState *s = FLINTSTONE_BOARD(dev);
+@@ -216,6 +234,8 @@ static void flintstone_board_realize(DeviceState *dev, Error **errp)
+ 
+     qdev_init_gpio_out(dev, &s->button, 1);
+     qdev_init_gpio_in(dev, flintstone_board_gpio_in, FLINTSTONE_BOARD_IN);
++    qdev_init_gpio_in_named(dev, flintstone_board_beeper,
++                            FLINTSTONE_BOARD_BEEPER, 1);
+ 
+     s->cmd = g_string_new(NULL);
+     s->hold = timer_new_ns(QEMU_CLOCK_VIRTUAL, flintstone_board_hold_end, s);
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+index f04fc90..b4163bf 100644
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -51,7 +51,6 @@ static const struct {
+ } fsl_imx6sx_unimplemented[] = {
+     /* AIPS1 */
+     { FSL_IMX6SX_LPM_SRAM_ADDR, FSL_IMX6SX_LPM_SRAM_SIZE, "lpm-sram" },
+-    { FSL_IMX6SX_PWM1_ADDR,  0x4000 * 4,            "pwm1-4" },
+     { FSL_IMX6SX_CAN1_ADDR,  0x8000,                "flexcan1-2" },
+     { FSL_IMX6SX_ANATOP_ADDR, FSL_IMX6SX_ANATOP_SIZE, "anatop" },
+     { FSL_IMX6SX_GPC_ADDR,   0x4000,                "gpc" },
+@@ -92,6 +91,10 @@ static void fsl_imx6sx_init(Object *obj)
+     object_initialize_child(obj, "gpmi", &s->gpmi, TYPE_IMX_GPMI_NAND);
+ 
+     object_initialize_child(obj, "sdma", &s->sdma, TYPE_IMX6_SDMA);
++    for (i = 0; i < FSL_IMX6SX_NUM_PWMS; i++) {
++        snprintf(name, NAME_SIZE, "pwm%d", i + 1);
++        object_initialize_child(obj, name, &s->pwm[i], TYPE_IMX_PWM);
++    }
+     object_initialize_child(obj, "mmdc", &s->mmdc, TYPE_IMX6_MMDC);
+     object_initialize_child(obj, "lcdif", &s->lcdif, TYPE_IMX_LCDIF);
+     for (i = 0; i < FSL_IMX6SX_NUM_ADCS; i++) {
+@@ -255,6 +258,15 @@ static void fsl_imx6sx_realize(DeviceState *dev, Error **errp)
+     sysbus_realize(SYS_BUS_DEVICE(&s->mmdc), &error_abort);
+     sysbus_mmio_map(SYS_BUS_DEVICE(&s->mmdc), 0, FSL_IMX6SX_MMDC_ADDR);
+ 
++    /* PWM1-4: each reports its output's frequency on its "tone" line. */
++    for (i = 0; i < FSL_IMX6SX_NUM_PWMS; i++) {
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwm[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwm[i]), 0,
++                        FSL_IMX6SX_PWM1_ADDR + i * 0x4000);
++    }
++
+     /* Initialize all UARTs */
+     {
+         static const struct {
+diff --git a/hw/misc/imx_pwm.c b/hw/misc/imx_pwm.c
+new file mode 100644
+index 0000000..533cadf
+--- /dev/null
++++ b/hw/misc/imx_pwm.c
+@@ -0,0 +1,204 @@
++/*
++ * i.MX PWM — the i.MX27-style block of the i.MX6 (PWM1-4 at 0x02080000).
++ *
++ * The Nest Display-3.4 drives its piezo from PWM1 through the kernel's
++ * pwm-beeper: a click is a 2 kHz square wave for 3 ms (product.config's
++ * clickfrequency and clickduration). The model keeps the registers the
++ * 4.1 pwm-imx driver programs (its v2 path) and reports what the pin does:
++ * the output's frequency in Hz on the "tone" line, 0 while it is still,
++ * so the board can make the sound outside the guest.
++ *
++ * The sample FIFO takes each PWMSAR write at once, so it always reads
++ * empty (FIFOAV 0, FE set) and the driver never waits for a slot; a
++ * software reset (PWMCR.SWR) completes before the next read. The counter
++ * isn't run and no interrupt is raised: nothing on this board uses them.
++ *
++ * Drivers/dt: drivers/pwm/pwm-imx.c v4.1 (MX3_PWM*), drivers/input/misc/
++ * pwm-beeper.c, arch/arm/boot/dts/imx6sx.dtsi (pwm@02080000).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/imx_pwm.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define PWMCR   0x00
++#define PWMSR   0x04
++#define PWMIR   0x08
++#define PWMSAR  0x0c
++#define PWMPR   0x10
++#define PWMCNR  0x14
++
++#define PWMCR_EN            BIT(0)
++#define PWMCR_SWR           BIT(3)
++#define PWMCR_PRESCALER(cr) (((cr) >> 4) & 0xfff)
++#define PWMCR_CLKSRC(cr)    (((cr) >> 16) & 3)
++
++#define PWMSR_FE            BIT(3)
++#define PWMSR_W1C           (0x78)      /* FE, ROV, CMP, FWE */
++
++static void imx_pwm_update(IMXPWMState *s)
++{
++    uint32_t period = (s->pr & 0xffff) + 2;
++    int hz = 0;
++
++    /*
++     * Running from a clock (CLKSRC 0 is "off") with a duty cycle that
++     * leaves both levels on the pin: a square wave at clock /
++     * (prescaler + 1) / (period + 2).
++     */
++    if ((s->cr & PWMCR_EN) && PWMCR_CLKSRC(s->cr) && s->sar &&
++        s->sar < period) {
++        hz = s->clock_frequency / (PWMCR_PRESCALER(s->cr) + 1) / period;
++    }
++    if (hz != s->hz) {
++        s->hz = hz;
++        qemu_set_irq(s->tone, hz);
++    }
++}
++
++static void imx_pwm_soft_reset(IMXPWMState *s)
++{
++    s->cr = 0;
++    s->ir = 0;
++    s->sar = 0;
++    s->pr = 0xfffe;
++    s->sr = 0;
++}
++
++static uint64_t imx_pwm_read(void *opaque, hwaddr off, unsigned size)
++{
++    IMXPWMState *s = IMX_PWM(opaque);
++
++    switch (off) {
++    case PWMCR:
++        return s->cr;
++    case PWMSR:
++        return s->sr | PWMSR_FE;            /* FIFOAV 0: the FIFO is empty */
++    case PWMIR:
++        return s->ir;
++    case PWMSAR:
++        return s->sar;
++    case PWMPR:
++        return s->pr;
++    case PWMCNR:
++        return 0;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "imx.pwm: bad read at 0x%" HWADDR_PRIx
++                      "\n", off);
++        return 0;
++    }
++}
++
++static void imx_pwm_write(void *opaque, hwaddr off, uint64_t val,
++                          unsigned size)
++{
++    IMXPWMState *s = IMX_PWM(opaque);
++
++    switch (off) {
++    case PWMCR:
++        if (val & PWMCR_SWR) {
++            imx_pwm_soft_reset(s);          /* done before the next read */
++        } else {
++            s->cr = val & 0x0ffffff7;
++        }
++        break;
++    case PWMSR:
++        s->sr &= ~(val & PWMSR_W1C);
++        break;
++    case PWMIR:
++        s->ir = val & 7;
++        break;
++    case PWMSAR:
++        s->sar = val & 0xffff;
++        break;
++    case PWMPR:
++        s->pr = val & 0xffff;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "imx.pwm: bad write at 0x%" HWADDR_PRIx
++                      "\n", off);
++        return;
++    }
++    imx_pwm_update(s);
++}
++
++static const MemoryRegionOps imx_pwm_ops = {
++    .read = imx_pwm_read,
++    .write = imx_pwm_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void imx_pwm_reset(DeviceState *dev)
++{
++    IMXPWMState *s = IMX_PWM(dev);
++
++    imx_pwm_soft_reset(s);
++    imx_pwm_update(s);
++}
++
++static void imx_pwm_init(Object *obj)
++{
++    IMXPWMState *s = IMX_PWM(obj);
++
++    memory_region_init_io(&s->iomem, obj, &imx_pwm_ops, s, TYPE_IMX_PWM,
++                          0x4000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->tone, "tone", 1);
++}
++
++static const VMStateDescription vmstate_imx_pwm = {
++    .name = TYPE_IMX_PWM,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(cr, IMXPWMState),
++        VMSTATE_UINT32(sr, IMXPWMState),
++        VMSTATE_UINT32(ir, IMXPWMState),
++        VMSTATE_UINT32(sar, IMXPWMState),
++        VMSTATE_UINT32(pr, IMXPWMState),
++        VMSTATE_INT32(hz, IMXPWMState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static const Property imx_pwm_properties[] = {
++    /*
++     * What the PWM counts (the clock its CLKSRC selects): on this board
++     * the kernel's perclk, the 24 MHz oscillator.
++     */
++    DEFINE_PROP_UINT32("clock-frequency", IMXPWMState, clock_frequency,
++                       24000000),
++};
++
++static void imx_pwm_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    device_class_set_legacy_reset(dc, imx_pwm_reset);
++    device_class_set_props(dc, imx_pwm_properties);
++    dc->vmsd = &vmstate_imx_pwm;
++    dc->desc = "i.MX PWM";
++}
++
++static const TypeInfo imx_pwm_info = {
++    .name = TYPE_IMX_PWM,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMXPWMState),
++    .instance_init = imx_pwm_init,
++    .class_init = imx_pwm_class_init,
++};
++
++static void imx_pwm_register_types(void)
++{
++    type_register_static(&imx_pwm_info);
++}
++
++type_init(imx_pwm_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index c40767c..5bd9086 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -72,6 +72,7 @@ system_ss.add(when: 'CONFIG_IMX', if_true: files(
+   'imx_gpmi_nand.c',
+   'imx6_mmdc.c',
+   'imx6_sdma.c',
++  'imx_pwm.c',
+   'imx_rngc.c',
+ ))
+ system_ss.add(when: 'CONFIG_MAX78000_AES', if_true: files('max78000_aes.c'))
+diff --git a/include/hw/arm/flintstone_board.h b/include/hw/arm/flintstone_board.h
+index 0824c79..7abd336 100644
+--- a/include/hw/arm/flintstone_board.h
++++ b/include/hw/arm/flintstone_board.h
+@@ -21,7 +21,11 @@ enum {
+     FLINTSTONE_BOARD_IN_WIFI_RESET,     /* GPIO1_IO04, brcm wifi reset */
+     FLINTSTONE_BOARD_IN_HALL_ENABLE,    /* GPIO7_IO02, wheel hall power */
+     FLINTSTONE_BOARD_IN_VBATT_ENABLE,   /* GPIO6_IO16, battery divider */
++    FLINTSTONE_BOARD_IN_BEEPER_ENABLE,  /* GPIO1_IO05, piezo enable */
+     FLINTSTONE_BOARD_IN
+ };
+ 
++/* The piezo's drive: PWM1's frequency in Hz (0 = still), a named input. */
++#define FLINTSTONE_BOARD_BEEPER "beeper"
++
+ #endif /* HW_ARM_FLINTSTONE_BOARD_H */
+diff --git a/include/hw/arm/fsl-imx6sx.h b/include/hw/arm/fsl-imx6sx.h
+index cf7d579..eb4c5c7 100644
+--- a/include/hw/arm/fsl-imx6sx.h
++++ b/include/hw/arm/fsl-imx6sx.h
+@@ -33,6 +33,7 @@
+ #include "hw/misc/imx_gpmi_nand.h"
+ #include "hw/misc/imx6_mmdc.h"
+ #include "hw/misc/imx6_sdma.h"
++#include "hw/misc/imx_pwm.h"
+ #include "hw/cpu/a9mpcore.h"
+ #include "hw/gpio/imx_gpio.h"
+ #include "hw/i2c/imx_i2c.h"
+@@ -103,6 +104,7 @@ DECLARE_INSTANCE_CHECKER(FslIMX6SXState, FSL_IMX6SX, TYPE_FSL_IMX6SX)
+ #define FSL_IMX6SX_PWM2_ADDR        0x02084000
+ #define FSL_IMX6SX_PWM3_ADDR        0x02088000
+ #define FSL_IMX6SX_PWM4_ADDR        0x0208C000
++#define FSL_IMX6SX_NUM_PWMS         4           /* PWM1-4; 5-8 unmodelled */
+ #define FSL_IMX6SX_CAN1_ADDR        0x02090000
+ #define FSL_IMX6SX_CAN2_ADDR        0x02094000
+ #define FSL_IMX6SX_GPT_ADDR         0x02098000
+@@ -255,6 +257,7 @@ struct FslIMX6SXState {
+     ImxGpmiNandState gpmi;
+ 
+     Imx6SdmaState sdma;
++    IMXPWMState pwm[FSL_IMX6SX_NUM_PWMS];
+     Imx6MmdcState mmdc;
+     ImxLcdifState lcdif;
+     Imx6AdcState adc[2];
+diff --git a/include/hw/misc/imx_pwm.h b/include/hw/misc/imx_pwm.h
+new file mode 100644
+index 0000000..8459c06
+--- /dev/null
++++ b/include/hw/misc/imx_pwm.h
+@@ -0,0 +1,29 @@
++/*
++ * i.MX PWM (the i.MX27-style block of the i.MX6), see imx_pwm.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_IMX_PWM_H
++#define HW_MISC_IMX_PWM_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_IMX_PWM "imx.pwm"
++OBJECT_DECLARE_SIMPLE_TYPE(IMXPWMState, IMX_PWM)
++
++struct IMXPWMState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq tone;              /* the output's frequency in Hz, 0 = still */
++    int32_t hz;
++
++    uint32_t cr, ir, sar, pr;
++    uint32_t sr;                /* the W1C status flags */
++
++    uint32_t clock_frequency;   /* the rate of the clock it counts */
++};
++
++#endif /* HW_MISC_IMX_PWM_H */
+-- 
+2.55.0
+

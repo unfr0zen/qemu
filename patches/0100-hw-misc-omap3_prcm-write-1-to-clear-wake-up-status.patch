@@ -1,0 +1,43 @@
+From 8ba5d20c9d18464eb3bd795f46cac80da8399df8 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 00:21:32 -0400
+Subject: [PATCH] hw/misc: omap3_prcm: write-1-to-clear wake-up status
+
+PM_WKST1/PM_WKST3 were stored as written, so Linux's clear set them and every
+idle saw a UART wake-up.
+---
+ hw/misc/omap3_prcm.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/hw/misc/omap3_prcm.c b/hw/misc/omap3_prcm.c
+index 610d216..df425ad 100644
+--- a/hw/misc/omap3_prcm.c
++++ b/hw/misc/omap3_prcm.c
+@@ -233,6 +233,8 @@ static void cm_class_init(ObjectClass *klass, const void *data)
+ #define PM_PWSTST               0xe4
+ #define PM_PREPWSTST            0xe8
+ #define RM_RSTST                0x58
++#define PM_WKST1                0xb0
++#define PM_WKST3                0xb8
+ 
+ #define PRM_CLKSEL_19M2         2
+ #define VC_BYPASS_VALID         (1 << 24)
+@@ -289,7 +291,14 @@ static void prm_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+         }
+         return;
+     }
+-    if ((addr < 0x1200 || addr >= 0x1300) && (addr & 0xff) == RM_RSTST) {
++    /*
++     * RM_RSTST and the wake-up status (PM_WKST*) are write-1-to-clear: Linux
++     * clears a UART's wake-up bit after each idle, and one read back set
++     * keeps the UART from sleeping, so the idle loop never reaches WFI.
++     */
++    if ((addr < 0x1200 || addr >= 0x1300) &&
++        ((addr & 0xff) == RM_RSTST || (addr & 0xff) == PM_WKST1 ||
++         (addr & 0xff) == PM_WKST3)) {
+         s->regs[addr / 4] &= ~val;
+         return;
+     }
+-- 
+2.56.0
+

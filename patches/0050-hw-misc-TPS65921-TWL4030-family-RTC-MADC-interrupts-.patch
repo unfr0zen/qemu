@@ -1,0 +1,418 @@
+From e4eb3479de9cca35cc7fffc9ccf44f66b0331054 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 50/91] hw/misc: TPS65921 (TWL4030 family): RTC, MADC,
+ interrupts, power button, power-off
+
+---
+ hw/misc/tps65921.c | 398 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 398 insertions(+)
+ create mode 100644 hw/misc/tps65921.c
+
+diff --git a/hw/misc/tps65921.c b/hw/misc/tps65921.c
+new file mode 100644
+index 0000000..4b81892
+--- /dev/null
++++ b/hw/misc/tps65921.c
+@@ -0,0 +1,398 @@
++/*
++ * TI TPS65921 power management companion (TWL4030 family)
++ *
++ * Four I2C slaves share the chip: 0x48 holds the USB PHY, 0x49 the
++ * interrupt bridge, GPIO and the primary interrupt handler, 0x4a the
++ * keypad, MADC and PWMs, 0x4b the power management, backup and RTC
++ * registers. Each is 256 registers behind an auto-incrementing pointer,
++ * the first byte of a write.
++ *
++ * Modelled behaviour: the USB PHY's DPLL clock reports running; the RTC
++ * keeps the host's time (QEMU's -rtc base) plus whatever the guest sets,
++ * latched into the time registers by RTC_CTRL.GET_TIME and taken back when
++ * the guest restarts it after writing them; the MADC's software
++ * conversions (SW1, SW2) complete at once, each selected channel's input
++ * (QOM "adcinN-mv", in mV at the channel's input, before its prescaler)
++ * becoming the 10-bit code, full scale 1.5 V after the prescaler; P1_SW_EVENTS.DEVOFF (Linux's
++ * twl4030_poweroff) switches the board off: the emulation ends.
++ *
++ * Interrupts: the power module's secondary handler (PWR_ISR1/IMR1, edge
++ * selection in PWR_EDR1, clear-on-read when PWR_SIH_CTRL.COR is set, as
++ * Linux sets it) feeds the primary handler's PIH_ISR_P1 bit 5, which
++ * drives SYS_NIRQ. Its one source is PWRON, the power button pin (GPIO
++ * input 0, or the QOM "pwron" property); STS_HW_CONDITIONS.STS_PWON reads
++ * the pin.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/tps65921.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qemu/bcd.h"
++#include "qemu/cutils.h"
++#include "qemu/module.h"
++#include "system/rtc.h"
++#include "system/runstate.h"
++
++/* ID 0 (0x48) */
++#define USB_PHY_CLK_CTRL_STS    0xff
++#define USB_PHY_DPLL_CLK        0x01
++
++/* ID 3 (0x4b) */
++#define RTC_SECONDS             0x1c
++#define RTC_CTRL                0x29
++#define RTC_STATUS              0x2a
++#define RTC_CTRL_STOP_RTC       0x01    /* 1: running */
++#define RTC_CTRL_GET_TIME       0x40
++#define RTC_STATUS_RUN          0x02
++#define PM_P1_SW_EVENTS         0x46    /* PM_MASTER 0x36 + 0x10 */
++#define PM_DEVOFF               0x01
++#define PM_STS_HW_CONDITIONS    0x45    /* PM_MASTER 0x36 + 0x0f */
++#define STS_PWON                0x01
++
++/* ID 3: the power module's secondary interrupt handler (INT base 0x2e) */
++#define PWR_ISR1                0x2e
++#define PWR_IMR1                0x2f
++#define PWR_EDR1                0x33
++#define PWR_SIH_CTRL            0x35
++#define SIH_CTRL_COR            0x04
++#define PWR_PWRON               0x01
++
++/* ID 1: the primary interrupt handler (PIH base 0x80) */
++#define PIH_ISR_P1              0x81
++#define PIH_POWER               (1 << 5)
++
++/* ID 2 (0x4a): MADC */
++#define MADC_SW1SELECT_LSB      0x06
++#define MADC_SW2SELECT_LSB      0x0a
++#define MADC_CTRL_SW1           0x12
++#define MADC_CTRL_SW2           0x13
++#define MADC_GPCH0_LSB          0x37
++#define MADC_EOC_SW             0x02
++#define MADC_SW_START           0x20
++
++/* each channel's prescaler, numerator/denominator, as the driver scales */
++static const uint8_t madc_ratio[16][2] = {
++    { 1, 1 }, { 1, 1 }, { 6, 10 }, { 6, 10 }, { 6, 10 }, { 6, 10 },
++    { 6, 10 }, { 6, 10 }, { 3, 14 }, { 1, 3 }, { 1, 1 }, { 15, 100 },
++    { 1, 4 }, { 1, 1 }, { 1, 1 }, { 5, 11 },
++};
++
++static void tps_madc_convert(Tps65921State *s, uint8_t ctrl)
++{
++    uint8_t *r = s->regs[2];
++    uint8_t sel = ctrl == MADC_CTRL_SW1 ? MADC_SW1SELECT_LSB : MADC_SW2SELECT_LSB;
++    uint16_t channels = r[sel] | r[sel + 1] << 8;
++
++    for (int i = 0; i < 16; i++) {
++        uint64_t code;
++
++        if (!(channels & (1 << i))) {
++            continue;
++        }
++        code = (uint64_t)s->adcin_mv[i] * 1023 * madc_ratio[i][0] /
++               (1500 * madc_ratio[i][1]);
++        code = MIN(code, 1023);
++        r[MADC_GPCH0_LSB + 2 * i] = (code & 3) << 6;
++        r[MADC_GPCH0_LSB + 2 * i + 1] = code >> 2;
++    }
++    r[ctrl] = MADC_EOC_SW;              /* done, not busy */
++}
++
++static void tps_rtc_latch(Tps65921State *s)
++{
++    struct tm tm;
++    uint8_t *r = &s->regs[3][RTC_SECONDS];
++
++    qemu_get_timedate(&tm, s->rtc_offset);
++    r[0] = to_bcd(tm.tm_sec);
++    r[1] = to_bcd(tm.tm_min);
++    r[2] = to_bcd(tm.tm_hour);
++    r[3] = to_bcd(tm.tm_mday);
++    r[4] = to_bcd(tm.tm_mon + 1);
++    r[5] = to_bcd(tm.tm_year % 100);
++    r[6] = to_bcd(tm.tm_wday);
++}
++
++static void tps_rtc_set(Tps65921State *s)
++{
++    const uint8_t *r = &s->regs[3][RTC_SECONDS];
++    struct tm tm = {
++        .tm_sec = from_bcd(r[0]),
++        .tm_min = from_bcd(r[1]),
++        .tm_hour = from_bcd(r[2] & 0x3f),
++        .tm_mday = from_bcd(r[3]),
++        .tm_mon = from_bcd(r[4]) - 1,
++        .tm_year = from_bcd(r[5]) + 100,
++    };
++
++    s->rtc_offset = qemu_timedate_diff(&tm);
++}
++
++static uint8_t tps_pwr_isr(Tps65921State *s)
++{
++    return s->pwr_pending & ~s->regs[3][PWR_IMR1];
++}
++
++static void tps_update_irq(Tps65921State *s)
++{
++    qemu_set_irq(s->irq, !!tps_pwr_isr(s));
++}
++
++static void tps_set_pwron(void *opaque, int n, int level)
++{
++    Tps65921State *s = opaque;
++    uint8_t edr = s->regs[3][PWR_EDR1];
++
++    if (s->pwron == !!level) {
++        return;
++    }
++    s->pwron = level;
++    /* PWRON's edge bits: falling at bit 0, rising at bit 1 */
++    if (edr & (level ? 0x02 : 0x01)) {
++        s->pwr_pending |= PWR_PWRON;
++    }
++    tps_update_irq(s);
++}
++
++static uint8_t tps_read(Tps65921State *s, int id, uint8_t reg)
++{
++    uint8_t isr;
++
++    if (id == 1 && reg == PIH_ISR_P1) {
++        return tps_pwr_isr(s) ? PIH_POWER : 0;
++    }
++    if (id == 3 && reg == PWR_ISR1) {
++        isr = tps_pwr_isr(s);
++        if (s->regs[3][PWR_SIH_CTRL] & SIH_CTRL_COR) {
++            s->pwr_pending &= ~isr;
++            tps_update_irq(s);
++        }
++        return isr;
++    }
++    if (id == 3 && reg == PM_STS_HW_CONDITIONS) {
++        return s->regs[3][reg] | (s->pwron ? STS_PWON : 0);
++    }
++    if (id == 0 && reg == USB_PHY_CLK_CTRL_STS) {
++        return USB_PHY_DPLL_CLK;
++    }
++    if (id == 3 && reg == RTC_STATUS) {
++        return (s->regs[3][RTC_CTRL] & RTC_CTRL_STOP_RTC) ? RTC_STATUS_RUN : 0;
++    }
++    return s->regs[id][reg];
++}
++
++static void tps_write(Tps65921State *s, int id, uint8_t reg, uint8_t val)
++{
++    uint8_t old = s->regs[id][reg];
++
++    if (id == 3 && reg == PWR_ISR1) {
++        if (!(s->regs[3][PWR_SIH_CTRL] & SIH_CTRL_COR)) {
++            s->pwr_pending &= ~val;
++            tps_update_irq(s);
++        }
++        return;
++    }
++    s->regs[id][reg] = val;
++    if (id == 3 && reg == PWR_IMR1) {
++        tps_update_irq(s);
++    }
++    if (id == 2 && (reg == MADC_CTRL_SW1 || reg == MADC_CTRL_SW2) &&
++        (val & MADC_SW_START)) {
++        tps_madc_convert(s, reg);
++    }
++    if (id == 3 && reg == PM_P1_SW_EVENTS && (val & PM_DEVOFF)) {
++        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++    }
++    if (id == 3 && reg == RTC_CTRL) {
++        if (val & RTC_CTRL_GET_TIME) {
++            tps_rtc_latch(s);
++        }
++        if ((val & RTC_CTRL_STOP_RTC) && !(old & RTC_CTRL_STOP_RTC)) {
++            tps_rtc_set(s);
++        }
++    }
++}
++
++static int tps_event(Tps65921State *s, int id, enum i2c_event event)
++{
++    if (event == I2C_START_SEND) {
++        s->slave[id].addressed = false;
++    }
++    return 0;
++}
++
++static int tps_send(Tps65921State *s, int id, uint8_t data)
++{
++    Tps65921Slave *sl = &s->slave[id];
++
++    if (!sl->addressed) {
++        sl->ptr = data;
++        sl->addressed = true;
++    } else {
++        tps_write(s, id, sl->ptr++, data);
++    }
++    return 0;
++}
++
++static uint8_t tps_recv(Tps65921State *s, int id)
++{
++    return tps_read(s, id, s->slave[id].ptr++);
++}
++
++static int tps_core_event(I2CSlave *i2c, enum i2c_event event)
++{
++    return tps_event(TPS65921(i2c), 0, event);
++}
++
++static int tps_core_send(I2CSlave *i2c, uint8_t data)
++{
++    return tps_send(TPS65921(i2c), 0, data);
++}
++
++static uint8_t tps_core_recv(I2CSlave *i2c)
++{
++    return tps_recv(TPS65921(i2c), 0);
++}
++
++static int tps_sub_event(I2CSlave *i2c, enum i2c_event event)
++{
++    Tps65921SubState *sub = TPS65921_SUB(i2c);
++
++    return tps_event(sub->core, sub->id, event);
++}
++
++static int tps_sub_send(I2CSlave *i2c, uint8_t data)
++{
++    Tps65921SubState *sub = TPS65921_SUB(i2c);
++
++    return tps_send(sub->core, sub->id, data);
++}
++
++static uint8_t tps_sub_recv(I2CSlave *i2c)
++{
++    Tps65921SubState *sub = TPS65921_SUB(i2c);
++
++    return tps_recv(sub->core, sub->id);
++}
++
++static void tps_reset(DeviceState *dev)
++{
++    Tps65921State *s = TPS65921(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->slave, 0, sizeof(s->slave));
++    s->regs[3][RTC_CTRL] = RTC_CTRL_STOP_RTC;   /* running from power-on */
++    s->regs[3][PWR_IMR1] = 0xff;
++    s->pwr_pending = 0;
++    tps_update_irq(s);
++}
++
++static void tps_realize(DeviceState *dev, Error **errp)
++{
++    Tps65921State *s = TPS65921(dev);
++    I2CBus *bus = I2C_BUS(qdev_get_parent_bus(dev));
++
++    for (int i = 1; i < TPS65921_NUM_ID; i++) {
++        DeviceState *sub = qdev_new(TYPE_TPS65921_SUB);
++
++        qdev_prop_set_uint8(sub, "address", TPS65921_ADDR + i);
++        s->sub[i - 1] = TPS65921_SUB(sub);
++        s->sub[i - 1]->core = s;
++        s->sub[i - 1]->id = i;
++        if (!qdev_realize_and_unref(sub, BUS(bus), errp)) {
++            return;
++        }
++    }
++}
++
++static bool tps_get_pwron(Object *obj, Error **errp)
++{
++    return TPS65921(obj)->pwron;
++}
++
++static void tps_prop_set_pwron(Object *obj, bool value, Error **errp)
++{
++    tps_set_pwron(obj, 0, value);
++}
++
++static void tps_init(Object *obj)
++{
++    Tps65921State *s = TPS65921(obj);
++
++    qdev_init_gpio_out(DEVICE(obj), &s->irq, 1);
++    qdev_init_gpio_in(DEVICE(obj), tps_set_pwron, 1);
++    for (int i = 0; i < 16; i++) {
++        g_autofree char *name = g_strdup_printf("adcin%d-mv", i);
++
++        object_property_add_uint32_ptr(obj, name, &s->adcin_mv[i],
++                                       OBJ_PROP_FLAG_READWRITE);
++    }
++    object_property_add_bool(obj, "pwron", tps_get_pwron, tps_prop_set_pwron);
++    s->adcin_mv[9] = 3000;              /* VBKB: backup battery */
++    s->adcin_mv[12] = 3900;             /* VBAT */
++}
++
++static const VMStateDescription tps_vmstate = {
++    .name = TYPE_TPS65921,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_I2C_SLAVE(parent_obj, Tps65921State),
++        VMSTATE_UINT8_2DARRAY(regs, Tps65921State, TPS65921_NUM_ID, 256),
++        VMSTATE_INT64(rtc_offset, Tps65921State),
++        VMSTATE_UINT32_ARRAY(adcin_mv, Tps65921State, 16),
++        VMSTATE_BOOL(pwron, Tps65921State),
++        VMSTATE_UINT8(pwr_pending, Tps65921State),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void tps_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    dc->realize = tps_realize;
++    device_class_set_legacy_reset(dc, tps_reset);
++    dc->vmsd = &tps_vmstate;
++    dc->desc = "TPS65921 power management companion";
++    k->event = tps_core_event;
++    k->send = tps_core_send;
++    k->recv = tps_core_recv;
++}
++
++static void tps_sub_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    dc->desc = "TPS65921 I2C ID 1-3";
++    dc->user_creatable = false;
++    k->event = tps_sub_event;
++    k->send = tps_sub_send;
++    k->recv = tps_sub_recv;
++}
++
++static const TypeInfo tps_types[] = {
++    {
++        .name = TYPE_TPS65921,
++        .parent = TYPE_I2C_SLAVE,
++        .instance_size = sizeof(Tps65921State),
++        .instance_init = tps_init,
++        .class_init = tps_class_init,
++    }, {
++        .name = TYPE_TPS65921_SUB,
++        .parent = TYPE_I2C_SLAVE,
++        .instance_size = sizeof(Tps65921SubState),
++        .class_init = tps_sub_class_init,
++    },
++};
++
++DEFINE_TYPES(tps_types)
+-- 
+2.55.0
+

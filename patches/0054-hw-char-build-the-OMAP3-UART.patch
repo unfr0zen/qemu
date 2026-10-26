@@ -1,0 +1,21 @@
+From 0e8f15b544945b2de8c81fa4d1f84fd3e076137c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 54/91] hw/char: build the OMAP3 UART
+
+---
+ hw/char/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/char/meson.build b/hw/char/meson.build
+index fc3d7ee..4c47b13 100644
+--- a/hw/char/meson.build
++++ b/hw/char/meson.build
+@@ -41,3 +41,4 @@ system_ss.add(when: 'CONFIG_GOLDFISH_TTY', if_true: files('goldfish_tty.c'))
+ 
+ specific_ss.add(when: 'CONFIG_TERMINAL3270', if_true: files('terminal3270.c'))
+ specific_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr_vty.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_uart.c'))
+-- 
+2.55.0
+

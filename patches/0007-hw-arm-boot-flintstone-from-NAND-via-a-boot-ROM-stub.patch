@@ -1,0 +1,89 @@
+From 64db8b6bdd20a64ed14ee3ead63195136f7c711f Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:27:32 -0400
+Subject: [PATCH 07/20] hw/arm: boot flintstone from NAND via a boot ROM stub
+
+A reset handler reads the firmware image from the NAND backend (mtd0
+fw1) into the address its IVT declares and starts the CPU at the entry
+point, mirroring what the real boot ROM does. The manual -device loader
+invocation is gone; run.sh only keeps the DCD clock-gate replay, which
+the stub does not apply yet.
+---
+ hw/arm/flintstone.c | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index a474260..1069746 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -24,7 +24,12 @@
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/qdev-properties-system.h"
+ #include "hw/core/sysbus.h"
++#include "hw/core/cpu.h"
++#include "system/address-spaces.h"
++#include "system/block-backend-io.h"
++#include "system/block-backend-io.h"
+ #include "system/blockdev.h"
++#include "system/reset.h"
+ #include "system/system.h"
+ #include "qemu/error-report.h"
+ #include "qemu/units.h"
+@@ -32,6 +37,40 @@
+ #define FLINTSTONE_RAM_ADDR     FSL_IMX6SX_DRAM_ADDR
+ #define FLINTSTONE_RAM_SIZE     (512 * MiB)   /* DTB: <0x80000000 0x20000000> */
+ 
++/*
++ * Boot ROM stub: on the real board the i.MX6SX boot ROM loads the NAND
++ * firmware image into DRAM per its IVT and jumps to the entry point. The
++ * image location and load/entry addresses are pinned by the stock image's
++ * own IVT (NAND mtd0 fw1: boot_data.start 0x877ff000, entry 0x87800000,
++ * size 0x61000 — see qemu/SPEC.md).
++ */
++#define FLINTSTONE_FW_NAND_OFF  0x100000
++#define FLINTSTONE_FW_SIZE      0x61000
++#define FLINTSTONE_FW_LOAD      0x877ff000
++#define FLINTSTONE_FW_ENTRY     0x87800000
++
++struct FlintstoneRomBoot {
++    BlockBackend *blk;
++};
++
++static void flintstone_rom_boot(void *opaque)
++{
++    struct FlintstoneRomBoot *rom = opaque;
++    g_autofree uint8_t *buf = g_malloc(FLINTSTONE_FW_SIZE);
++
++    /* Nothing else resets the CPU (no arm_load_kernel), so a watchdog
++     * reboot would otherwise resume with the MMU and caches still on. */
++    cpu_reset(first_cpu);
++
++    if (blk_pread(rom->blk, FLINTSTONE_FW_NAND_OFF, FLINTSTONE_FW_SIZE,
++                  buf, 0) < 0) {
++        error_report("flintstone: ROM could not read NAND firmware");
++        exit(1);
++    }
++    cpu_physical_memory_write(FLINTSTONE_FW_LOAD, buf, FLINTSTONE_FW_SIZE);
++    cpu_set_pc(first_cpu, FLINTSTONE_FW_ENTRY);
++}
++
+ static void flintstone_init(MachineState *machine)
+ {
+     DeviceState *soc;
+@@ -48,7 +87,13 @@ static void flintstone_init(MachineState *machine)
+     gpmi = DEVICE(object_resolve_path_component(OBJECT(soc), "gpmi"));
+     nand = blk_by_name("nand");
+     if (nand) {
++        struct FlintstoneRomBoot *rom = g_new(struct FlintstoneRomBoot, 1);
++
+         qdev_prop_set_drive_err(gpmi, "drive", nand, &error_fatal);
++        /* The boot ROM runs after CPU reset, so hook it as a reset
++         * handler: it loads the NAND firmware and starts the CPU. */
++        rom->blk = nand;
++        qemu_register_reset(flintstone_rom_boot, rom);
+     }
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
+ 
+-- 
+2.55.0
+

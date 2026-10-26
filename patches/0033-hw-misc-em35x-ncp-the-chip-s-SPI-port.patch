@@ -1,0 +1,336 @@
+From 19d2ffce87ec3665c4728a83af1fb339cbdc1f0a Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 20:19:46 -0400
+Subject: [PATCH 33/36] hw/misc: em35x-ncp: the chip's SPI port
+
+The EM35x's ConnectIP firmware (ip-modem-app, spi-protocol2-sc1.c) lays
+out a transaction's reply the moment nSSEL falls: 0xff (the preloaded
+data register), a header (0x31, | 0x08 on the first transactions after a
+boot), the length of what it has for the host and that much of it. A
+model on the far side of a chardev can't answer that fast, so the port
+moves into the device and the chardev carries the byte stream instead:
+the payload of the host's SPI frames out, the chip's stream in, plus the
+port's controls (up, flush on a reboot, deep sleep).
+
+nHOST_INT is low while the chip holds bytes and neither nSSEL nor nWAKE
+is asserted. Asleep, the port is off: the transaction that wakes the chip
+is lost (spi-server resends it), and a falling nWAKE wakes it with
+nHOST_INT held low until nWAKE rises. The chip's state is not the SoC's:
+a machine reset leaves it to nRESET.
+---
+ hw/misc/em35x_ncp.c | 203 +++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 174 insertions(+), 29 deletions(-)
+
+diff --git a/hw/misc/em35x_ncp.c b/hw/misc/em35x_ncp.c
+index 3cbc48e..92dd5fb 100644
+--- a/hw/misc/em35x_ncp.c
++++ b/hw/misc/em35x_ncp.c
+@@ -1,26 +1,45 @@
+ /*
+  * Silicon Labs EM35x network co-processor, as a chardev.
+  *
+- * The Nest Display-3.4 carries an EM357 (802.15.4 / Thread radio) on
+- * ECSPI3, with its chip select on a GPIO and three more lines: nRESET and
+- * nWAKE from the SoC, nHOST_INT back to it. This device is the SPI slave
+- * and the other end of those lines; the chip's behaviour lives outside
+- * QEMU (qemu/ui/em35x.py), on a chardev:
++ * The Nest Display-3.4 carries an EM35x (802.15.4 / Thread radio, running
++ * Silicon Labs' ConnectIP "ip-modem-app") on ECSPI3, with its chip select
++ * on a GPIO and three more lines: nRESET and nWAKE from the SoC, nHOST_INT
++ * back to it.
++ *
++ * This device is the chip's SPI slave port as its firmware drives it
++ * (spi-protocol2-sc1.c in ip-modem-app): the reply to a transaction is laid
++ * out the moment nSSEL falls, which a model on the far side of a chardev
++ * could not do in time. The application behind the port (the management
++ * protocol, booting, sleeping) lives outside QEMU, in qemu/ui/em35x.py, and
++ * sees only the byte stream the SPI frames carry:
+  *
+  *   QEMU -> model, two bytes each:
+- *     'd' byte   a byte the SoC clocked out while the chip was selected
++ *     'd' byte   a stream byte the host sent (the payload of its SPI frame)
+  *     's' level  nSSEL (0 = selected)
+  *     'r' level  nRESET (0 = held in reset)
+  *     'w' level  nWAKE (0 = wake request)
+  *   model -> QEMU, two bytes each:
+- *     'd' byte   queue a byte for the chip to clock back
+- *     'i' level  nHOST_INT (0 = the chip wants the host)
+- *     'f' 0      drop what's queued (the chip reset)
++ *     'd' byte   a stream byte for the host (appended to the TX ring)
++ *     'a' level  the SPI port is up (1: the chip runs; 0: in reset, asleep
++ *                or absent, it answers 0xff and drops what it is sent)
++ *     'f' 0      drop the TX ring (the chip rebooted)
++ *     'z' 0      deep sleep, once the host has clocked out the TX ring
++ *
++ * A transaction clocks out 0xff (the preloaded data register), the header
++ * H = 0x31 (| 0x08 on the first transactions after a boot), the length L
++ * of the stream bytes that follow (up to 0xfe), and those bytes. At nSSEL
++ * rising the bytes that went out leave the ring, and the host's frame is
++ * parsed: up to 5 leading 0x00/0xff, a header with (h & 0xe1) == 0x20 and
++ * 0x10 set, a length, then its stream bytes. The port never reports busy
++ * (header bit 0x04): the model takes whatever arrives. nHOST_INT is low
++ * while the ring holds bytes and neither nSSEL nor nWAKE is asserted.
++ *
++ * Asleep, the port is off: nHOST_INT stays high, and the transaction that
++ * wakes the chip (any nSSEL edge) is lost, 0xff out and its MOSI dropped,
++ * so spi-server sends it again. A falling nWAKE wakes it too: the chip
++ * then holds nHOST_INT low until nWAKE rises, the host's cue that it is up.
+  *
+- * Each byte the SoC clocks in while selected takes the next queued byte,
+- * or 0xff when none is: the EM35x SPI protocol's "nothing yet", which the
+- * host keeps clocking through until the chip's answer starts. With no
+- * model attached the chip reads as absent: 0xff, nHOST_INT high.
++ * With no model attached the chip reads as absent: 0xff, nHOST_INT high.
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+@@ -36,7 +55,9 @@
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ 
+-#define EM35X_NCP_MISO_DEPTH    4096
++#define EM35X_NCP_RING_DEPTH    4096
++#define EM35X_NCP_FRAME_MAX     0xfe    /* stream bytes per SPI frame */
++#define EM35X_NCP_XFER_MAX      0x110   /* a transaction, as the host sizes it */
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(EM35xNcpState, EM35X_NCP)
+ 
+@@ -45,8 +66,22 @@ struct EM35xNcpState {
+ 
+     CharFrontend chr;
+     qemu_irq nhost_int;
+-    Fifo8 miso;
++    Fifo8 ring;                 /* stream bytes for the host */
+     bool nssel, nreset, nwake;
++    bool up;                    /* the SPI port runs ('a') */
++    bool first;                 /* no transaction since the boot yet */
++    bool sleep_pending;         /* 'z': sleep once the ring is out */
++    bool asleep;
++    bool waking;                /* woken by nWAKE: nHOST_INT low till it rises */
++    bool lost;                  /* this transaction woke the chip */
++
++    /* The transaction in progress. */
++    uint8_t miso[EM35X_NCP_XFER_MAX];
++    int miso_len;               /* 0xff, H, L, and L stream bytes */
++    int reply_len;              /* L */
++    uint8_t mosi[EM35X_NCP_XFER_MAX];
++    int clocked;
++
+     uint8_t msg[2];             /* a message from the model, in progress */
+     int msg_len;
+ };
+@@ -60,16 +95,98 @@ static void em35x_send(EM35xNcpState *s, char kind, uint8_t val)
+     }
+ }
+ 
++static void em35x_update_int(EM35xNcpState *s)
++{
++    bool low = s->waking ||
++               (s->up && !s->asleep && !fifo8_is_empty(&s->ring) &&
++                s->nssel && s->nwake);
++
++    qemu_set_irq(s->nhost_int, !low);
++}
++
++static void em35x_sleep_if_done(EM35xNcpState *s)
++{
++    if (s->sleep_pending && fifo8_is_empty(&s->ring) && s->nssel) {
++        s->sleep_pending = false;
++        s->asleep = true;
++    }
++}
++
++/* nSSEL fell: lay out what the chip clocks back. */
++static void em35x_select(EM35xNcpState *s)
++{
++    s->clocked = 0;
++    s->miso_len = 0;
++    s->reply_len = 0;
++    if (s->asleep) {
++        s->asleep = false;
++        s->lost = true;
++    }
++    if (!s->up || s->lost) {
++        return;
++    }
++    /* Peek: only what gets clocked out leaves the ring. */
++    s->reply_len = fifo8_peek_buf(&s->ring, s->miso + 3,
++                                  MIN(fifo8_num_used(&s->ring),
++                                      EM35X_NCP_FRAME_MAX));
++    s->miso[0] = 0xff;
++    s->miso[1] = 0x31 | (s->first ? 0x08 : 0);
++    s->miso[2] = s->reply_len;
++    s->miso_len = 3 + s->reply_len;
++}
++
++/* nSSEL rose: retire what went out, take in what came. */
++static void em35x_deselect(EM35xNcpState *s)
++{
++    int i, len;
++
++    if (s->lost) {
++        s->lost = false;
++        return;
++    }
++    if (!s->up) {
++        return;
++    }
++    /* A reboot ('f') may have emptied the ring meanwhile. */
++    if (s->clocked > 3) {
++        fifo8_drop(&s->ring, MIN(MIN(s->reply_len, s->clocked - 3),
++                                 fifo8_num_used(&s->ring)));
++    }
++    if (s->clocked >= 2) {
++        s->first = false;
++    }
++    em35x_sleep_if_done(s);
++    for (i = 0; i < 5 && i < s->clocked &&
++                (s->mosi[i] == 0x00 || s->mosi[i] == 0xff); i++) {
++    }
++    if (i + 2 > s->clocked) {
++        return;
++    }
++    if ((s->mosi[i] & 0xe1) != 0x20 || !(s->mosi[i] & 0x10)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "em35x-ncp: bad frame header 0x%02x\n",
++                      s->mosi[i]);
++        return;
++    }
++    len = MIN(s->mosi[i + 1], s->clocked - (i + 2));
++    for (int j = 0; j < len; j++) {
++        em35x_send(s, 'd', s->mosi[i + 2 + j]);
++    }
++}
++
+ static uint32_t em35x_transfer(SSIPeripheral *dev, uint32_t val)
+ {
+     EM35xNcpState *s = EM35X_NCP(dev);
++    uint8_t out;
+ 
+     /* The bus is shared by chip selects this device doesn't see. */
+-    if (s->nssel) {
++    if (s->nssel || !s->up || s->lost) {
+         return 0xff;
+     }
+-    em35x_send(s, 'd', val);
+-    return fifo8_is_empty(&s->miso) ? 0xff : fifo8_pop(&s->miso);
++    out = s->clocked < s->miso_len ? s->miso[s->clocked] : 0xff;
++    if (s->clocked < EM35X_NCP_XFER_MAX) {
++        s->mosi[s->clocked++] = val;
++    }
++    return out;
+ }
+ 
+ static void em35x_line(void *opaque, char kind, bool *line, int level)
+@@ -85,8 +202,15 @@ static void em35x_line(void *opaque, char kind, bool *line, int level)
+ static void em35x_nssel(void *opaque, int n, int level)
+ {
+     EM35xNcpState *s = opaque;
++    bool was = s->nssel;
+ 
+     em35x_line(s, 's', &s->nssel, level);
++    if (was && !s->nssel) {
++        em35x_select(s);
++    } else if (!was && s->nssel) {
++        em35x_deselect(s);
++    }
++    em35x_update_int(s);
+ }
+ 
+ static void em35x_nreset(void *opaque, int n, int level)
+@@ -101,26 +225,40 @@ static void em35x_nwake(void *opaque, int n, int level)
+     EM35xNcpState *s = opaque;
+ 
+     em35x_line(s, 'w', &s->nwake, level);
++    if (!s->nwake && s->asleep) {
++        s->asleep = false;
++        s->waking = true;
++    } else if (s->nwake) {
++        s->waking = false;
++    }
++    em35x_update_int(s);
+ }
+ 
+ static void em35x_message(EM35xNcpState *s, uint8_t kind, uint8_t val)
+ {
+     switch (kind) {
+     case 'd':
+-        if (!fifo8_is_full(&s->miso)) {
+-            fifo8_push(&s->miso, val);
++        if (!fifo8_is_full(&s->ring)) {
++            fifo8_push(&s->ring, val);
+         }
+         break;
+-    case 'i':
+-        qemu_set_irq(s->nhost_int, val != 0);
++    case 'a':
++        s->up = val != 0;
+         break;
+     case 'f':
+-        fifo8_reset(&s->miso);
++        fifo8_reset(&s->ring);
++        s->first = true;
++        s->sleep_pending = s->asleep = s->waking = false;
++        break;
++    case 'z':
++        s->sleep_pending = true;
++        em35x_sleep_if_done(s);
+         break;
+     default:
+         qemu_log_mask(LOG_GUEST_ERROR, "em35x-ncp: bad message 0x%02x\n",
+                       kind);
+     }
++    em35x_update_int(s);
+ }
+ 
+ static int em35x_chr_can_read(void *opaque)
+@@ -155,8 +293,10 @@ static void em35x_chr_event(void *opaque, QEMUChrEvent event)
+         break;
+     case CHR_EVENT_CLOSED:
+         /* The chip is gone with it. */
+-        fifo8_reset(&s->miso);
+-        qemu_set_irq(s->nhost_int, 1);
++        fifo8_reset(&s->ring);
++        s->up = false;
++        s->sleep_pending = s->asleep = s->waking = false;
++        em35x_update_int(s);
+         break;
+     default:
+         break;
+@@ -167,7 +307,7 @@ static void em35x_realize(SSIPeripheral *dev, Error **errp)
+ {
+     EM35xNcpState *s = EM35X_NCP(dev);
+ 
+-    fifo8_create(&s->miso, EM35X_NCP_MISO_DEPTH);
++    fifo8_create(&s->ring, EM35X_NCP_RING_DEPTH);
+     qdev_init_gpio_in_named(DEVICE(dev), em35x_nssel, EM35X_NCP_NSSEL, 1);
+     qdev_init_gpio_in_named(DEVICE(dev), em35x_nreset, EM35X_NCP_NRESET, 1);
+     qdev_init_gpio_in_named(DEVICE(dev), em35x_nwake, EM35X_NCP_NWAKE, 1);
+@@ -183,9 +323,14 @@ static void em35x_reset(DeviceState *dev)
+ {
+     EM35xNcpState *s = EM35X_NCP(dev);
+ 
+-    fifo8_reset(&s->miso);
++    /*
++     * The SoC's reset is not the chip's: the model's state (up, the ring)
++     * stands until it says otherwise or nRESET reboots it.
++     */
+     s->nssel = s->nreset = s->nwake = true;
+-    qemu_set_irq(s->nhost_int, 1);
++    s->waking = s->lost = false;
++    s->clocked = s->miso_len = s->reply_len = 0;
++    em35x_update_int(s);
+ }
+ 
+ static const Property em35x_properties[] = {
+@@ -201,7 +346,7 @@ static void em35x_class_init(ObjectClass *oc, const void *data)
+     k->transfer_raw = em35x_transfer;
+     device_class_set_legacy_reset(dc, em35x_reset);
+     device_class_set_props(dc, em35x_properties);
+-    dc->desc = "Silicon Labs EM35x NCP (SPI and lines via chardev)";
++    dc->desc = "Silicon Labs EM35x NCP (SPI port; application via chardev)";
+ }
+ 
+ static const TypeInfo em35x_info = {
+-- 
+2.55.0
+

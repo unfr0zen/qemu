@@ -1,0 +1,39 @@
+From c547b7acea272dc64382666e8cc916f604be4cfc Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 81/91] include/hw/net: TI WL1271 SDIO wifi chip
+
+---
+ include/hw/net/wl1271.h | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+ create mode 100644 include/hw/net/wl1271.h
+
+diff --git a/include/hw/net/wl1271.h b/include/hw/net/wl1271.h
+new file mode 100644
+index 0000000..60dd5f0
+--- /dev/null
++++ b/include/hw/net/wl1271.h
+@@ -0,0 +1,20 @@
++/*
++ * TI WL1271 SDIO wifi chip, as the wl12xx driver sees it.
++ * See hw/net/wl1271.c.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_NET_WL1271_H
++#define HW_NET_WL1271_H
++
++#include "qom/object.h"
++
++#define TYPE_WL1271 "wl1271"
++
++/*
++ * GPIO lines:
++ *   in  "power"      WLAN_EN; low holds the chip powered down
++ *   out "irq"        WLAN_IRQ, the out-of-band interrupt (active high)
++ */
++
++#endif /* HW_NET_WL1271_H */
+-- 
+2.55.0
+

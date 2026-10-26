@@ -1,0 +1,21 @@
+From 838c6e07207a5119a377922df991e376ac41b719 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 57/91] hw/i2c: build the OMAP3 I2C controller
+
+---
+ hw/i2c/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/i2c/meson.build b/hw/i2c/meson.build
+index 9c75e7d..9f9025c 100644
+--- a/hw/i2c/meson.build
++++ b/hw/i2c/meson.build
+@@ -20,3 +20,4 @@ i2c_ss.add(when: 'CONFIG_PMBUS', if_true: files('pmbus_device.c'))
+ i2c_ss.add(when: 'CONFIG_BCM2835_I2C', if_true: files('bcm2835_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_PFUZE200', if_true: files('pfuze200.c'))
+ system_ss.add_all(when: 'CONFIG_I2C', if_true: i2c_ss)
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_i2c.c'))
+-- 
+2.55.0
+

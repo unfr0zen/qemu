@@ -1,0 +1,92 @@
+From 0550253e29d9bb726a637cb82a800ef0de9b70ea Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:40:07 -0400
+Subject: [PATCH] hw/usb: cihdrc-udc: acknowledge host bridge tokens
+
+Provide TOKENIN and TOKENOUT with explicit ACK, NAK, STALL and error
+responses for hosts forwarding asynchronous URBs. An acknowledged OUT
+token is consumed immediately or retried by the host; legacy OUTEP
+commands retain their queued behavior.
+
+Keep zero-length status tokens from consuming a data descriptor, and
+stop IN transfers at IOC request boundaries so a short response cannot
+consume the next request.
+---
+ hw/usb/cihdrc-udc.c | 47 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/hw/usb/cihdrc-udc.c b/hw/usb/cihdrc-udc.c
+index 55ddd6b..590b13c 100644
+--- a/hw/usb/cihdrc-udc.c
++++ b/hw/usb/cihdrc-udc.c
+@@ -267,7 +267,7 @@ static unsigned ci_transfer(CIHDRCUDCState *s, unsigned ep, bool in,
+             break;
+         }
+         /* IOC delimits a request; a short packet must not eat the next one. */
+-        if (draining && (token & TD_IOC)) {
++        if ((draining || in) && (token & TD_IOC)) {
+             break;
+         }
+         if (!draining && done == length) {
+@@ -355,6 +355,42 @@ static bool ci_unhex(const char *hex, uint8_t *data, unsigned *length)
+     return true;
+ }
+ 
++/* Acknowledged tokens let a host distinguish backpressure from a ZLP. */
++static void ci_token(CIHDRCUDCState *s, unsigned ep, bool in,
++                     uint8_t *data, unsigned length)
++{
++    unsigned slot = ep * 2 + in;
++    uint32_t ctrl = REG(s, EPCTRL + ep * 4) >> (in ? 16 : 0);
++    uint32_t token;
++    unsigned done = 0, i;
++    const char *status = "NAK";
++    g_autoptr(GString) reply = g_string_new(NULL);
++
++    if (s->connected && (ctrl & 1)) {
++        status = "STALL";
++    } else if (s->connected && (REG(s, EPSTAT) & ci_ep_bit(slot)) &&
++               (!ep || (ctrl & BIT(7)))) {
++        token = ci_dma_read32((s->td[slot] & TD_ADDR) + 4);
++        if ((token & (TD_ACTIVE | TD_HALTED)) == TD_ACTIVE &&
++            (length || !(token & TD_BYTES))) {
++            done = ci_transfer(s, ep, in, data, length);
++            token = ci_dma_read32(ci_qh(s, slot) + 12);
++            status = (token & TD_HALTED) ? "ERROR" : "ACK";
++        }
++    }
++    g_string_append_printf(reply, "TOKEN %u %s %s ", ep,
++                           in ? "IN" : "OUT", status);
++    if (in) {
++        for (i = 0; i < done; i++) {
++            g_string_append_printf(reply, "%02x", data[i]);
++        }
++    } else {
++        g_string_append_printf(reply, "%u", done);
++    }
++    g_string_append_c(reply, '\n');
++    ci_send(s, reply->str);
++}
++
+ static void ci_command(CIHDRCUDCState *s, char *line)
+ {
+     g_auto(GStrv) args = g_strsplit(line, " ", 3);
+@@ -393,7 +429,14 @@ static void ci_command(CIHDRCUDCState *s, char *line)
+                !qemu_strtoui(args[1], NULL, 10, &ep) &&
+                (ep & ~0x80U) < CIHDRC_EP_COUNT) {
+         data = g_malloc(CIHDRC_MAX_DATA);
+-        if (!strcmp(args[0], "INEP") &&
++        if (!strcmp(args[0], "TOKENIN") && ep < CIHDRC_EP_COUNT &&
++            !qemu_strtoui(args[2], NULL, 10, &length) &&
++            length <= CIHDRC_MAX_DATA) {
++            ci_token(s, ep, true, data, length);
++        } else if (!strcmp(args[0], "TOKENOUT") && ep < CIHDRC_EP_COUNT &&
++                   ci_unhex(args[2], data, &length)) {
++            ci_token(s, ep, false, data, length);
++        } else if (!strcmp(args[0], "INEP") &&
+             !qemu_strtoui(args[2], NULL, 10, &length) &&
+             length <= CIHDRC_MAX_DATA) {
+             g_autoptr(GString) reply = g_string_new(NULL);
+-- 
+2.56.0
+

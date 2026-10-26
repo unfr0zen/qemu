@@ -1,0 +1,93 @@
+From 590a8b31a33f5ba7e4fd5554a794d95ded8e779b Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 43/91] include/hw/misc: OMAP3 PRCM, control module and SDRC
+ state
+
+---
+ include/hw/misc/omap3_prcm.h | 73 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 73 insertions(+)
+ create mode 100644 include/hw/misc/omap3_prcm.h
+
+diff --git a/include/hw/misc/omap3_prcm.h b/include/hw/misc/omap3_prcm.h
+new file mode 100644
+index 0000000..8182750
+--- /dev/null
++++ b/include/hw/misc/omap3_prcm.h
+@@ -0,0 +1,73 @@
++/*
++ * OMAP3 power, reset and clock management (CM and PRM), the system
++ * control module (SCM, with the TAP identification block) and the SDRAM
++ * controller with its memory scheduler (SDRC, SMS)
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_OMAP3_PRCM_H
++#define HW_MISC_OMAP3_PRCM_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_OMAP3_CM "omap3-cm"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3CmState, OMAP3_CM)
++
++#define TYPE_OMAP3_PRM "omap3-prm"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3PrmState, OMAP3_PRM)
++
++#define TYPE_OMAP3_SCM "omap3-scm"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3ScmState, OMAP3_SCM)
++
++#define TYPE_OMAP3_SDRC "omap3-sdrc"
++OBJECT_DECLARE_SIMPLE_TYPE(Omap3SdrcState, OMAP3_SDRC)
++
++#define OMAP3_CM_SIZE   0x2000
++#define OMAP3_PRM_SIZE  0x2000
++
++/* CM named outputs: "gpt-clksel"[n] is GPTIMER(n+1)'s source, 1 = sys_clk */
++#define OMAP3_CM_GPT_CLKSEL "gpt-clksel"
++#define OMAP3_NUM_GPT       12
++
++struct Omap3CmState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    uint32_t regs[OMAP3_CM_SIZE / 4];
++    qemu_irq gpt_clksel[OMAP3_NUM_GPT];
++};
++
++struct Omap3PrmState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    uint32_t regs[OMAP3_PRM_SIZE / 4];
++    qemu_irq irq;
++};
++
++struct Omap3ScmState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;         /* 0x48002000: padconf and general */
++    MemoryRegion tap;           /* 0x4830a000: IDCODE, die ID */
++    uint32_t regs[0x1000 / 4];
++    uint32_t idcode;            /* properties */
++    uint32_t die_id[4];
++    uint32_t omap_status;
++    uint32_t sys_boot;
++};
++
++struct Omap3SdrcState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion sdrc;          /* 0x6d000000 */
++    MemoryRegion sms;           /* 0x6c000000 */
++    uint32_t sdrc_regs[0x400 / 4];
++    uint32_t sms_regs[0x400 / 4];
++};
++
++#endif
+-- 
+2.55.0
+

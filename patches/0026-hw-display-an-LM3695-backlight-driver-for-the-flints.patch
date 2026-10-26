@@ -1,0 +1,178 @@
+From 95a54781ebb9eb1923eaaaba0935ce9b2d77faf3 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 15:06:50 -0400
+Subject: [PATCH 26/36] hw/display: an LM3695 backlight driver for the
+ flintstone's panel
+
+The board's backlight driver sits on i2c2 at 0x63 (the DT's lm3695@63).
+The vendor lm3695_bl driver reprograms it on every brightness change,
+which nlclient makes whenever the ambient light sensor reports; with no
+device there each change failed. A register file that ACKs and stores
+everything is all the driver needs.
+---
+ hw/arm/Kconfig         |  1 +
+ hw/arm/flintstone.c    |  3 ++
+ hw/display/Kconfig     |  4 ++
+ hw/display/lm3695.c    | 92 ++++++++++++++++++++++++++++++++++++++++++
+ hw/display/meson.build |  1 +
+ 5 files changed, 101 insertions(+)
+ create mode 100644 hw/display/lm3695.c
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 8128417..2246ce6 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -204,6 +204,7 @@ config FLINTSTONE
+     depends on TCG && ARM
+     select FSL_IMX6SX
+     select BCM43341
++    select LM3695
+ 
+ config STELLARIS
+     bool
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+index 6ab8b1c..a82680a 100644
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -21,6 +21,7 @@
+ #include "qapi/visitor.h"
+ #include "hw/adc/imx6_adc.h"
+ #include "hw/arm/flintstone_board.h"
++#include "hw/i2c/i2c.h"
+ #include "hw/arm/fsl-imx6sx.h"
+ #include "hw/net/bcm43341.h"
+ #include "hw/sd/sd.h"
+@@ -211,6 +212,8 @@ static void flintstone_init(MachineState *machine)
+                           qdev_get_gpio_in(board,
+                                            FLINTSTONE_BOARD_IN_POWEROFF));
+     flintstone_init_wifi(soc, board);
++    /* The panel backlight driver, i2c2 0x63 (the DT's lm3695@63). */
++    i2c_slave_create_simple(FSL_IMX6SX(soc)->i2c[1].bus, "lm3695", 0x63);
+     qdev_connect_gpio_out(gpio7, 2, qdev_get_gpio_in(hall_split, 0));
+     qdev_connect_gpio_out(hall_split, 0, qdev_get_gpio_in(adc1, 0));
+     qdev_connect_gpio_out(hall_split, 1,
+diff --git a/hw/display/Kconfig b/hw/display/Kconfig
+index a0b0352..480e17c 100644
+--- a/hw/display/Kconfig
++++ b/hw/display/Kconfig
+@@ -152,3 +152,7 @@ config MAC_PVG_PCI
+     bool
+     depends on MAC_PVG && PCI
+     default y if PCI_DEVICES
++
++config LM3695
++    bool
++    depends on I2C
+diff --git a/hw/display/lm3695.c b/hw/display/lm3695.c
+new file mode 100644
+index 0000000..bbcef9c
+--- /dev/null
++++ b/hw/display/lm3695.c
+@@ -0,0 +1,92 @@
++/*
++ * TI LM3695 backlight driver (i2c) — a register file.
++ *
++ * The flintstone board's panel backlight sits on i2c2 at 0x63 (the DT's
++ * lm3695@63, "national,lm3695"). The vendor kernel's lm3695_bl driver
++ * reprograms it on every brightness change: nlclient sets the brightness
++ * whenever the ambient light sensor reports, every couple of seconds, and
++ * with no device there each transfer waited out the i2c timeout, blocking
++ * nlclient for half a second at a time. The driver only writes (general
++ * purpose, ramp and brightness registers), so a plain 8-bit register file
++ * with auto-increment that ACKs everything is all it needs; nothing is
++ * drawn from the brightness.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/i2c/i2c.h"
++#include "qom/object.h"
++
++#define TYPE_LM3695 "lm3695"
++OBJECT_DECLARE_SIMPLE_TYPE(LM3695State, LM3695)
++
++struct LM3695State {
++    I2CSlave i2c;
++
++    uint8_t regs[256];
++    uint8_t cur;        /* register being addressed */
++    bool first_byte;    /* next send() byte is a register address */
++};
++
++static int lm3695_event(I2CSlave *i2c, enum i2c_event event)
++{
++    LM3695State *s = LM3695(i2c);
++
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->first_byte = true;
++    }
++    return 0;
++}
++
++static int lm3695_send(I2CSlave *i2c, uint8_t data)
++{
++    LM3695State *s = LM3695(i2c);
++
++    if (s->first_byte) {
++        s->cur = data;
++        s->first_byte = false;
++    } else {
++        s->regs[s->cur++] = data;
++    }
++    return 0;
++}
++
++static uint8_t lm3695_recv(I2CSlave *i2c)
++{
++    LM3695State *s = LM3695(i2c);
++
++    return s->regs[s->cur++];
++}
++
++static void lm3695_reset(DeviceState *dev)
++{
++    LM3695State *s = LM3695(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->cur = 0;
++    s->first_byte = false;
++}
++
++static void lm3695_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    I2CSlaveClass *isc = I2C_SLAVE_CLASS(oc);
++
++    dc->desc = "TI LM3695 backlight driver";
++    device_class_set_legacy_reset(dc, lm3695_reset);
++    isc->event = lm3695_event;
++    isc->send = lm3695_send;
++    isc->recv = lm3695_recv;
++}
++
++static const TypeInfo lm3695_types[] = {
++    {
++        .name           = TYPE_LM3695,
++        .parent         = TYPE_I2C_SLAVE,
++        .instance_size  = sizeof(LM3695State),
++        .class_init     = lm3695_class_init,
++    },
++};
++
++DEFINE_TYPES(lm3695_types)
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index e53f110..cf80533 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -14,6 +14,7 @@ system_ss.add(when: 'CONFIG_JAZZ_LED', if_true: files('jazz_led.c'))
+ system_ss.add(when: 'CONFIG_PL110', if_true: files('pl110.c'))
+ system_ss.add(when: 'CONFIG_SII9022', if_true: files('sii9022.c'))
+ system_ss.add(when: 'CONFIG_SSD0303', if_true: files('ssd0303.c'))
++system_ss.add(when: 'CONFIG_LM3695', if_true: files('lm3695.c'))
+ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
+ system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
+ 
+-- 
+2.55.0
+

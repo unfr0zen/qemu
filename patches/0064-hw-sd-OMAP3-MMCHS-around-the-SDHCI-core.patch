@@ -1,0 +1,264 @@
+From 0a699f4acce6444c045f1487881b34d2d2e7c2b8 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 64/91] hw/sd: OMAP3 MMCHS around the SDHCI core
+
+---
+ hw/sd/omap3_hsmmc.c | 245 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 245 insertions(+)
+ create mode 100644 hw/sd/omap3_hsmmc.c
+
+diff --git a/hw/sd/omap3_hsmmc.c b/hw/sd/omap3_hsmmc.c
+new file mode 100644
+index 0000000..13b6d40
+--- /dev/null
++++ b/hw/sd/omap3_hsmmc.c
+@@ -0,0 +1,245 @@
++/*
++ * OMAP3 high-speed MMC/SD/SDIO host controller (MMCHS)
++ *
++ * From offset 0x100 the MMCHS is the SD host controller standard's register
++ * block (BLK, ARG, CMD, RSP, DATA, PSTATE, HCTL, SYSCTL, STAT, IE, ISE,
++ * AC12, CAPA, CUR_CAPA, REV at their SDHCI offsets, with SYSCTL's SRA/SRC/
++ * SRD the standard's software reset bits), so that part is QEMU's SDHCI.
++ * Below it are the OMAP registers: SYSCONFIG (with a soft reset of the
++ * whole controller), SYSSTATUS, CSRE, SYSTEST, CON and PWCNT. CON.INIT's
++ * initialization stream needs no modelling: the command sent with it
++ * completes as any other.
++ *
++ * DMA: the MMCHS has no bus-master DMA of its own; with CMD.DE set it
++ * requests the system DMA controller's transfers instead - DMA_TX while
++ * the buffer has room for a block, DMA_RX while it holds one - and the
++ * system DMA moves the data through DATA. The standard block is reached
++ * through this device so it sees CMD.DE (which the SDHCI core, having no
++ * DMA here, drops) and re-evaluates the requests after every access and
++ * every change of the core's interrupt.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/sd/omap3_hsmmc.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "sdhci-internal.h"
++
++#define MMCHS_SYSCONFIG     0x10
++#define MMCHS_SYSSTATUS     0x14
++#define MMCHS_CSRE          0x24
++#define MMCHS_SYSTEST       0x28
++#define MMCHS_CON           0x2c
++#define MMCHS_PWCNT         0x30
++
++#define SDHCI_OFFSET        0x100
++#define MMCHS_CMD           0x0c        /* within the standard block */
++#define CMD_DE              (1 << 0)
++
++static void hsmmc_update_dma(Omap3HsmmcState *s)
++{
++    uint32_t prnsts = s->sdhci.prnsts;
++
++    qemu_set_irq(s->dma[0], s->de && (prnsts & SDHC_SPACE_AVAILABLE));
++    qemu_set_irq(s->dma[1], s->de && (prnsts & SDHC_DATA_AVAILABLE));
++}
++
++static uint64_t hsmmc_std_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3HsmmcState *s = opaque;
++    uint64_t v = s->sdhci.io_ops->read(&s->sdhci, addr, size);
++
++    hsmmc_update_dma(s);
++    return v;
++}
++
++static void hsmmc_std_write(void *opaque, hwaddr addr, uint64_t val,
++                            unsigned size)
++{
++    Omap3HsmmcState *s = opaque;
++
++    if (addr == MMCHS_CMD) {
++        s->de = val & CMD_DE;
++    }
++    s->sdhci.io_ops->write(&s->sdhci, addr, val, size);
++    hsmmc_update_dma(s);
++}
++
++static const MemoryRegionOps hsmmc_std_ops = {
++    .read = hsmmc_std_read,
++    .write = hsmmc_std_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static void hsmmc_sdhci_irq(void *opaque, int n, int level)
++{
++    Omap3HsmmcState *s = opaque;
++
++    hsmmc_update_dma(s);
++    qemu_set_irq(s->irq, level);
++}
++
++static void hsmmc_reset_regs(Omap3HsmmcState *s)
++{
++    s->de = false;
++    s->sysconfig = 0x15;
++    s->csre = 0;
++    s->systest = 0;
++    s->con = 0x00000500;
++    s->pwcnt = 0;
++}
++
++static uint64_t hsmmc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3HsmmcState *s = opaque;
++
++    switch (addr) {
++    case MMCHS_SYSCONFIG:
++        return s->sysconfig;
++    case MMCHS_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case MMCHS_CSRE:
++        return s->csre;
++    case MMCHS_SYSTEST:
++        return s->systest;
++    case MMCHS_CON:
++        return s->con;
++    case MMCHS_PWCNT:
++        return s->pwcnt;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-hsmmc: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void hsmmc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3HsmmcState *s = opaque;
++
++    switch (addr) {
++    case MMCHS_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            /*
++             * The controller only: a device reset of the SDHCI core would
++             * walk its bus and reset the card as well, which forgets what
++             * the host set up in it (an SDIO card's block sizes).
++             */
++            hsmmc_reset_regs(s);
++            s->sdhci.io_ops->write(&s->sdhci, SDHC_SWRST, SDHC_RESET_ALL, 1);
++            hsmmc_update_dma(s);
++            return;
++        }
++        s->sysconfig = val & 0x31d;
++        return;
++    case MMCHS_CSRE:
++        s->csre = val;
++        return;
++    case MMCHS_SYSTEST:
++        s->systest = val;
++        return;
++    case MMCHS_CON:
++        s->con = val;
++        return;
++    case MMCHS_PWCNT:
++        s->pwcnt = val & 0xffff;
++        return;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-hsmmc: bad write at 0x%" HWADDR_PRIx "\n",
++                  addr);
++}
++
++static const MemoryRegionOps hsmmc_ops = {
++    .read = hsmmc_read,
++    .write = hsmmc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void hsmmc_reset(DeviceState *dev)
++{
++    hsmmc_reset_regs(OMAP3_HSMMC(dev));
++}
++
++static void hsmmc_init(Object *obj)
++{
++    Omap3HsmmcState *s = OMAP3_HSMMC(obj);
++
++    object_initialize_child(obj, "sdhci", &s->sdhci, TYPE_SYSBUS_SDHCI);
++    memory_region_init(&s->container, obj, "omap3-hsmmc", 0x1000);
++    memory_region_init_io(&s->iomem, obj, &hsmmc_ops, s, "omap3-hsmmc.regs",
++                          SDHCI_OFFSET);
++    memory_region_add_subregion(&s->container, 0, &s->iomem);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->container);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++    qdev_init_gpio_out_named(DEVICE(obj), s->dma, OMAP3_HSMMC_DMA, 2);
++}
++
++static void hsmmc_realize(DeviceState *dev, Error **errp)
++{
++    Omap3HsmmcState *s = OMAP3_HSMMC(dev);
++    SysBusDevice *sdhci = SYS_BUS_DEVICE(&s->sdhci);
++
++    /* SD 2.0 host: 1.8 V and 3.0 V, high speed, 1024-byte blocks, and no
++     * SDMA: the MMCHS's DMA is the system DMA controller's, through its
++     * DMA requests, never the standard's bus-master DMA. */
++    qdev_prop_set_uint8(DEVICE(sdhci), "sd-spec-version", 2);
++    qdev_prop_set_uint64(DEVICE(sdhci), "capareg", 0x06a10080);
++    if (!sysbus_realize(sdhci, errp)) {
++        return;
++    }
++    memory_region_init_io(&s->std, OBJECT(dev), &hsmmc_std_ops, s,
++                          "omap3-hsmmc.std", SDHCI_OFFSET);
++    memory_region_add_subregion(&s->container, SDHCI_OFFSET, &s->std);
++    sysbus_connect_irq(sdhci, 0, qemu_allocate_irq(hsmmc_sdhci_irq, s, 0));
++}
++
++static const VMStateDescription hsmmc_vmstate = {
++    .name = TYPE_OMAP3_HSMMC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(sysconfig, Omap3HsmmcState),
++        VMSTATE_UINT32(csre, Omap3HsmmcState),
++        VMSTATE_UINT32(systest, Omap3HsmmcState),
++        VMSTATE_UINT32(con, Omap3HsmmcState),
++        VMSTATE_UINT32(pwcnt, Omap3HsmmcState),
++        VMSTATE_BOOL(de, Omap3HsmmcState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void hsmmc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = hsmmc_realize;
++    device_class_set_legacy_reset(dc, hsmmc_reset);
++    dc->vmsd = &hsmmc_vmstate;
++    dc->desc = "OMAP3 MMC/SD/SDIO host controller";
++}
++
++static const TypeInfo hsmmc_info = {
++    .name = TYPE_OMAP3_HSMMC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3HsmmcState),
++    .instance_init = hsmmc_init,
++    .class_init = hsmmc_class_init,
++};
++
++static void hsmmc_register_types(void)
++{
++    type_register_static(&hsmmc_info);
++}
++
++type_init(hsmmc_register_types)
+-- 
+2.55.0
+

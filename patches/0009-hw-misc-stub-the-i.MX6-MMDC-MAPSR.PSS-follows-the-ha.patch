@@ -1,0 +1,187 @@
+From 5c5f17e5ed181d40dbc49b987fdf1d787a75e718 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:35:58 -0400
+Subject: [PATCH 09/20] =?UTF-8?q?hw/misc:=20stub=20the=20i.MX6=20MMDC=20?=
+ =?UTF-8?q?=E2=80=94=20MAPSR.PSS=20follows=20the=20hardware?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The imx-mmdc probe reads the DDR type from MDMISC, then enables the
+automatic power saving: it clears MAPSR.PSD (bit 0) and spins until
+PSS (bit 4) sets — the hardware asserts the status once the core is
+allowed to enter its counter-based power save. Reads-as-zero left PSS
+clear, the poll ran out and the probe failed:
+
+    imx_mmdc_probe: failed to enable automatic power saving
+    imx-mmdc: probe of 21b0000.mmdc failed with error -16
+
+The stub mirrors the register: PSS = !PSD, everything else a plain
+register file. Verified on boot: no probe failure, no -16.
+---
+ hw/misc/imx6_mmdc.c | 116 ++++++++++++++++++++++++++++++++++++++++++++
+ hw/misc/imx6_mmdc.h |  29 +++++++++++
+ 2 files changed, 145 insertions(+)
+ create mode 100644 hw/misc/imx6_mmdc.c
+ create mode 100644 hw/misc/imx6_mmdc.h
+
+diff --git a/hw/misc/imx6_mmdc.c b/hw/misc/imx6_mmdc.c
+new file mode 100644
+index 0000000..bd8c2f0
+--- /dev/null
++++ b/hw/misc/imx6_mmdc.c
+@@ -0,0 +1,116 @@
++/*
++ * i.MX6 MMDC emulation — a stub that answers the probe.
++ *
++ * The 4.1.15 imx-mmdc driver maps the block, reads MDMISC for the DDR
++ * type, then enables the automatic power saving: it clears PSD (bit 0)
++ * in MAPSR and spins until PSS (bit 4) sets — the hardware asserts the
++ * status once the core is allowed to enter its counter-based power save.
++ * Reads-as-zero left PSS clear, the poll timed out and the probe failed:
++ *
++ *   imx_mmdc_probe: failed to enable automatic power saving
++ *   imx-mmdc: probe of 21b0000.mmdc failed with error -16
++ *
++ * The stub makes PSS follow the hardware: 1 whenever power saving is
++ * enabled (PSD clear), 0 while the driver disables it. Everything else is
++ * a plain register file.
++ *
++ * Driver: arch/arm/mach-imx/mmdc.c v4.1 (MMDC_MAPSR 0x404, PSD bit 0,
++ * PSS bit 4), i.MX6SX Reference Manual ch. 47.
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/imx6_mmdc.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define MMDC_MDMISC     0x018
++#define MMDC_MAPSR      0x404
++#define BP_MAPSR_PSD    0       /* power saving disable (RW) */
++#define BP_MAPSR_PSS    4       /* power saving status (RO, follows !PSD) */
++
++static uint64_t imx6_mmdc_read(void *opaque, hwaddr off, unsigned size)
++{
++    Imx6MmdcState *s = IMX6_MMDC(opaque);
++    uint32_t val;
++
++    if (off < sizeof(s->regs)) {
++        val = s->regs[off / 4];
++    } else {
++        val = 0;
++    }
++    if (off == MMDC_MAPSR) {
++        val = deposit32(val, BP_MAPSR_PSS, 1,
++                        !extract32(val, BP_MAPSR_PSD, 1));
++    }
++    return val;
++}
++
++static void imx6_mmdc_write(void *opaque, hwaddr off, uint64_t val,
++                            unsigned size)
++{
++    Imx6MmdcState *s = IMX6_MMDC(opaque);
++
++    if (off < sizeof(s->regs)) {
++        s->regs[off / 4] = val;
++    }
++}
++
++static const MemoryRegionOps imx6_mmdc_ops = {
++    .read = imx6_mmdc_read,
++    .write = imx6_mmdc_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void imx6_mmdc_realize(DeviceState *dev, Error **errp)
++{
++    Imx6MmdcState *s = IMX6_MMDC(dev);
++
++    memory_region_init_io(&s->iomem, OBJECT(s), &imx6_mmdc_ops, s,
++                          TYPE_IMX6_MMDC, IMX6_MMDC_REG_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
++}
++
++static const VMStateDescription imx6_mmdc_vmstate = {
++    .name = TYPE_IMX6_MMDC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, Imx6MmdcState, IMX6_MMDC_REG_SIZE / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx6_mmdc_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = imx6_mmdc_realize;
++    dc->vmsd = &imx6_mmdc_vmstate;
++    dc->desc = "i.MX6 MMDC (probe stub)";
++}
++
++static const TypeInfo imx6_mmdc_info = {
++    .name = TYPE_IMX6_MMDC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Imx6MmdcState),
++    .class_init = imx6_mmdc_class_init,
++};
++
++static void imx6_mmdc_register_types(void)
++{
++    type_register_static(&imx6_mmdc_info);
++}
++
++type_init(imx6_mmdc_register_types)
+diff --git a/hw/misc/imx6_mmdc.h b/hw/misc/imx6_mmdc.h
+new file mode 100644
+index 0000000..7c33d54
+--- /dev/null
++++ b/hw/misc/imx6_mmdc.h
+@@ -0,0 +1,29 @@
++/*
++ * i.MX6 MMDC emulation — a stub, see imx6_mmdc.c.
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++#ifndef HW_MISC_IMX6_MMDC_H
++#define HW_MISC_IMX6_MMDC_H
++
++#include "qom/object.h"
++#include "hw/core/sysbus.h"
++
++#define TYPE_IMX6_MMDC "imx6.mmdc"
++OBJECT_DECLARE_SIMPLE_TYPE(Imx6MmdcState, IMX6_MMDC)
++
++#define IMX6_MMDC_REG_SIZE  0x4000
++
++struct Imx6MmdcState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    uint32_t regs[IMX6_MMDC_REG_SIZE / 4];
++};
++
++#endif /* HW_MISC_IMX6_MMDC_H */
+-- 
+2.55.0
+

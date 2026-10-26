@@ -1,0 +1,21 @@
+From 6dca4f09b07c67844bc19d8a67746eb837bcd3df Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 69/91] hw/ssi: build the OMAP3 McSPI
+
+---
+ hw/ssi/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/ssi/meson.build b/hw/ssi/meson.build
+index 6afb1ea..3466029 100644
+--- a/hw/ssi/meson.build
++++ b/hw/ssi/meson.build
+@@ -13,3 +13,4 @@ system_ss.add(when: 'CONFIG_IMX', if_true: files('imx_spi.c'))
+ system_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_spi_host.c'))
+ system_ss.add(when: 'CONFIG_BCM2835_SPI', if_true: files('bcm2835_spi.c'))
+ system_ss.add(when: 'CONFIG_PNV_SPI', if_true: files('pnv_spi.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_mcspi.c'))
+-- 
+2.55.0
+

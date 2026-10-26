@@ -1,0 +1,30 @@
+From 06f2351e7ae048526c67fcaea4128a141980c01c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:36:42 -0400
+Subject: [PATCH 14/20] hw/misc: answer the GPMI BCH version at the RM offset
+ (0x160) too
+
+The BCH VERSION register sits at +0x160 in the i.MX6SX reference manual;
+the model only answered at +0x180. Guests that read the RM offset got
+zero. Both offsets now return the same version word.
+---
+ hw/misc/imx_gpmi_nand.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/hw/misc/imx_gpmi_nand.c b/hw/misc/imx_gpmi_nand.c
+index 8f14464..835e52c 100644
+--- a/hw/misc/imx_gpmi_nand.c
++++ b/hw/misc/imx_gpmi_nand.c
+@@ -727,7 +727,8 @@ static uint64_t bch_read(void *opaque, hwaddr off, unsigned size)
+     case 0x0e0:
+     case 0x0f0:
+         return s->bch_flash_layout[((off & ~0xc) - 0x080) / 0x10];
+-    case 0x180: return 0x00010000; /* version */
++    case 0x160: /* version — the RM's offset; some BSPs read 0x180 */
++    case 0x180: return 0x00010000;
+     default:
+         return 0;
+     }
+-- 
+2.55.0
+

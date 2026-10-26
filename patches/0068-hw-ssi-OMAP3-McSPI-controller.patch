@@ -1,0 +1,392 @@
+From 586c534b981f53291f60ece35c4d5268f8e8b466 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:39 -0400
+Subject: [PATCH 68/91] hw/ssi: OMAP3 McSPI controller
+
+---
+ hw/ssi/omap3_mcspi.c | 373 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 373 insertions(+)
+ create mode 100644 hw/ssi/omap3_mcspi.c
+
+diff --git a/hw/ssi/omap3_mcspi.c b/hw/ssi/omap3_mcspi.c
+new file mode 100644
+index 0000000..4a23ea3
+--- /dev/null
++++ b/hw/ssi/omap3_mcspi.c
+@@ -0,0 +1,373 @@
++/*
++ * OMAP3 multichannel SPI controller (McSPI), master mode
++ *
++ * Each channel drives one chip select. A word written to TXn is shifted
++ * out at once on the SSI bus (WL+1 bits, the slave's reply landing in RXn)
++ * unless the channel only receives. In transmit-receive mode a word goes
++ * out only once RXn is free: one written while RXn is still unread waits
++ * in TXn (TXS clear) until RXn is read, so a DMA feeding TXn keeps pace
++ * with the one draining RXn, as the shift register does. A receive-only
++ * channel clocks a word on the dummy TXn write that starts it, when it is
++ * enabled receive-only, and again after each RXn read.
++ * Chip selects follow the channel: in single-channel mode CHCONF.FORCE
++ * asserts it, otherwise an enabled channel does; CHCONF.EPOL gives the
++ * active level. DMA requests go up while a DMA-enabled channel's TX is
++ * empty (DMAW) or its RX full (DMAR). The FIFO is not modelled: words move
++ * one at a time.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/ssi/omap3_mcspi.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define MCSPI_REVISION      0x00
++#define MCSPI_SYSCONFIG     0x10
++#define MCSPI_SYSSTATUS     0x14
++#define MCSPI_IRQSTATUS     0x18
++#define MCSPI_IRQENABLE     0x1c
++#define MCSPI_WAKEUPENABLE  0x20
++#define MCSPI_SYST          0x24
++#define MCSPI_MODULCTRL     0x28
++#define MCSPI_CH_BASE       0x2c
++#define MCSPI_CH_STRIDE     0x14
++#define MCSPI_CHCONF        0x00
++#define MCSPI_CHSTAT        0x04
++#define MCSPI_CHCTRL        0x08
++#define MCSPI_TX            0x0c
++#define MCSPI_RX            0x10
++#define MCSPI_XFERLEVEL     0x7c
++
++#define MODULCTRL_SINGLE    (1 << 0)
++#define MODULCTRL_MS        (1 << 2)
++
++#define CHCONF_EPOL         (1 << 6)
++#define CHCONF_WL(c)        ((((c) >> 7) & 0x1f) + 1)
++#define CHCONF_TRM(c)       (((c) >> 12) & 3)
++#define CHCONF_DMAW         (1 << 14)
++#define CHCONF_DMAR         (1 << 15)
++#define CHCONF_FORCE        (1 << 20)
++
++#define TRM_TX_RX           0
++#define TRM_RX_ONLY         1
++#define TRM_TX_ONLY         2
++
++#define CHSTAT_RXS          (1 << 0)
++#define CHSTAT_TXS          (1 << 1)
++#define CHSTAT_EOT          (1 << 2)
++
++#define CHCTRL_EN           (1 << 0)
++
++#define IRQ_TX_EMPTY(n)     (1 << (4 * (n)))
++#define IRQ_RX_FULL(n)      (1 << (4 * (n) + 2))
++
++static void mcspi_update(Omap3McspiState *s)
++{
++    qemu_set_irq(s->irq, !!(s->irqstatus & s->irqenable));
++    for (int n = 0; n < OMAP3_MCSPI_CHANNELS; n++) {
++        Omap3McspiChannel *ch = &s->ch[n];
++        bool en = ch->ctrl & CHCTRL_EN;
++
++        qemu_set_irq(s->dma[2 * n], en && (ch->conf & CHCONF_DMAW) &&
++                                     !ch->tx_full);
++        qemu_set_irq(s->dma[2 * n + 1], en && (ch->conf & CHCONF_DMAR) &&
++                                         ch->rx_full);
++    }
++}
++
++static void mcspi_update_cs(Omap3McspiState *s)
++{
++    for (int n = 0; n < OMAP3_MCSPI_CHANNELS; n++) {
++        Omap3McspiChannel *ch = &s->ch[n];
++        bool active = (s->modulctrl & MODULCTRL_SINGLE) ?
++                      !!(ch->conf & CHCONF_FORCE) : !!(ch->ctrl & CHCTRL_EN);
++        bool level = (ch->conf & CHCONF_EPOL) ? !active : active;
++
++        if (level != ch->cs_level) {
++            ch->cs_level = level;
++            qemu_set_irq(s->cs[n], level);
++        }
++    }
++}
++
++static void mcspi_transfer(Omap3McspiState *s, int n, uint32_t tx)
++{
++    Omap3McspiChannel *ch = &s->ch[n];
++    int wl = CHCONF_WL(ch->conf);
++    uint32_t mask = wl == 32 ? UINT32_MAX : (1u << wl) - 1;
++    uint32_t rx = ssi_transfer(s->bus, tx & mask) & mask;
++
++    if (CHCONF_TRM(ch->conf) != TRM_TX_ONLY) {
++        ch->rx = rx;
++        ch->rx_full = true;
++        s->irqstatus |= IRQ_RX_FULL(n);
++    }
++    s->irqstatus |= IRQ_TX_EMPTY(n);
++}
++
++static uint64_t mcspi_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3McspiState *s = opaque;
++
++    if (addr >= MCSPI_CH_BASE &&
++        addr < MCSPI_CH_BASE + MCSPI_CH_STRIDE * OMAP3_MCSPI_CHANNELS) {
++        int n = (addr - MCSPI_CH_BASE) / MCSPI_CH_STRIDE;
++        Omap3McspiChannel *ch = &s->ch[n];
++        uint32_t v;
++
++        switch ((addr - MCSPI_CH_BASE) % MCSPI_CH_STRIDE) {
++        case MCSPI_CHCONF:
++            return ch->conf;
++        case MCSPI_CHSTAT:
++            return (ch->rx_full ? CHSTAT_RXS : 0) |
++                   (ch->tx_full ? 0 : CHSTAT_TXS | CHSTAT_EOT);
++        case MCSPI_CHCTRL:
++            return ch->ctrl;
++        case MCSPI_TX:
++            return 0;
++        case MCSPI_RX:
++            v = ch->rx;
++            ch->rx_full = false;
++            s->irqstatus &= ~IRQ_RX_FULL(n);
++            if (ch->tx_full) {
++                ch->tx_full = false;
++                mcspi_transfer(s, n, ch->tx);
++            } else if ((ch->ctrl & CHCTRL_EN) &&
++                       CHCONF_TRM(ch->conf) == TRM_RX_ONLY) {
++                mcspi_transfer(s, n, 0);
++            }
++            mcspi_update(s);
++            return v;
++        }
++    }
++
++    switch (addr) {
++    case MCSPI_REVISION:
++        return 0x21;
++    case MCSPI_SYSCONFIG:
++        return s->sysconfig;
++    case MCSPI_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case MCSPI_IRQSTATUS:
++        return s->irqstatus;
++    case MCSPI_IRQENABLE:
++        return s->irqenable;
++    case MCSPI_WAKEUPENABLE:
++        return s->wakeupenable;
++    case MCSPI_SYST:
++        return s->syst;
++    case MCSPI_MODULCTRL:
++        return s->modulctrl;
++    case MCSPI_XFERLEVEL:
++        return s->xferlevel;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-mcspi: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void mcspi_reset(DeviceState *dev)
++{
++    Omap3McspiState *s = OMAP3_MCSPI(dev);
++
++    s->sysconfig = 0;
++    s->irqstatus = 0;
++    s->irqenable = 0;
++    s->wakeupenable = 0;
++    s->syst = 0;
++    s->modulctrl = MODULCTRL_MS | MODULCTRL_SINGLE;
++    s->xferlevel = 0;
++    for (int n = 0; n < OMAP3_MCSPI_CHANNELS; n++) {
++        s->ch[n].conf = 0x00060000;
++        s->ch[n].ctrl = 0;
++        s->ch[n].rx = 0;
++        s->ch[n].rx_full = false;
++        s->ch[n].tx_full = false;
++    }
++    mcspi_update_cs(s);
++    mcspi_update(s);
++}
++
++static void mcspi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Omap3McspiState *s = opaque;
++
++    if (addr >= MCSPI_CH_BASE &&
++        addr < MCSPI_CH_BASE + MCSPI_CH_STRIDE * OMAP3_MCSPI_CHANNELS) {
++        int n = (addr - MCSPI_CH_BASE) / MCSPI_CH_STRIDE;
++        Omap3McspiChannel *ch = &s->ch[n];
++        bool was_enabled = ch->ctrl & CHCTRL_EN;
++
++        switch ((addr - MCSPI_CH_BASE) % MCSPI_CH_STRIDE) {
++        case MCSPI_CHCONF:
++            ch->conf = val;
++            mcspi_update_cs(s);
++            break;
++        case MCSPI_CHCTRL:
++            ch->ctrl = val & 0xff01;
++            if (!(ch->ctrl & CHCTRL_EN)) {
++                ch->tx_full = false;
++            }
++            mcspi_update_cs(s);
++            if ((ch->ctrl & CHCTRL_EN) && !was_enabled) {
++                s->irqstatus |= IRQ_TX_EMPTY(n);
++                if (CHCONF_TRM(ch->conf) == TRM_RX_ONLY) {
++                    mcspi_transfer(s, n, 0);
++                }
++            }
++            break;
++        case MCSPI_TX:
++            if (!(ch->ctrl & CHCTRL_EN)) {
++                qemu_log_mask(LOG_GUEST_ERROR,
++                              "omap3-mcspi: TX%d written while disabled\n", n);
++                return;
++            }
++            if (CHCONF_TRM(ch->conf) == TRM_RX_ONLY) {
++                /* the dummy write that starts a receive-only channel */
++                if (!ch->rx_full) {
++                    mcspi_transfer(s, n, 0);
++                }
++            } else if (CHCONF_TRM(ch->conf) == TRM_TX_RX && ch->rx_full) {
++                ch->tx = val;
++                ch->tx_full = true;
++            } else {
++                mcspi_transfer(s, n, val);
++            }
++            break;
++        case MCSPI_CHSTAT:
++        case MCSPI_RX:
++            return;
++        }
++        mcspi_update(s);
++        return;
++    }
++
++    switch (addr) {
++    case MCSPI_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            mcspi_reset(DEVICE(s));
++            return;
++        }
++        s->sysconfig = val;
++        return;
++    case MCSPI_IRQSTATUS:
++        s->irqstatus &= ~val;
++        break;
++    case MCSPI_IRQENABLE:
++        s->irqenable = val;
++        break;
++    case MCSPI_WAKEUPENABLE:
++        s->wakeupenable = val;
++        return;
++    case MCSPI_SYST:
++        s->syst = val;
++        return;
++    case MCSPI_MODULCTRL:
++        if (val & MODULCTRL_MS) {
++            qemu_log_mask(LOG_UNIMP, "omap3-mcspi: slave mode\n");
++        }
++        s->modulctrl = val;
++        mcspi_update_cs(s);
++        return;
++    case MCSPI_XFERLEVEL:
++        s->xferlevel = val;
++        return;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "omap3-mcspi: bad write at 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    mcspi_update(s);
++}
++
++static const MemoryRegionOps mcspi_ops = {
++    .read = mcspi_read,
++    .write = mcspi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    /* the system DMA moves 8- and 16-bit words through TXn/RXn */
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static void mcspi_init(Object *obj)
++{
++    Omap3McspiState *s = OMAP3_MCSPI(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &mcspi_ops, s, "omap3-mcspi", 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_out(DEVICE(obj), s->cs, OMAP3_MCSPI_CHANNELS);
++    qdev_init_gpio_out_named(DEVICE(obj), s->dma, OMAP3_MCSPI_DMA,
++                             2 * OMAP3_MCSPI_CHANNELS);
++    s->bus = ssi_create_bus(DEVICE(obj), "spi");
++    for (int n = 0; n < OMAP3_MCSPI_CHANNELS; n++) {
++        s->ch[n].cs_level = true;
++    }
++}
++
++static const VMStateDescription mcspi_channel_vmstate = {
++    .name = "omap3-mcspi-channel",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(conf, Omap3McspiChannel),
++        VMSTATE_UINT32(ctrl, Omap3McspiChannel),
++        VMSTATE_UINT32(rx, Omap3McspiChannel),
++        VMSTATE_BOOL(rx_full, Omap3McspiChannel),
++        VMSTATE_UINT32(tx, Omap3McspiChannel),
++        VMSTATE_BOOL(tx_full, Omap3McspiChannel),
++        VMSTATE_BOOL(cs_level, Omap3McspiChannel),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static const VMStateDescription mcspi_vmstate = {
++    .name = TYPE_OMAP3_MCSPI,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(sysconfig, Omap3McspiState),
++        VMSTATE_UINT32(irqstatus, Omap3McspiState),
++        VMSTATE_UINT32(irqenable, Omap3McspiState),
++        VMSTATE_UINT32(wakeupenable, Omap3McspiState),
++        VMSTATE_UINT32(syst, Omap3McspiState),
++        VMSTATE_UINT32(modulctrl, Omap3McspiState),
++        VMSTATE_UINT32(xferlevel, Omap3McspiState),
++        VMSTATE_STRUCT_ARRAY(ch, Omap3McspiState, OMAP3_MCSPI_CHANNELS, 1,
++                             mcspi_channel_vmstate, Omap3McspiChannel),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void mcspi_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, mcspi_reset);
++    dc->vmsd = &mcspi_vmstate;
++    dc->desc = "OMAP3 McSPI controller";
++}
++
++static const TypeInfo mcspi_info = {
++    .name = TYPE_OMAP3_MCSPI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3McspiState),
++    .instance_init = mcspi_init,
++    .class_init = mcspi_class_init,
++};
++
++static void mcspi_register_types(void)
++{
++    type_register_static(&mcspi_info);
++}
++
++type_init(mcspi_register_types)
+-- 
+2.55.0
+

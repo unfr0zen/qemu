@@ -1,0 +1,224 @@
+From 75fa787d8033a6216c75fb24ec58aa103028be0c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:35:58 -0400
+Subject: [PATCH 10/20] hw/i2c: add a PFUZE200 PMIC stub for the board's i2c4
+ address 0x08
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Both firmwares talk to the PMIC through a plain 8/8 register file, and
+both tripped over the missing device:
+
+    U-Boot:  wait_for_sr_state: failed sr=a1 cr=b8 state=202
+             i2c_init_transfer: failed for chip 0x8 retry=0
+             Set PMIC switcher mode error!
+    Linux:   pfuze100-regulator 3-0008: unrecognized pfuze chip ID!
+             pfuze100-regulator: probe of 3-0008 failed with error -110
+
+The stub stores any write and ACKs every transfer; only the fused
+identification words carry reset values — DEVICEID (0x00) low nibble 1
+(PFUZE200, what pfuze_identify() compares against "fsl,pfuze200"),
+REVID (0x03) and FABID (0x04) plausible. Verified on boot: U-Boot configures
+its switchers silently and Linux reports "pfuze200 found."
+---
+ hw/i2c/Kconfig            |   4 ++
+ hw/i2c/meson.build        |   1 +
+ hw/i2c/pfuze200.c         | 124 ++++++++++++++++++++++++++++++++++++++
+ include/hw/i2c/pfuze200.h |  28 +++++++++
+ 4 files changed, 157 insertions(+)
+ create mode 100644 hw/i2c/pfuze200.c
+ create mode 100644 include/hw/i2c/pfuze200.h
+
+diff --git a/hw/i2c/Kconfig b/hw/i2c/Kconfig
+index 596a7a3..2cb3392 100644
+--- a/hw/i2c/Kconfig
++++ b/hw/i2c/Kconfig
+@@ -30,6 +30,10 @@ config IMX_I2C
+     bool
+     select I2C
+ 
++config PFUZE200
++    bool
++    select I2C
++
+ config MPC_I2C
+     bool
+     select I2C
+diff --git a/hw/i2c/meson.build b/hw/i2c/meson.build
+index c459adc..9c75e7d 100644
+--- a/hw/i2c/meson.build
++++ b/hw/i2c/meson.build
+@@ -18,4 +18,5 @@ i2c_ss.add(when: 'CONFIG_PPC4XX', if_true: files('ppc4xx_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_PCA954X', if_true: files('i2c_mux_pca954x.c'))
+ i2c_ss.add(when: 'CONFIG_PMBUS', if_true: files('pmbus_device.c'))
+ i2c_ss.add(when: 'CONFIG_BCM2835_I2C', if_true: files('bcm2835_i2c.c'))
++i2c_ss.add(when: 'CONFIG_PFUZE200', if_true: files('pfuze200.c'))
+ system_ss.add_all(when: 'CONFIG_I2C', if_true: i2c_ss)
+diff --git a/hw/i2c/pfuze200.c b/hw/i2c/pfuze200.c
+new file mode 100644
+index 0000000..c5f1303
+--- /dev/null
++++ b/hw/i2c/pfuze200.c
+@@ -0,0 +1,124 @@
++/*
++ * NXP PFUZE200 PMIC (i2c) — a stub register file.
++ *
++ * The board's PMIC sits on i2c4 at address 0x08. Both firmwares talk to
++ * it through a plain 8-bit-address / 8-bit-value register file, and both
++ * trip over the missing device:
++ *
++ *   U-Boot:  wait_for_sr_state: failed sr=a1 cr=b8 state=202
++ *            i2c_init_transfer: failed for chip 0x8 retry=0
++ *            Set PMIC switcher mode error!
++ *   Linux:   pfuze100-regulator 3-0008: unrecognized pfuze chip ID!
++ *            pfuze100-regulator: probe of 3-0008 failed with error -110
++ *
++ * The model stores any write and ACKs every transfer, so regulator
++ * setup writes stick (and read back the same); only the identification
++ * registers carry non-zero reset values:
++ *
++ *   0x00 DEVICEID: low nibble 1 = PFUZE200, what the Linux driver's
++ *        pfuze_identify() compares against the DT's "fsl,pfuze200"
++ *        (drivers/regulator/pfuze100-regulator.c, PFUZE100_DEVICEID).
++ *   0x03 REVID / 0x04 FABID: only printed, any plausible value.
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/pfuze200.h"
++#include "hw/core/qdev-properties.h"
++#include "qemu/module.h"
++
++/* Read-only identification (regmap 8/8, auto-increment on read) */
++#define PFUZE_DEVICEID  0x00
++#define PFUZE_REVID     0x03
++#define PFUZE_FABID     0x04
++
++static int pfuze_event(I2CSlave *i2c, enum i2c_event event)
++{
++    Pfuze200State *s = PFUZE200(i2c);
++
++    switch (event) {
++    case I2C_START_SEND:
++    case I2C_START_SEND_ASYNC:
++    case I2C_START_RECV:
++        s->first_byte = true;
++        break;
++    case I2C_FINISH:
++    case I2C_NACK:
++        break;
++    }
++    return 0;
++}
++
++/* Master -> device: the first byte is the register address. */
++static int pfuze_send(I2CSlave *i2c, uint8_t data)
++{
++    Pfuze200State *s = PFUZE200(i2c);
++
++    if (s->first_byte) {
++        s->cur = data;
++        s->first_byte = false;
++        return 0;
++    }
++    /* The identification words are fused: writes land on other regs. */
++    if (s->cur != PFUZE_DEVICEID && s->cur != PFUZE_REVID &&
++        s->cur != PFUZE_FABID) {
++        s->regs[s->cur] = data;
++    }
++    s->cur = (s->cur + 1) & 0xff;
++    return 0;
++}
++
++/* Device -> master: the addressed register, then increment. */
++static uint8_t pfuze_recv(I2CSlave *i2c)
++{
++    Pfuze200State *s = PFUZE200(i2c);
++    uint8_t val = s->regs[s->cur];
++
++    s->cur = (s->cur + 1) & 0xff;
++    return val;
++}
++
++static void pfuze_reset(DeviceState *dev)
++{
++    Pfuze200State *s = PFUZE200(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->regs[PFUZE_DEVICEID] = 0x01;     /* ID: PFUZE200 */
++    s->regs[PFUZE_REVID] = 0x20;        /* full layer 2, metal layer 0 */
++    s->regs[PFUZE_FABID] = 0x00;
++    s->cur = 0;
++}
++
++static void pfuze_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    I2CSlaveClass *isc = I2C_SLAVE_CLASS(oc);
++
++    device_class_set_legacy_reset(dc, pfuze_reset);
++    dc->desc = "NXP PFUZE200 PMIC (stub)";
++
++    isc->event = pfuze_event;
++    isc->send = pfuze_send;
++    isc->recv = pfuze_recv;
++}
++
++static const TypeInfo pfuze_info = {
++    .name = TYPE_PFUZE200,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(Pfuze200State),
++    .class_init = pfuze_class_init,
++};
++
++static void pfuze_register_types(void)
++{
++    type_register_static(&pfuze_info);
++}
++
++type_init(pfuze_register_types)
+diff --git a/include/hw/i2c/pfuze200.h b/include/hw/i2c/pfuze200.h
+new file mode 100644
+index 0000000..3e0d9d2
+--- /dev/null
++++ b/include/hw/i2c/pfuze200.h
+@@ -0,0 +1,28 @@
++/*
++ * NXP PFUZE200 PMIC (i2c) — a stub, see pfuze200.c.
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++#ifndef HW_I2C_PFUZE200_H
++#define HW_I2C_PFUZE200_H
++
++#include "hw/i2c/i2c.h"
++#include "qom/object.h"
++
++#define TYPE_PFUZE200 "pfuze200"
++OBJECT_DECLARE_SIMPLE_TYPE(Pfuze200State, PFUZE200)
++
++struct Pfuze200State {
++    I2CSlave i2c;
++
++    uint8_t regs[256];
++    uint8_t cur;        /* register being addressed */
++    bool first_byte;    /* next send() byte is a register address */
++};
++
++#endif /* HW_I2C_PFUZE200_H */
+-- 
+2.55.0
+

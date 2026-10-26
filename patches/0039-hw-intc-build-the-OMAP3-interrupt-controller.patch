@@ -1,0 +1,21 @@
+From 8c70e3e2b393a54911c15da75a2c72704f902518 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 39/91] hw/intc: build the OMAP3 interrupt controller
+
+---
+ hw/intc/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/intc/meson.build b/hw/intc/meson.build
+index 96742df..9b51c7b 100644
+--- a/hw/intc/meson.build
++++ b/hw/intc/meson.build
+@@ -82,3 +82,4 @@ specific_ss.add(when: 'CONFIG_LOONGARCH_EXTIOI', if_true: files('loongarch_extio
+ specific_ss.add(when: ['CONFIG_KVM', 'CONFIG_LOONGARCH_EXTIOI'],
+                if_true: files('loongarch_extioi_kvm.c'))
+ specific_ss.add(when: 'CONFIG_LOONGARCH_DINTC', if_true: files('loongarch_dintc.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_intc.c'))
+-- 
+2.55.0
+

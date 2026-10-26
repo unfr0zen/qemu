@@ -1,0 +1,21 @@
+From 7c853efe262dfa3cb75dc4f39222d9c9ef8a4ea7 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 80/91] hw/input: build the j49's ring sensor
+
+---
+ hw/input/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/input/meson.build b/hw/input/meson.build
+index 90a2149..1afa2a6 100644
+--- a/hw/input/meson.build
++++ b/hw/input/meson.build
+@@ -10,3 +10,4 @@ system_ss.add(when: 'CONFIG_VIRTIO_INPUT', if_true: files('virtio-input-hid.c'))
+ system_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-host.c'))
+ 
+ system_ss.add(when: 'CONFIG_LASIPS2', if_true: files('lasips2.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('adbs_a330.c'))
+-- 
+2.55.0
+

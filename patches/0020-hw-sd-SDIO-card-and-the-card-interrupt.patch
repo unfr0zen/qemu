@@ -1,0 +1,650 @@
+From 7e1f847c3f01fe34b08b8c4cf8fe1aedb7dff198 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 11:54:36 -0400
+Subject: [PATCH 20/36] hw/sd: SDIO card and the card interrupt
+
+Taken as is from the dm-lumyo QEMU tree (0008-t33-sdio): an I/O-only
+sdio-card (CMD5/52/53, CCCR/FBR/CIS) whose functions live in a chip
+model implementing the sdio-function interface, plus a level-sensitive
+card interrupt that sdhci re-latches when Linux unmasks CARD_INT.
+---
+ hw/sd/core.c          |  10 +
+ hw/sd/sd.c            | 439 +++++++++++++++++++++++++++++++++++++++++-
+ hw/sd/sdhci.c         |  21 ++
+ include/hw/sd/sd.h    |  26 +++
+ include/hw/sd/sdhci.h |   2 +
+ 5 files changed, 497 insertions(+), 1 deletion(-)
+
+diff --git a/hw/sd/core.c b/hw/sd/core.c
+index 3568a81..9673f7f 100644
+--- a/hw/sd/core.c
++++ b/hw/sd/core.c
+@@ -234,6 +234,16 @@ void sdbus_set_readonly(SDBus *sdbus, bool readonly)
+     }
+ }
+ 
++void sdbus_set_card_int(SDBus *sdbus, bool level)
++{
++    SDBusClass *sbc = SD_BUS_GET_CLASS(sdbus);
++    BusState *qbus = BUS(sdbus);
++
++    if (sbc->set_card_int) {
++        sbc->set_card_int(qbus->parent, level);
++    }
++}
++
+ void sdbus_reparent_card(SDBus *from, SDBus *to)
+ {
+     SDState *card = get_card(from);
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 37f6e07..bbb202b 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -69,6 +69,8 @@ typedef enum {
+     sd_r3,        /* OCR register */
+     sd_r6 = 6,    /* Published RCA response */
+     sd_r7,        /* Operating voltage */
++    sd_r4 = 8,    /* SDIO: I/O OCR and function count (CMD5) */
++    sd_r5,        /* SDIO: status and one data byte (CMD52/53) */
+     sd_r1b = -1,
+     sd_illegal = -2,
+ } sd_rsp_type_t;
+@@ -205,6 +207,25 @@ struct SDState {
+     QEMUTimer *ocr_power_timer;
+     uint8_t dat_lines;
+     bool cmd_line;
++
++    /*
++     * SDIO (TYPE_SDIO_CARD only). An SDIO card has no storage: it exposes a
++     * byte-addressed I/O space holding the CCCR, the FBRs and the CIS tuple
++     * chains, which CMD52/CMD53 read and write. Side effects live in
++     * sdio_io_write(); everything else is plain memory.
++     */
++    uint8_t *sdio_io;
++    uint8_t sdio_r5_data;
++    uint16_t sdio_device_f2;
++    DeviceState *sdio_fn_dev;
++    uint8_t *sdio_blk;          /* CMD53 staging, can exceed sizeof(data) */
++    unsigned sdio_blk_fn;
++    bool sdio_blk_write;
++    bool sdio_blk_incr;
++    uint32_t sdio_io_size;
++    uint8_t sdio_class;
++    uint16_t sdio_vendor;
++    uint16_t sdio_device;
+ };
+ 
+ static void sd_realize(DeviceState *dev, Error **errp);
+@@ -282,6 +303,8 @@ static const char *sd_response_name(sd_rsp_type_t rsp)
+         [sd_r3]     = "RESP#3 (OCR reg)",
+         [sd_r6]     = "RESP#6 (RCA)",
+         [sd_r7]     = "RESP#7 (operating voltage)",
++        [sd_r4]     = "RESP#4 (SDIO OCR)",
++        [sd_r5]     = "RESP#5 (SDIO status+data)",
+     };
+     if (rsp == sd_illegal) {
+         return "ILLEGAL RESP";
+@@ -778,6 +801,11 @@ static size_t sd_response_size(SDState *sd, sd_rsp_type_t rtype)
+         assert(!sd_is_spi(sd));
+         return 4;
+ 
++    case sd_r4:
++    case sd_r5:
++        /* Both are 32 bits on the SD bus, like R1/R3. */
++        return 4;
++
+     case sd_r0:
+     case sd_illegal:
+         return sd_is_spi(sd) ? 1 : 0;
+@@ -2492,7 +2520,12 @@ static size_t sd_do_command(SDState *sd, SDRequest *req,
+     sd_rsp_type_t rtype;
+     int rsplen;
+ 
+-    if (!sd->blk || !blk_is_inserted(sd->blk)) {
++    /*
++     * A memory card with no medium answers nothing. An I/O-only SDIO card
++     * has no medium by definition — its functions are the whole card — so it
++     * is identified by its I/O space rather than by a block backend.
++     */
++    if (!sd->sdio_io && (!sd->blk || !blk_is_inserted(sd->blk))) {
+         return 0;
+     }
+ 
+@@ -2582,6 +2615,20 @@ send_response:
+         sd_response_r7_make(sd, response);
+         break;
+ 
++    case sd_r4:
++        /* The I/O OCR, assembled by the CMD5 handler. */
++        stl_be_p(response, sd->ocr);
++        break;
++
++    case sd_r5:
++        /*
++         * R5 has its own flag layout — reusing the CSR here is a trap,
++         * because CURRENT_STATE=transfer puts a 1 in what R5 calls the
++         * ERROR bit. Flags in bits 15:8 (IO state "CMD"), data in 7:0.
++         */
++        stl_be_p(response, 0x1000 | sd->sdio_r5_data);
++        break;
++
+     case sd_r0:
+         /*
+          * Invalid state transition, reset implementation
+@@ -3226,7 +3273,392 @@ static void emmc_class_init(ObjectClass *klass, const void *data)
+     sc->set_csd = emmc_set_csd;
+ }
+ 
++
++/* ------------------------------------------------------------------ SDIO */
++
++/*
++ * A minimal SDIO card, enough for Linux's mmc core to enumerate one I/O
++ * function and bind a driver to it by class. QEMU has no SDIO card model at
++ * all otherwise — CMD5/52/53 are declared optional and answered "illegal",
++ * which is deliberate so Linux concludes there is no SDIO card here.
++ *
++ * There is no storage. The card is a byte-addressed I/O space:
++ *
++ *   0x0000..0x00ff  CCCR   card capability, function enable/ready, CIS ptr
++ *   0x0100*n        FBR    per-function: interface class, CIS ptr, blksize
++ *   CIS areas       tuple chains the core parses for blksize and IDs
++ *
++ * Enumeration is CMD5 (OCR), CMD3 (RCA), CMD7 (select), then CMD52 byte
++ * reads/writes; CMD53 moves blocks once a driver is bound.
++ */
++
++#define SDIO_CCCR_REV           0x00
++#define SDIO_CCCR_SD_REV        0x01
++#define SDIO_CCCR_IOEN          0x02    /* function enable, written by core */
++#define SDIO_CCCR_IORDY         0x03    /* function ready, polled after IOEN */
++#define SDIO_CCCR_IENX          0x04
++#define SDIO_CCCR_INTX          0x05
++#define SDIO_CCCR_BUS_IF        0x07
++#define SDIO_CCCR_CAPS          0x08
++#define SDIO_CCCR_CIS_PTR       0x09    /* 24-bit, function 0's CIS */
++#define SDIO_CCCR_HIGH_SPEED    0x13
++
++#define SDIO_FBR(fn)            (0x100 * (fn))
++#define SDIO_FBR_STD_IF         0x00
++#define SDIO_FBR_CIS_PTR        0x09
++#define SDIO_FBR_BLKSIZE        0x10
++
++#define SDIO_CIS_F0             0x1000
++#define SDIO_CIS_FN(fn)         (0x1000 + 0x1000 * (fn))
++#define SDIO_NUM_FUNCS          2
++#define SDIO_IO_SIZE            0x4000
++/* Big enough for the largest multi-block CMD53 the aic8800 driver issues. */
++#define SDIO_BLK_SIZE           0x2000
++
++/* Tuples the core understands; anything else it skips. */
++#define CISTPL_MANFID           0x20
++#define CISTPL_FUNCID           0x21
++#define CISTPL_FUNCE            0x22
++#define CISTPL_END              0xff
++
++static void sdio_put(SDState *sd, uint32_t addr, uint8_t val)
++{
++    if (addr < sd->sdio_io_size) {
++        sd->sdio_io[addr] = val;
++    }
++}
++
++static void sdio_put_ptr(SDState *sd, uint32_t addr, uint32_t val)
++{
++    sdio_put(sd, addr, val & 0xff);
++    sdio_put(sd, addr + 1, (val >> 8) & 0xff);
++    sdio_put(sd, addr + 2, (val >> 16) & 0xff);
++}
++
++static void sdio_build_io(SDState *sd)
++{
++    uint32_t p;
++
++    memset(sd->sdio_io, 0, sd->sdio_io_size);
++
++    /* CCCR/FBR format 2.00, SD spec 2.00. */
++    sdio_put(sd, SDIO_CCCR_REV, 0x22);
++    sdio_put(sd, SDIO_CCCR_SD_REV, 0x02);
++    /* 4-bit bus support (S4MI) and low-speed card = no. */
++    sdio_put(sd, SDIO_CCCR_CAPS, 0x17);
++    sdio_put_ptr(sd, SDIO_CCCR_CIS_PTR, SDIO_CIS_F0);
++    sdio_put(sd, SDIO_CCCR_HIGH_SPEED, 0x01);
++
++    /*
++     * The aic8800 chips expose two I/O functions and their driver is picky
++     * about both: it matches SDIO_CLASS_WLAN, checks the MANFID of each
++     * function, and only latches on when probed for function *2*. So every
++     * function gets the WLAN class and its own CIS with its own device ID.
++     */
++    for (unsigned fn = 1; fn <= SDIO_NUM_FUNCS; fn++) {
++        sdio_put(sd, SDIO_FBR(fn) + SDIO_FBR_STD_IF, sd->sdio_class);
++        sdio_put_ptr(sd, SDIO_FBR(fn) + SDIO_FBR_CIS_PTR, SDIO_CIS_FN(fn));
++        sdio_put(sd, SDIO_FBR(fn) + SDIO_FBR_BLKSIZE, 0x00);
++        sdio_put(sd, SDIO_FBR(fn) + SDIO_FBR_BLKSIZE + 1, 0x02);   /* 512 */
++    }
++
++    /* Function 0 CIS: manufacturer, then the common function extension. */
++    p = SDIO_CIS_F0;
++    sdio_put(sd, p++, CISTPL_MANFID);
++    sdio_put(sd, p++, 4);
++    sdio_put(sd, p++, sd->sdio_vendor & 0xff);
++    sdio_put(sd, p++, sd->sdio_vendor >> 8);
++    sdio_put(sd, p++, sd->sdio_device & 0xff);
++    sdio_put(sd, p++, sd->sdio_device >> 8);
++
++    sdio_put(sd, p++, CISTPL_FUNCE);
++    sdio_put(sd, p++, 4);
++    sdio_put(sd, p++, 0x00);            /* common extension */
++    sdio_put(sd, p++, 0x00);            /* max block size 512 */
++    sdio_put(sd, p++, 0x02);
++    sdio_put(sd, p++, 0x32);            /* max transfer rate code */
++    sdio_put(sd, p++, CISTPL_END);
++
++    /*
++     * Per-function CIS. The function extension has to be long enough for
++     * the core to accept it (42 bytes covers every CCCR revision) and it
++     * carries the maximum block size at offset 12.
++     */
++    for (unsigned fn = 1; fn <= SDIO_NUM_FUNCS; fn++) {
++        uint16_t device = fn == 2 ? sd->sdio_device_f2 : sd->sdio_device;
++
++        p = SDIO_CIS_FN(fn);
++        sdio_put(sd, p++, CISTPL_MANFID);
++        sdio_put(sd, p++, 4);
++        sdio_put(sd, p++, sd->sdio_vendor & 0xff);
++        sdio_put(sd, p++, sd->sdio_vendor >> 8);
++        sdio_put(sd, p++, device & 0xff);
++        sdio_put(sd, p++, device >> 8);
++
++        sdio_put(sd, p++, CISTPL_FUNCID);
++        sdio_put(sd, p++, 2);
++        sdio_put(sd, p++, 0x0c);            /* generic function */
++        sdio_put(sd, p++, 0x00);
++
++        sdio_put(sd, p++, CISTPL_FUNCE);
++        sdio_put(sd, p++, 0x2a);
++        sdio_put(sd, p, 0x01);              /* per-function extension */
++        sdio_put(sd, p + 12, 0x00);         /* max block size 512 */
++        sdio_put(sd, p + 13, 0x02);
++        p += 0x2a;
++        sdio_put(sd, p++, CISTPL_END);
++    }
++}
++
++static uint8_t sdio_io_read(SDState *sd, uint32_t addr)
++{
++    return addr < sd->sdio_io_size ? sd->sdio_io[addr] : 0;
++}
++
++static void sdio_io_write(SDState *sd, uint32_t addr, uint8_t val)
++{
++    if (addr >= sd->sdio_io_size) {
++        return;
++    }
++    sd->sdio_io[addr] = val;
++
++    /*
++     * Enabling a function must make it report ready, or the core times out
++     * waiting and tears the card down again.
++     */
++    if (addr == SDIO_CCCR_IOEN) {
++        sd->sdio_io[SDIO_CCCR_IORDY] = val;
++    }
++}
++
++/* CMD5 */
++static sd_rsp_type_t sdio_cmd_IO_SEND_OP_COND(SDState *sd, SDRequest req)
++{
++    /*
++     * R4: number of I/O functions, memory-present flag and the OCR. The
++     * first probe passes a zero OCR to ask what the card supports; the
++     * second passes the voltage and expects the card to be ready.
++     */
++    sd->ocr = (1 << 31)                     /* card ready */
++            | (SDIO_NUM_FUNCS << 28)        /* number of I/O functions */
++            | 0x00ff8000;                   /* the usual 2.0-3.6 V window */
++    if (sd->state == sd_inactive_state) {
++        sd->state = sd_idle_state;
++    }
++    if (req.arg & 0x00ffffff) {
++        /*
++         * SDIO has no CMD2: once powered, the host goes straight to CMD3,
++         * which only answers in identification state.
++         */
++        sd->state = sd_identification_state;
++    }
++    return sd_r4;
++}
++
++/* CMD52 */
++static SDIOFunctionClass *sdio_fn_class(SDState *sd)
++{
++    if (!sd->sdio_fn_dev) {
++        return NULL;
++    }
++    return SDIO_FUNCTION_GET_CLASS(sd->sdio_fn_dev);
++}
++
++static sd_rsp_type_t sdio_cmd_IO_RW_DIRECT(SDState *sd, SDRequest req)
++{
++    bool write = req.arg & (1u << 31);
++    unsigned fn = (req.arg >> 28) & 0x7;
++    bool raw = req.arg & (1u << 27);
++    uint32_t addr = (req.arg >> 9) & 0x1ffff;
++    uint8_t data = req.arg & 0xff;
++    SDIOFunctionClass *fc = fn ? sdio_fn_class(sd) : NULL;
++
++    if (fc && fc->rw) {
++        data = fc->rw(sd->sdio_fn_dev, fn, addr, data, write);
++    } else if (write) {
++        sdio_io_write(sd, addr, data);
++        /* RAW ("read after write") wants the resulting value back. */
++        data = raw ? sdio_io_read(sd, addr) : data;
++    } else {
++        data = sdio_io_read(sd, addr);
++    }
++    sd->sdio_r5_data = data;
++    return sd_r5;
++}
++
++/* CMD53 */
++static sd_rsp_type_t sdio_cmd_IO_RW_EXTENDED(SDState *sd, SDRequest req)
++{
++    bool write = req.arg & (1u << 31);
++    unsigned fn = (req.arg >> 28) & 0x7;
++    uint32_t addr = (req.arg >> 9) & 0x1ffff;
++    bool block_mode = req.arg & (1u << 27);
++    bool incr = req.arg & (1u << 26);
++    uint32_t count = req.arg & 0x1ff;
++    SDIOFunctionClass *fc = fn ? sdio_fn_class(sd) : NULL;
++    uint32_t len;
++
++    if (block_mode) {
++        len = (count ? count : 512) * sd->blk_len;
++    } else {
++        len = count ? count : 512;
++    }
++    len = MIN(len, SDIO_BLK_SIZE);
++
++    sd->data_start = addr;
++    sd->data_offset = 0;
++    sd->data_size = len;
++    sd->sdio_blk_fn = fn;
++    sd->sdio_blk_write = write;
++    sd->sdio_blk_incr = incr;
++    sd->state = write ? sd_receivingdata_state : sd_sendingdata_state;
++    sd->sdio_r5_data = 0;
++
++    if (!write) {
++        if (fc && fc->read_block) {
++            fc->read_block(sd->sdio_fn_dev, fn, addr, sd->sdio_blk, len, incr);
++        } else {
++            for (uint32_t i = 0; i < len; i++) {
++                sd->sdio_blk[i] = sdio_io_read(sd, incr ? addr + i : addr);
++            }
++        }
++    }
++    return sd_r5;
++}
++
++static void sdio_write_byte(SDState *sd, uint8_t value)
++{
++    SDIOFunctionClass *fc;
++
++    if (sd->state != sd_receivingdata_state) {
++        return;
++    }
++    sd->sdio_blk[sd->data_offset] = value;
++    if (++sd->data_offset >= sd->data_size) {
++        sd->state = sd_transfer_state;
++        fc = sd->sdio_blk_fn ? sdio_fn_class(sd) : NULL;
++        if (fc && fc->write_block) {
++            fc->write_block(sd->sdio_fn_dev, sd->sdio_blk_fn, sd->data_start,
++                            sd->sdio_blk, sd->data_size, sd->sdio_blk_incr);
++        } else {
++            for (uint32_t i = 0; i < sd->data_size; i++) {
++                sdio_io_write(sd, sd->sdio_blk_incr ? sd->data_start + i
++                                                    : sd->data_start,
++                              sd->sdio_blk[i]);
++            }
++        }
++    }
++}
++
++static uint8_t sdio_read_byte(SDState *sd)
++{
++    uint8_t value;
++
++    if (sd->state != sd_sendingdata_state) {
++        return 0;
++    }
++    value = sd->sdio_blk[sd->data_offset];
++    if (++sd->data_offset >= sd->data_size) {
++        sd->state = sd_transfer_state;
++    }
++    return value;
++}
++
++static const SDProto sd_proto_sdio = {
++    .name = "SDIO",
++    .cmd = {
++        [0]  = {0,  sd_bc,   "GO_IDLE_STATE", sd_cmd_GO_IDLE_STATE},
++        [3]  = {0,  sd_bcr,  "SEND_RELATIVE_ADDR", sd_cmd_SEND_RELATIVE_ADDR},
++        [5]  = {9,  sd_bcr,  "IO_SEND_OP_COND", sdio_cmd_IO_SEND_OP_COND},
++        [7]  = {0,  sd_ac,   "(DE)SELECT_CARD", sd_cmd_DE_SELECT_CARD},
++        [15] = {0,  sd_ac,   "GO_INACTIVE_STATE", sd_cmd_GO_INACTIVE_STATE},
++        [52] = {9,  sd_bc,   "IO_RW_DIRECT", sdio_cmd_IO_RW_DIRECT},
++        [53] = {9,  sd_bc,   "IO_RW_EXTENDED", sdio_cmd_IO_RW_EXTENDED},
++    },
++};
++
++static void sdio_card_int_handler(void *opaque, int n, int level)
++{
++    SDState *sd = opaque;
++
++    sdbus_set_card_int(SD_BUS(qdev_get_parent_bus(DEVICE(sd))), level);
++}
++
++static void sdio_card_realize(DeviceState *dev, Error **errp)
++{
++    SDState *sd = SDMMC_COMMON(dev);
++
++    sd->sdio_io_size = SDIO_IO_SIZE;
++    sd->sdio_io = g_malloc0(sd->sdio_io_size);
++    sd->sdio_blk = g_malloc0(SDIO_BLK_SIZE);
++    sdio_build_io(sd);
++    sd->state = sd_idle_state;
++    sd->blk_len = 512;
++    qdev_init_gpio_in_named(dev, sdio_card_int_handler, "card-int", 1);
++}
++
++static void sdio_card_reset(DeviceState *dev)
++{
++    SDState *sd = SDMMC_COMMON(dev);
++
++    sdio_build_io(sd);
++    sd->state = sd_idle_state;
++    sd->blk_len = 512;
++}
++
++/* An I/O-only card has no CID or CSD; CMD0 resets it all the same. */
++static void sdio_set_cid(SDState *sd)
++{
++}
++
++static void sdio_set_csd(SDState *sd, uint64_t size)
++{
++}
++
++static bool sdio_get_inserted(SDState *sd)
++{
++    return true;
++}
++
++static bool sdio_get_readonly(SDState *sd)
++{
++    return false;
++}
++
++/* The defaults are an AIC8800D80, the chip every Lumyo board carries. */
++static const Property sdio_card_props[] = {
++    DEFINE_PROP_UINT8("class", SDState, sdio_class, 0x07),   /* WLAN */
++    DEFINE_PROP_UINT16("vendor-id", SDState, sdio_vendor, 0xc8a1),
++    DEFINE_PROP_UINT16("device-id", SDState, sdio_device, 0x0082),
++    DEFINE_PROP_UINT16("device-id-f2", SDState, sdio_device_f2, 0x0182),
++    DEFINE_PROP_LINK("function-device", SDState, sdio_fn_dev,
++                     TYPE_SDIO_FUNCTION, DeviceState *),
++};
++
++static void sdio_card_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SDCardClass *sc = SDMMC_COMMON_CLASS(klass);
++
++    dc->desc = "SDIO card";
++    dc->realize = sdio_card_realize;
++    device_class_set_props(dc, sdio_card_props);
++    device_class_set_legacy_reset(dc, sdio_card_reset);
++    sc->proto = &sd_proto_sdio;
++    sc->set_cid = sdio_set_cid;
++    sc->set_csd = sdio_set_csd;
++    sc->read_byte = sdio_read_byte;
++    sc->write_byte = sdio_write_byte;
++    sc->get_inserted = sdio_get_inserted;
++    sc->get_readonly = sdio_get_readonly;
++}
++
+ static const TypeInfo sd_types[] = {
++    {
++        .name           = TYPE_SDIO_FUNCTION,
++        .parent         = TYPE_INTERFACE,
++        .class_size     = sizeof(SDIOFunctionClass),
++    },
+     {
+         .name           = TYPE_SDMMC_COMMON,
+         .parent         = TYPE_DEVICE,
+@@ -3247,6 +3679,11 @@ static const TypeInfo sd_types[] = {
+         .parent         = TYPE_SD_CARD,
+         .class_init     = sd_spi_class_init,
+     },
++    {
++        .name           = TYPE_SDIO_CARD,
++        .parent         = TYPE_SDMMC_COMMON,
++        .class_init     = sdio_card_class_init,
++    },
+     {
+         .name           = TYPE_EMMC,
+         .parent         = TYPE_SDMMC_COMMON,
+diff --git a/hw/sd/sdhci.c b/hw/sd/sdhci.c
+index c86dfa2..c52b4b4 100644
+--- a/hw/sd/sdhci.c
++++ b/hw/sd/sdhci.c
+@@ -270,6 +270,22 @@ static void sdhci_set_inserted(DeviceState *dev, bool level)
+     }
+ }
+ 
++static void sdhci_set_card_int(DeviceState *dev, bool level)
++{
++    SDHCIState *s = (SDHCIState *)dev;
++
++    /*
++     * The card interrupt is level-sensitive: as long as the card holds the
++     * line, clearing the status bit re-latches it (see sdhci_write), so
++     * remember the line state rather than just pulsing the bit.
++     */
++    s->card_int_level = level;
++    if (level && (s->norintstsen & SDHC_NISEN_CARDINT)) {
++        s->norintsts |= SDHC_NIS_CARDINT;
++    }
++    sdhci_update_irq(s);
++}
++
+ static void sdhci_set_readonly(DeviceState *dev, bool level)
+ {
+     SDHCIState *s = (SDHCIState *)dev;
+@@ -1316,6 +1332,10 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
+             s->norintsts |= SDHC_NIS_INSERT;
+             s->pending_insert_state = false;
+         }
++        /* Re-sample a level-asserted SDIO interrupt on enable. */
++        if ((s->norintstsen & SDHC_NISEN_CARDINT) && s->card_int_level) {
++            s->norintsts |= SDHC_NIS_CARDINT;
++        }
+         sdhci_update_irq(s);
+         break;
+     case SDHC_NORINTSIGEN:
+@@ -1605,6 +1625,7 @@ static void sdhci_bus_class_init(ObjectClass *klass, const void *data)
+ 
+     sbc->set_inserted = sdhci_set_inserted;
+     sbc->set_readonly = sdhci_set_readonly;
++    sbc->set_card_int = sdhci_set_card_int;
+ }
+ 
+ /* --- qdev i.MX eSDHC --- */
+diff --git a/include/hw/sd/sd.h b/include/hw/sd/sd.h
+index d12f249..7b28cda 100644
+--- a/include/hw/sd/sd.h
++++ b/include/hw/sd/sd.h
+@@ -85,6 +85,29 @@ typedef struct {
+ OBJECT_DECLARE_TYPE(SDState, SDCardClass, SD_CARD)
+ 
+ #define TYPE_SD_CARD_SPI "sd-card-spi"
++#define TYPE_SDIO_CARD "sdio-card"
++
++/*
++ * An SDIO card is a transport; what its I/O functions actually do lives in
++ * a chip model implementing this interface. The card routes CMD52/CMD53
++ * accesses to functions 1..7 here; function 0 (CCCR/FBR/CIS) stays in the
++ * card itself. @incr distinguishes incrementing-address transfers from
++ * FIFO reads/writes at a fixed address.
++ */
++#define TYPE_SDIO_FUNCTION "sdio-function"
++typedef struct SDIOFunctionClass SDIOFunctionClass;
++DECLARE_CLASS_CHECKERS(SDIOFunctionClass, SDIO_FUNCTION, TYPE_SDIO_FUNCTION)
++
++struct SDIOFunctionClass {
++    InterfaceClass parent_class;
++
++    uint8_t (*rw)(DeviceState *dev, unsigned fn, uint32_t addr,
++                  uint8_t val, bool write);
++    void (*read_block)(DeviceState *dev, unsigned fn, uint32_t addr,
++                       uint8_t *buf, unsigned len, bool incr);
++    void (*write_block)(DeviceState *dev, unsigned fn, uint32_t addr,
++                        const uint8_t *buf, unsigned len, bool incr);
++};
+ DECLARE_INSTANCE_CHECKER(SDState, SD_CARD_SPI, TYPE_SD_CARD_SPI)
+ 
+ #define TYPE_EMMC "emmc"
+@@ -154,6 +177,8 @@ struct SDBusClass {
+      */
+     void (*set_inserted)(DeviceState *dev, bool inserted);
+     void (*set_readonly)(DeviceState *dev, bool readonly);
++    /* Level of the SDIO interrupt line (DAT[1] in 1-bit/4-bit mode). */
++    void (*set_card_int)(DeviceState *dev, bool level);
+ };
+ 
+ /* Functions to be used by qdevified callers (working via
+@@ -226,5 +251,6 @@ void sdbus_reparent_card(SDBus *from, SDBus *to);
+ /* Functions to be used by SD devices to report back to qdevified controllers */
+ void sdbus_set_inserted(SDBus *sd, bool inserted);
+ void sdbus_set_readonly(SDBus *sd, bool inserted);
++void sdbus_set_card_int(SDBus *sd, bool level);
+ 
+ #endif /* HW_SD_H */
+diff --git a/include/hw/sd/sdhci.h b/include/hw/sd/sdhci.h
+index a9da620..62366c8 100644
+--- a/include/hw/sd/sdhci.h
++++ b/include/hw/sd/sdhci.h
+@@ -87,6 +87,8 @@ struct SDHCIState {
+     uint16_t data_count;   /* current element in FIFO buffer */
+     uint8_t  stopped_state;/* Current SDHC state */
+     bool     pending_insert_state;
++    /* Level of the card's SDIO interrupt line */
++    bool     card_int_level;
+     /* Buffer Data Port Register - virtual access point to R and W buffers */
+     /* Software Reset Register - always reads as 0 */
+     /* Force Event Auto CMD12 Error Interrupt Reg - write only */
+-- 
+2.55.0
+

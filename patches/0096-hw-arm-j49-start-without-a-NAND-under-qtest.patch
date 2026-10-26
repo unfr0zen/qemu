@@ -1,0 +1,65 @@
+From cf2f7b157b81e4acaba08fd75c7f184ee92b509e Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 06:43:16 -0400
+Subject: [PATCH 96/96] hw/arm: j49: start without a NAND under qtest
+
+qom-test and test-hmp build every machine without firmware; j49 exited
+asking for its NAND. A real run still needs one.
+---
+ hw/arm/j49.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/hw/arm/j49.c b/hw/arm/j49.c
+index d0b4b80..791a363 100644
+--- a/hw/arm/j49.c
++++ b/hw/arm/j49.c
+@@ -41,6 +41,7 @@
+ #include "system/blockdev.h"
+ #include "system/reset.h"
+ #include "system/system.h"
++#include "system/qtest.h"
+ #include "qemu/error-report.h"
+ #include "qemu/timer.h"
+ #include "qemu/units.h"
+@@ -245,7 +246,8 @@ static void j49_init(MachineState *machine)
+                      (unsigned long)(J49_RAM_SIZE / MiB));
+         exit(1);
+     }
+-    if (!nand) {
++    /* qtest builds the machine without a firmware to boot. */
++    if (!nand && !qtest_enabled()) {
+         error_report("j49: the board boots from its NAND: "
+                      "-drive if=none,id=nand,format=raw,file=NAND.raw");
+         exit(1);
+@@ -253,7 +255,10 @@ static void j49_init(MachineState *machine)
+ 
+     soc = OMAP3630(object_new(TYPE_OMAP3630));
+     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
+-    qdev_prop_set_drive_err(DEVICE(&soc->gpmc), "drive", nand, &error_fatal);
++    if (nand) {
++        qdev_prop_set_drive_err(DEVICE(&soc->gpmc), "drive", nand,
++                                &error_fatal);
++    }
+     for (int i = 0; i < OMAP3630_NUM_UART && i < 3; i++) {
+         qdev_prop_set_chr(DEVICE(&soc->uart[i]), "chardev", serial_hd(i));
+     }
+@@ -313,10 +318,12 @@ static void j49_init(MachineState *machine)
+     j49_init_wifi(soc, board);
+     j49_init_ncp(soc);
+ 
+-    rom = g_new0(struct J49RomBoot, 1);
+-    rom->soc = soc;
+-    rom->blk = nand;
+-    qemu_register_reset(j49_rom_boot, rom);
++    if (nand) {
++        rom = g_new0(struct J49RomBoot, 1);
++        rom->soc = soc;
++        rom->blk = nand;
++        qemu_register_reset(j49_rom_boot, rom);
++    }
+ }
+ 
+ static void j49_machine_class_init(MachineClass *mc)
+-- 
+2.56.0
+

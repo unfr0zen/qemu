@@ -1,0 +1,38 @@
+From bcdf2a32a98bc5b08a355e2e1b274d2b1ac2762e Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 11:19:19 -0400
+Subject: [PATCH 19/36] hw/adc: a third of the wheel gain (120 degrees per
+ detent)
+
+At 360 degrees of magnet angle per detent the setup menus moved an item every two detents, too fast to steer. 120 gives six detents per item; -global imx6.adc.wheel-degrees=N still tunes it.
+---
+ hw/adc/imx6_adc.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/hw/adc/imx6_adc.c b/hw/adc/imx6_adc.c
+index 581c739..3c29f56 100644
+--- a/hw/adc/imx6_adc.c
++++ b/hw/adc/imx6_adc.c
+@@ -14,8 +14,8 @@
+  *   "dial" posts turn * 65536); the setup menus move one item per ~716
+  *   degrees of magnet angle (measured). The model synthesizes the pair
+  *   from a signed `wheel-position` (detents, driven by the UI over QMP)
+- *   and `wheel-degrees` of magnet angle per detent - 360 by default, two
+- *   detents (a page ring step or mouse-wheel notch) per menu item - gated
++ *   and `wheel-degrees` of magnet angle per detent - 120 by default, six
++ *   detents (page ring steps or mouse-wheel notches) per menu item - gated
+  *   by the hall-enable line on GPIO7_IO02 (active low). Like a real ring the
+  *   magnet slews to the new position rather than jumping: the driver
+  *   takes the shortest way round between samples, so a step near 180
+@@ -374,7 +374,7 @@ static void imx6_adc_unrealize(DeviceState *dev)
+ static const Property imx6_adc_properties[] = {
+     /* Wheel: detents, and the magnet angle each one turns (the "gain"). */
+     DEFINE_PROP_INT64("wheel-position", Imx6AdcState, wheel_position, 0),
+-    DEFINE_PROP_UINT32("wheel-degrees", Imx6AdcState, wheel_degrees, 360),
++    DEFINE_PROP_UINT32("wheel-degrees", Imx6AdcState, wheel_degrees, 120),
+     DEFINE_PROP_UINT32("wheel-amplitude", Imx6AdcState, amplitude, 0x180),
+     DEFINE_PROP_UINT32("wheel-mid1", Imx6AdcState, mid1, 0x7ad),
+     DEFINE_PROP_UINT32("wheel-mid2", Imx6AdcState, mid2, 0x7f6),
+-- 
+2.55.0
+

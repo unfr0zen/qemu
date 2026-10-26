@@ -1,0 +1,217 @@
+From d09811bf1fc0679f667aa50d6b2695c1063bb8b3 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:34:17 -0400
+Subject: [PATCH 08/20] =?UTF-8?q?hw/misc:=20stub=20the=20i.MX6=20SDMA=20?=
+ =?UTF-8?q?=E2=80=94=20its=20probe=20waits=20for=20CH0=20ready?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 4.1.15 imx-sdma driver loads its ROM scripts, points H_C0PTR at
+channel 0's control block and spins on H_INTR bit 0 until the emulated
+core has run the context-load script. There is no core here, so the spin
+always timed out:
+
+    imx-sdma 20ec000.sdma: Timeout waiting for CH0 ready
+
+The stub keeps bit 0 set (CH0 ready), acknowledges W1C writes and stores
+the rest of the host interface, so the probe completes and the driver
+initializes. DMA clients would still have nothing behind them; the stock
+firmware drives the console without SDMA, and any channel submission
+would hang on the same missing core as before this stub existed.
+---
+ hw/misc/imx6_sdma.c | 129 ++++++++++++++++++++++++++++++++++++++++++++
+ hw/misc/imx6_sdma.h |  31 +++++++++++
+ hw/misc/meson.build |   2 +
+ 3 files changed, 162 insertions(+)
+ create mode 100644 hw/misc/imx6_sdma.c
+ create mode 100644 hw/misc/imx6_sdma.h
+
+diff --git a/hw/misc/imx6_sdma.c b/hw/misc/imx6_sdma.c
+new file mode 100644
+index 0000000..7a67e19
+--- /dev/null
++++ b/hw/misc/imx6_sdma.c
+@@ -0,0 +1,129 @@
++/*
++ * i.MX6 SDMA emulation — a stub that answers the probe.
++ *
++ * The 4.1.15 imx-sdma driver maps the block, loads its ROM scripts
++ * (through the shared RAM the model reports as RAM), then brings up
++ * channel 0: it points H_C0PTR at the channel's control block and spins
++ * on H_INTR bit 0 ("CH0 ready") — the emulated core is supposed to have
++ * run the context-load script and raised the interrupt. There is no core
++ * here, so the stub keeps bit 0 set: the driver sees CH0 ready at once,
++ * the probe completes and every DMA client (the vendor kernel uses none
++ * on the console path) would still have nothing behind it.
++ *
++ *   imx-sdma 20ec000.sdma: Timeout waiting for CH0 ready
++ *
++ * Drivers/dt: arch/arm/boot/dts/imx6sx.dtsi (sdma@020ec000, SPI 2),
++ * drivers/dma/imx-sdma.c v4.1 (SDMA_H_* offsets).
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/imx6_sdma.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++/* Host interface registers (drivers/dma/imx-sdma.c, enum sdma_h_*) */
++#define SDMA_H_C0PTR    0x000
++#define SDMA_H_INTR     0x004
++#define SDMA_H_STATSTOP 0x008
++#define SDMA_H_START    0x00c
++#define SDMA_H_RESET    0x024
++#define SDMA_H_INTRMSK  0x02c
++#define SDMA_H_CONFIG   0x038
++
++#define SDMA_INTR_CH0   BIT(0)
++
++static uint64_t imx6_sdma_read(void *opaque, hwaddr off, unsigned size)
++{
++    Imx6SdmaState *s = IMX6_SDMA(opaque);
++
++    if (off == SDMA_H_INTR) {
++        /* CH0 is always ready — there is nothing here to run it. */
++        return s->intr | SDMA_INTR_CH0;
++    }
++    if (off < sizeof(s->regs)) {
++        return s->regs[off / 4];
++    }
++    return 0;
++}
++
++static void imx6_sdma_write(void *opaque, hwaddr off, uint64_t val,
++                            unsigned size)
++{
++    Imx6SdmaState *s = IMX6_SDMA(opaque);
++
++    if (off == SDMA_H_INTR) {
++        /* W1C: acknowledge the raised channel interrupts. */
++        s->intr &= ~val;
++        return;
++    }
++    if (off == SDMA_H_RESET) {
++        memset(s->regs, 0, sizeof(s->regs));
++        s->intr = 0;
++        return;
++    }
++    if (off < sizeof(s->regs)) {
++        s->regs[off / 4] = val;
++    }
++}
++
++static const MemoryRegionOps imx6_sdma_ops = {
++    .read = imx6_sdma_read,
++    .write = imx6_sdma_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void imx6_sdma_realize(DeviceState *dev, Error **errp)
++{
++    Imx6SdmaState *s = IMX6_SDMA(dev);
++
++    memory_region_init_io(&s->iomem, OBJECT(s), &imx6_sdma_ops, s,
++                          TYPE_IMX6_SDMA, IMX6_SDMA_REG_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
++}
++
++static const VMStateDescription imx6_sdma_vmstate = {
++    .name = TYPE_IMX6_SDMA,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, Imx6SdmaState, IMX6_SDMA_REG_SIZE / 4),
++        VMSTATE_UINT32(intr, Imx6SdmaState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx6_sdma_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = imx6_sdma_realize;
++    dc->vmsd = &imx6_sdma_vmstate;
++    dc->desc = "i.MX6 SDMA (probe stub)";
++}
++
++static const TypeInfo imx6_sdma_info = {
++    .name = TYPE_IMX6_SDMA,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Imx6SdmaState),
++    .class_init = imx6_sdma_class_init,
++};
++
++static void imx6_sdma_register_types(void)
++{
++    type_register_static(&imx6_sdma_info);
++}
++
++type_init(imx6_sdma_register_types)
+diff --git a/hw/misc/imx6_sdma.h b/hw/misc/imx6_sdma.h
+new file mode 100644
+index 0000000..ae6a70b
+--- /dev/null
++++ b/hw/misc/imx6_sdma.h
+@@ -0,0 +1,31 @@
++/*
++ * i.MX6 SDMA emulation — a stub, see imx6_sdma.c.
++ *
++ * Copyright (c) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++#ifndef HW_MISC_IMX6_SDMA_H
++#define HW_MISC_IMX6_SDMA_H
++
++#include "qom/object.h"
++#include "hw/core/sysbus.h"
++
++#define TYPE_IMX6_SDMA "imx6.sdma"
++OBJECT_DECLARE_SIMPLE_TYPE(Imx6SdmaState, IMX6_SDMA)
++
++#define IMX6_SDMA_REG_SIZE  0x4000
++
++struct Imx6SdmaState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    uint32_t intr;
++    uint32_t regs[IMX6_SDMA_REG_SIZE / 4];
++};
++
++#endif /* HW_MISC_IMX6_SDMA_H */
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index df7e141..06bd282 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -70,6 +70,8 @@ system_ss.add(when: 'CONFIG_IMX', if_true: files(
+   'imx7_snvs.c',
+   'imx_ccm.c',
+   'imx_gpmi_nand.c',
++  'imx6_mmdc.c',
++  'imx6_sdma.c',
+   'imx_rngc.c',
+ ))
+ system_ss.add(when: 'CONFIG_MAX78000_AES', if_true: files('max78000_aes.c'))
+-- 
+2.55.0
+

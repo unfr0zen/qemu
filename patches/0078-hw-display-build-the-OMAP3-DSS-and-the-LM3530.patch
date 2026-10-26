@@ -1,0 +1,22 @@
+From 84d3da71c7933a108c2ea9d1cec4f63cf632f61e Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:40 -0400
+Subject: [PATCH 78/91] hw/display: build the OMAP3 DSS and the LM3530
+
+---
+ hw/display/meson.build | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 3213c5e..5b85023 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -145,3 +145,5 @@ endif
+ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
+ 
+ modules += { 'hw-display': hw_display_modules }
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_dss.c'))
++system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('lm3530.c'))
+-- 
+2.55.0
+

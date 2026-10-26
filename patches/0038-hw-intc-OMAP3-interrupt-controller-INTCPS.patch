@@ -1,0 +1,314 @@
+From b9ce96ec47a5dcfc198e1c64c0ad17fcbf9b3340 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:38 -0400
+Subject: [PATCH 38/91] hw/intc: OMAP3 interrupt controller (INTCPS)
+
+---
+ hw/intc/omap3_intc.c | 295 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 295 insertions(+)
+ create mode 100644 hw/intc/omap3_intc.c
+
+diff --git a/hw/intc/omap3_intc.c b/hw/intc/omap3_intc.c
+new file mode 100644
+index 0000000..4ba9ff7
+--- /dev/null
++++ b/hw/intc/omap3_intc.c
+@@ -0,0 +1,295 @@
++/*
++ * OMAP3 MPU subsystem interrupt controller (INTCPS)
++ *
++ * 96 level-sensitive inputs in three banks of 32. Each line has an ILR
++ * (priority 0..63, 0 the highest, and an IRQ/FIQ steering bit); the sorted
++ * highest-priority pending line is reported in SIR_IRQ/SIR_FIQ. The output
++ * follows the unmasked pending lines; NEWIRQAGR/NEWFIQAGR only restart the
++ * sort, which this model does on every read, so they are accepted as is.
++ * Linux masks a line (MIR_SET) before writing NEWIRQAGR, as the hardware
++ * expects.
++ *
++ * Copyright (c) 2026
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "hw/intc/omap3_intc.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define INTC_REVISION       0x00
++#define INTC_SYSCONFIG      0x10
++#define INTC_SYSSTATUS      0x14
++#define INTC_SIR_IRQ        0x40
++#define INTC_SIR_FIQ        0x44
++#define INTC_CONTROL        0x48
++#define INTC_PROTECTION     0x4c
++#define INTC_IDLE           0x50
++#define INTC_IRQ_PRIORITY   0x60
++#define INTC_FIQ_PRIORITY   0x64
++#define INTC_THRESHOLD      0x68
++#define INTC_BANK_BASE      0x80   /* + 0x20 * bank */
++#define INTC_ITR            0x00
++#define INTC_MIR            0x04
++#define INTC_MIR_CLEAR      0x08
++#define INTC_MIR_SET        0x0c
++#define INTC_ISR_SET        0x10
++#define INTC_ISR_CLEAR      0x14
++#define INTC_PENDING_IRQ    0x18
++#define INTC_PENDING_FIQ    0x1c
++#define INTC_ILR_BASE       0x100
++
++#define INTC_SPURIOUS       0xffffff80u
++
++static uint32_t omap3_intc_pending(Omap3IntcState *s, int bank, bool fiq)
++{
++    uint32_t steer = 0;
++
++    for (int i = 0; i < 32; i++) {
++        steer |= (s->ilr[bank * 32 + i] & 1) << i;
++    }
++    return (s->level[bank] | s->swi[bank]) & ~s->mir[bank] &
++           (fiq ? steer : ~steer);
++}
++
++/* The sorted line: lowest priority value first, then the lowest number. */
++static int omap3_intc_sort(Omap3IntcState *s, bool fiq)
++{
++    int best = -1, best_prio = 64;
++
++    for (int bank = 0; bank < OMAP3_INTC_BANKS; bank++) {
++        uint32_t p = omap3_intc_pending(s, bank, fiq);
++
++        while (p) {
++            int i = ctz32(p), irq = bank * 32 + i;
++            int prio = (s->ilr[irq] >> 2) & 0x3f;
++
++            p &= p - 1;
++            if (prio < best_prio) {
++                best = irq;
++                best_prio = prio;
++            }
++        }
++    }
++    return best;
++}
++
++static void omap3_intc_update(Omap3IntcState *s)
++{
++    qemu_set_irq(s->irq, omap3_intc_sort(s, false) >= 0);
++    qemu_set_irq(s->fiq, omap3_intc_sort(s, true) >= 0);
++}
++
++static void omap3_intc_set_irq(void *opaque, int irq, int level)
++{
++    Omap3IntcState *s = opaque;
++    uint32_t bit = 1u << (irq & 31);
++
++    if (level) {
++        s->level[irq >> 5] |= bit;
++    } else {
++        s->level[irq >> 5] &= ~bit;
++    }
++    omap3_intc_update(s);
++}
++
++static uint64_t omap3_intc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3IntcState *s = opaque;
++    int irq;
++
++    if (addr >= INTC_ILR_BASE && addr < INTC_ILR_BASE + 4 * OMAP3_INTC_NUM_IRQS) {
++        return s->ilr[(addr - INTC_ILR_BASE) >> 2];
++    }
++    if (addr >= INTC_BANK_BASE && addr < INTC_BANK_BASE + 0x20 * OMAP3_INTC_BANKS) {
++        int bank = (addr - INTC_BANK_BASE) >> 5;
++
++        switch (addr & 0x1f) {
++        case INTC_ITR:
++            return s->level[bank];
++        case INTC_MIR:
++            return s->mir[bank];
++        case INTC_ISR_SET:
++            return s->swi[bank];
++        case INTC_PENDING_IRQ:
++            return omap3_intc_pending(s, bank, false);
++        case INTC_PENDING_FIQ:
++            return omap3_intc_pending(s, bank, true);
++        default:
++            return 0;
++        }
++    }
++
++    switch (addr) {
++    case INTC_REVISION:
++        return 0x40;
++    case INTC_SYSCONFIG:
++        return s->sysconfig;
++    case INTC_SYSSTATUS:
++        return 1;                       /* RESETDONE */
++    case INTC_SIR_IRQ:
++    case INTC_SIR_FIQ:
++        irq = omap3_intc_sort(s, addr == INTC_SIR_FIQ);
++        return irq < 0 ? INTC_SPURIOUS : irq;
++    case INTC_IRQ_PRIORITY:
++    case INTC_FIQ_PRIORITY:
++        irq = omap3_intc_sort(s, addr == INTC_FIQ_PRIORITY);
++        return irq < 0 ? INTC_SPURIOUS : (s->ilr[irq] >> 2) & 0x3f;
++    case INTC_CONTROL:
++        return 0;
++    case INTC_PROTECTION:
++        return s->protection;
++    case INTC_IDLE:
++        return s->idle;
++    case INTC_THRESHOLD:
++        return s->threshold;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-intc: bad read at 0x%" HWADDR_PRIx "\n",
++                  addr);
++    return 0;
++}
++
++static void omap3_intc_reset(DeviceState *dev)
++{
++    Omap3IntcState *s = OMAP3_INTC(dev);
++
++    memset(s->swi, 0, sizeof(s->swi));
++    memset(s->ilr, 0, sizeof(s->ilr));
++    for (int i = 0; i < OMAP3_INTC_BANKS; i++) {
++        s->mir[i] = ~0u;
++    }
++    s->sysconfig = 0;
++    s->idle = 0;
++    s->threshold = 0xff;
++    s->protection = 0;
++    omap3_intc_update(s);
++}
++
++static void omap3_intc_write(void *opaque, hwaddr addr, uint64_t val,
++                             unsigned size)
++{
++    Omap3IntcState *s = opaque;
++
++    if (addr >= INTC_ILR_BASE && addr < INTC_ILR_BASE + 4 * OMAP3_INTC_NUM_IRQS) {
++        s->ilr[(addr - INTC_ILR_BASE) >> 2] = val & 0xfd;
++        omap3_intc_update(s);
++        return;
++    }
++    if (addr >= INTC_BANK_BASE && addr < INTC_BANK_BASE + 0x20 * OMAP3_INTC_BANKS) {
++        int bank = (addr - INTC_BANK_BASE) >> 5;
++
++        switch (addr & 0x1f) {
++        case INTC_MIR:
++            s->mir[bank] = val;
++            break;
++        case INTC_MIR_CLEAR:
++            s->mir[bank] &= ~val;
++            break;
++        case INTC_MIR_SET:
++            s->mir[bank] |= val;
++            break;
++        case INTC_ISR_SET:
++            s->swi[bank] |= val;
++            break;
++        case INTC_ISR_CLEAR:
++            s->swi[bank] &= ~val;
++            break;
++        default:
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "omap3-intc: write to read-only 0x%" HWADDR_PRIx "\n",
++                          addr);
++            return;
++        }
++        omap3_intc_update(s);
++        return;
++    }
++
++    switch (addr) {
++    case INTC_SYSCONFIG:
++        if (val & 2) {                  /* SOFTRESET */
++            omap3_intc_reset(DEVICE(s));
++        }
++        s->sysconfig = val & 1;
++        return;
++    case INTC_CONTROL:                  /* NEWIRQAGR / NEWFIQAGR */
++        omap3_intc_update(s);
++        return;
++    case INTC_PROTECTION:
++        s->protection = val & 1;
++        return;
++    case INTC_IDLE:
++        s->idle = val & 3;
++        return;
++    case INTC_THRESHOLD:
++        s->threshold = val & 0xff;
++        return;
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "omap3-intc: bad write at 0x%" HWADDR_PRIx "\n",
++                  addr);
++}
++
++static const MemoryRegionOps omap3_intc_ops = {
++    .read = omap3_intc_read,
++    .write = omap3_intc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void omap3_intc_init(Object *obj)
++{
++    Omap3IntcState *s = OMAP3_INTC(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &omap3_intc_ops, s, "omap3-intc",
++                          0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    sysbus_init_irq(sbd, &s->fiq);
++    qdev_init_gpio_in(DEVICE(obj), omap3_intc_set_irq, OMAP3_INTC_NUM_IRQS);
++}
++
++static const VMStateDescription omap3_intc_vmstate = {
++    .name = TYPE_OMAP3_INTC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(level, Omap3IntcState, OMAP3_INTC_BANKS),
++        VMSTATE_UINT32_ARRAY(swi, Omap3IntcState, OMAP3_INTC_BANKS),
++        VMSTATE_UINT32_ARRAY(mir, Omap3IntcState, OMAP3_INTC_BANKS),
++        VMSTATE_UINT32_ARRAY(ilr, Omap3IntcState, OMAP3_INTC_NUM_IRQS),
++        VMSTATE_UINT32(sysconfig, Omap3IntcState),
++        VMSTATE_UINT32(idle, Omap3IntcState),
++        VMSTATE_UINT32(threshold, Omap3IntcState),
++        VMSTATE_UINT32(protection, Omap3IntcState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void omap3_intc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, omap3_intc_reset);
++    dc->vmsd = &omap3_intc_vmstate;
++    dc->desc = "OMAP3 interrupt controller";
++}
++
++static const TypeInfo omap3_intc_info = {
++    .name = TYPE_OMAP3_INTC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Omap3IntcState),
++    .instance_init = omap3_intc_init,
++    .class_init = omap3_intc_class_init,
++};
++
++static void omap3_intc_register_types(void)
++{
++    type_register_static(&omap3_intc_info);
++}
++
++type_init(omap3_intc_register_types)
+-- 
+2.55.0
+
