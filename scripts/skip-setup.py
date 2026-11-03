@@ -106,12 +106,15 @@ def main():
     drop = "|".join(f'"{k}"' for k in values)
 
     con = Console(args.ui)
-    # nlclient rewrites the file from memory, so it must be down meanwhile.
+    # nlclient rewrites the file from memory, also on its way out (seconds
+    # after SIGTERM), so the edit waits until it has exited.
     rc, _ = con.run("monit unmonitor nlclient; kill $(pidof nlclient) 2>/dev/null; "
-                    f"sleep 3; cp {SETTINGS} /tmp/settings.bak && "
+                    "i=0; while pidof nlclient >/dev/null && [ $i -lt 30 ]; "
+                    "do sleep 1; i=$((i+1)); done; "
+                    f"! pidof nlclient >/dev/null && cp {SETTINGS} /tmp/settings.bak && "
                     f"grep -vE '</settings>|{drop}' /tmp/settings.bak > {SETTINGS}")
     if rc:
-        sys.exit("could not edit the settings (logged in as root?)")
+        sys.exit("could not stop nlclient or edit the settings (logged in as root?)")
     rc, _ = con.run(f"cat >> {SETTINGS} <<'NGLEOF'\n{xml}</settings>\nNGLEOF")
     if rc:
         sys.exit("writing the settings failed; the old ones are in /tmp/settings.bak")
