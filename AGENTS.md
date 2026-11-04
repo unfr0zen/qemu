@@ -20,7 +20,7 @@ NAND_FRESH=1 ./run.sh --nand FILE  # re-seed .qemu/ from FILE
 
 Guest login `root` / `nest`. Quit: Ctrl-A X (Ctrl-] with `--ui`). Full option list: header of `run.sh`.
 
-CI checks (`.circleci/config.yml`), reproducible locally:
+CI checks (`.circleci/ci.yml`; `docker/.circleci/config.yml` publishes CI's image, the `ci` stage of `docker/Dockerfile` with the QEMU base compiled through ccache, when docker/ or setup.sh changes), reproducible locally:
 
 ```sh
 # patches: numbered 0001..N without gaps, apply one at a time, checkpatch-clean (new/edited patches only)

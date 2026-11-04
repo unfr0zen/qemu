@@ -43,7 +43,7 @@ if [ "$1" = "docker" ]; then
     if ! docker image inspect "$tag" > /dev/null 2>&1; then
         echo "--- Building Docker image $tag (one-time) ---"
         docker build --platform "linux/$(uname -m | sed 's/aarch64/arm64/')" \
-            -t "$tag" "$script_path/docker"
+            --target tools -t "$tag" "$script_path/docker"
     fi
     builddir=build-docker
     docker run --rm --init \
