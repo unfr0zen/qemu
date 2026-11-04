@@ -20,7 +20,7 @@ NAND_FRESH=1 ./run.sh --nand FILE  # re-seed .qemu/ from FILE
 
 Guest login `root` / `nest`. Quit: Ctrl-A X (Ctrl-] with `--ui`). Full option list: header of `run.sh`.
 
-CI checks (`.github/workflows/ci.yml`), reproducible locally:
+CI checks (`.circleci/config.yml`), reproducible locally:
 
 ```sh
 # patches: numbered 0001..N without gaps, apply one at a time, checkpatch-clean (new/edited patches only)

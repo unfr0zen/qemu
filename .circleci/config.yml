@@ -1,0 +1,141 @@
+version: 2.1
+
+# The patch stack on the QEMU it is written against (setup.sh's base), and the
+# host-side scripts: on every pull request and push to main.
+
+executors:
+  # Ubuntu, with the packages QEMU's build needs added by the job.
+  ubuntu:
+    docker:
+      - image: cimg/base:current
+    resource_class: arm.medium.gen2
+  ubuntu-large:
+    docker:
+      - image: cimg/base:current
+    resource_class: arm.large.gen2
+
+jobs:
+  # The patches: numbered without gaps, applying one at a time in order, clean
+  # under QEMU's checkpatch where this change touches them, and building; then
+  # the machines under the host-side tests and QEMU's own ARM qtests.
+  patches:
+    executor: ubuntu-large
+    steps:
+      - checkout
+      - run:
+          name: Numbering
+          command: |
+            n=0
+            for p in patches/*.patch; do
+              n=$((n + 1))
+              want=$(printf '%04d-' "$n")
+              case "$(basename "$p")" in
+                "$want"*) ;;
+                *) echo "$p: expected a name starting $want"; exit 1 ;;
+              esac
+            done
+            echo "$n patches, numbered 0001 to $(printf '%04d' "$n")"
+      - run:
+          name: Clone QEMU
+          command: |
+            base=$(sed -n 's/.*--branch \(v[0-9.]*\).*/\1/p' setup.sh | head -1)
+            git clone --depth 1 --branch "$base" https://gitlab.com/qemu-project/qemu.git qemu-src
+      # One at a time, as setup.sh applies them: a later patch may touch a
+      # file an earlier one creates.
+      - run:
+          name: Apply
+          command: |
+            for p in patches/*.patch; do
+              git -C qemu-src apply "$PWD/$p" || { echo "$p does not apply"; exit 1; }
+            done
+      # The stack predates checkpatch here, so only the patches this change
+      # adds or edits, against main (or the push before, on main itself), must
+      # be free of errors; every patch's result is listed.
+      - run:
+          name: checkpatch
+          command: |
+            git fetch --quiet origin main
+            base=$(git merge-base origin/main HEAD)
+            [ "$base" != "$(git rev-parse HEAD)" ] || base=$(git rev-parse HEAD~1)
+            changed=$(git diff --name-only --diff-filter=AM "$base" HEAD -- patches/)
+            fail=0
+            for p in patches/*.patch; do
+              out=$(perl qemu-src/scripts/checkpatch.pl --no-signoff -q "$p" 2>&1) || true
+              total=$(printf '%s\n' "$out" | grep '^total:' || echo 'total: clean')
+              echo "$(basename "$p"): $total"
+              if printf '%s\n' "$changed" | grep -qx "$p" && printf '%s\n' "$out" | grep -q '^ERROR:'; then
+                printf '%s\n' "$out"
+                echo "$p: checkpatch errors"
+                fail=1
+              fi
+            done
+            exit $fail
+      - run:
+          name: Build dependencies
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ninja-build python3-venv python3-pytest \
+              flex bison pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev libslirp-dev
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: ./setup.sh
+      - run:
+          name: UDC bridge
+          command: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m pytest tests/test_cihdrc_bridge.py --junitxml=.work/test-results/udc/junit.xml
+      - run:
+          name: GDB protocol on virt and flintstone
+          command: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m pytest tests/test_gdb*.py --junitxml=.work/test-results/gdb/junit.xml
+      # QEMU's own ARM tests: the stack changes models upstream boards share
+      # (the i.MX watchdog, I2C and uSDHC among them), and qom-test and
+      # test-hmp build every machine, flintstone and j49 included. meson
+      # writes their JUnit report itself.
+      - run:
+          name: qtest
+          no_output_timeout: 30m
+          command: |
+            ninja -C qemu-src/build
+            status=0
+            (cd qemu-src/build && ./pyvenv/bin/meson test --suite qtest-arm --no-rebuild --print-errorlogs) || status=$?
+            mkdir -p .work/test-results/qtest && cp qemu-src/build/meson-logs/testlog.junit.xml .work/test-results/qtest/junit.xml
+            exit $status
+      - store_test_results:
+          path: .work/test-results
+
+  # The host-side Python and shell: syntax, pyflakes on a pinned ruff (so a new
+  # release cannot fail an unchanged tree), the protocol and control tests,
+  # shellcheck at warnings and errors (the scripts split argument lists on
+  # purpose).
+  scripts:
+    executor: ubuntu
+    steps:
+      - checkout
+      - run:
+          name: Tools
+          command: sudo apt-get update && sudo apt-get install -y --no-install-recommends pipx python3-pytest shellcheck
+      - run:
+          name: Python
+          command: python3 -m py_compile $(git ls-files '*.py')
+      - run:
+          name: ruff
+          command: pipx run ruff==0.17.0 check --isolated --select E9,F $(git ls-files '*.py')
+      - run:
+          name: Tests
+          command: |
+            python3 -m pytest tests/test_usb*.py --junitxml=.work/test-results/usb/junit.xml
+            python3 -m pytest tests/test_fs*.py --junitxml=.work/test-results/fs/junit.xml
+            python3 -m pytest tests/test_gdb*.py --junitxml=.work/test-results/gdb/junit.xml
+      - run:
+          name: Shell
+          command: for f in $(git ls-files '*.sh'); do sh -n "$f" || exit 1; done
+      - run:
+          name: shellcheck
+          command: shellcheck --severity=warning $(git ls-files '*.sh')
+      - store_test_results:
+          path: .work/test-results
+
+workflows:
+  ci:
+    jobs:
+      - patches
+      - scripts
