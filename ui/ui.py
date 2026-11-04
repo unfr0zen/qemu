@@ -646,14 +646,19 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
             # The press and the release are separate so a hold lasts as
             # long as the pointer is down; the firmware times any holds
             # off the line itself.
+            # Each answers with when the line changed, on the frames' clock
+            # (ms of this host's monotonic clock, as /screen stamps them),
+            # so an input can be timed against the frames it causes.
             if urllib.parse.urlsplit(self.path).path == "/fs/file":
                 self.file_transfer(True)
             elif self.path == "/button/press" and "button" in pins:
                 board.drive(pins["button"], 1)
-                self.send_body(204, "text/plain", b"")
+                self.send_body(200, "application/json",
+                               json.dumps({"at": int(time.monotonic() * 1000)}).encode())
             elif self.path == "/button/release" and "button" in pins:
                 board.drive(pins["button"], 0)
-                self.send_body(204, "text/plain", b"")
+                self.send_body(200, "application/json",
+                               json.dumps({"at": int(time.monotonic() * 1000)}).encode())
             elif self.path == "/wheel/turn":
                 if not qmp:
                     self.send_body(503, "text/plain", b"no QMP\n")
