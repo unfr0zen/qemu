@@ -72,8 +72,8 @@ callback.
   0x694c                0x6349 (not joined)
   0x6959 GetGlobalAddresses: one 0x6356 per address, so none
   0x6990 WriteNestMACAddr: 0x6390; the EUI-64 is used from the next boot
-  0x6991 SetTransmitHookActive: 0x6391 (--board j49 only: the gen 2's EM357
-                        build has it, the gen 3's 0x6993/0x6994 instead)
+  0x6991 SetTransmitHookActive: 0x6391 (--board j49 only: the j49's EM357
+                        build has it, the diamond3's 0x6993/0x6994 instead)
 The network the chip forms is kept like its flash tokens: across nRESET
 (a reboot reports it saved, network state 1, and the host resumes it) but
 not across a restart of this script, which starts a chip with none.
@@ -96,7 +96,7 @@ STACK_VERSION = 0x2044
 BUILD = 301
 VERSION_TYPE = 1
 DATE = b"Sep 23 2015 16:39:49\0"
-DATE_GEN2 = b"Sep 23 2015 16:39:22\0"   # the gen 2's EM357 build
+DATE_J49 = b"Sep 23 2015 16:39:22\0"   # the j49's EM357 build
 
 BOOT_TIME = 0.03        # nRESET to CBReset; the host waits up to 0.5 s
 
@@ -208,7 +208,7 @@ class Link:
 class Chip:
     """The ConnectIP NCP: boots, answers management commands, sleeps."""
 
-    def __init__(self, link, eui64, board="flintstone"):
+    def __init__(self, link, eui64, board="diamond3"):
         self.link = link
         self.board = board
         self.lock = threading.Lock()
@@ -573,7 +573,7 @@ class Chip:
     def versions(self):
         self.callback(CB_GET_VERSIONS, "bvvvub", NAME, MGMT_VERSION,
                       STACK_VERSION, BUILD, VERSION_TYPE,
-                      DATE_GEN2 if self.board == "j49" else DATE)
+                      DATE_J49 if self.board == "j49" else DATE)
 
 
 def follow_parent(pid):
@@ -592,7 +592,7 @@ def main():
     ap.add_argument("--debug", action="store_true", help="log the stream")
     ap.add_argument("--eui64", default="18:b4:30:00:00:00:00:01",
                     help="the radio's EUI-64 (default: a placeholder)")
-    ap.add_argument("--board", choices=("flintstone", "j49"), default="flintstone",
+    ap.add_argument("--board", choices=("diamond3", "j49"), default="diamond3",
                     help="the board's EM35x firmware build")
     args = ap.parse_args()
     eui64 = bytes.fromhex(args.eui64.replace(":", ""))

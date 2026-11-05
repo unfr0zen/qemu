@@ -1,4 +1,4 @@
-# Flintstone (Nest Display-3.4, i.MX6SX) QEMU machine — hardware spec
+# diamond3 (Nest Display-3.4, i.MX6SX) QEMU machine — hardware spec
 
 The model boots the stock chain end to end — the boot ROM stub, U-Boot
 2014.04, the vendor kernel and the Nest userspace — with the UI, WiFi and

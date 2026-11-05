@@ -41,12 +41,12 @@ Anything already in place is left alone. run.sh runs this before every
 boot, on the NAND that boot uses; nothing is kept on the host, so every
 checkout and every NAND image behave the same.
 
-The gen 2 (--gen2 NAND, the j49 machine) has no U-Boot prompt to stop at:
+The j49 (--j49 NAND) has no U-Boot prompt to stop at:
 its release U-Boot is silent. There the shell comes from the unit's own
 environment, edited as fw_setenv would (j49_env.py): the boot command's
 addmodel gets init=/bin/sh for this one boot and is put back after. Root
 gets "nest" even when it has a password already: a stock image can carry one
-nobody here knows (NoLongerEvil's installer sets one), and as the gen 2's
+nobody here knows (NoLongerEvil's installer sets one), and as the j49's
 inittab runs no getty, one goes on the console (ttyO0). Its
 writable partitions are JFFS2 on MTD (user-config is mtdblock11), so the
 same changes go through the kernel's JFFS2, and --factory erases those
@@ -64,7 +64,7 @@ file system on each at its next mount. The root file systems, the U-Boot
 environment and the factory provision volume are not touched; the root is
 never mounted read-write.
 
-Usage: provision.py [--ssid QEMU | --factory] [--gen2 NAND]
+Usage: provision.py [--ssid QEMU | --factory] [--j49 NAND]
                     [--transcript FILE] -- QEMU-COMMAND...
        (the command must boot the machine with -nographic and the NAND
        writable: its serial console is driven over stdin/stdout)
@@ -198,8 +198,8 @@ def shell(con, root_rw=True, root=None):
     return mac, root.group(1)
 
 
-def gen2_prepare(nand):
-    """Read the gen 2's MAC and active root from its environment and make
+def j49_prepare(nand):
+    """Read the j49's MAC and active root from its environment and make
     its next boot a shell; return them and the env to put back."""
     j49_env = load("j49_env", "boards/j49/j49_env.py")
     env = j49_env.read_env(nand)
@@ -219,8 +219,8 @@ def gen2_prepare(nand):
     return mac.replace(":", "").lower(), name, restore
 
 
-def gen2_shell(con, root_rw=True):
-    """The kernel boots straight into the shell gen2_prepare asked for."""
+def j49_shell(con, root_rw=True):
+    """The kernel boots straight into the shell j49_prepare asked for."""
     deadline = time.time() + 180
     while time.time() < deadline:
         con.send("echo RDY$((6*7))\n")
@@ -270,8 +270,8 @@ GETTY = ('::sysinit:/bin/sh -c "while :; do /sbin/getty -L ttyO0 115200 '
 
 
 def console_login(con):
-    """The gen 2's inittab runs no getty: a login on the console, as the
-    gen 3 has."""
+    """The j49's inittab runs no getty: a login on the console, as the
+    diamond3 has."""
     if con.run(f"grep -qF '{GETTY}' /etc/inittab") == 0:
         return "console login: already"
     if con.run("{ printf '%s\\n' '# A login on the console (qemu/provision.py)' "
@@ -344,13 +344,13 @@ def hostname(con, name=None):
     return f"hostname: {name}" if name else "hostname: the serial number"
 
 
-def nestlocal(con, board="flintstone"):
+def nestlocal(con, board="diamond3"):
     """Whether ha/qemu_install.py has put nestlocal on this root: run.sh
     --mqtt only relays the broker to it."""
     if con.run("[ -x /nestlabs/sbin/nestlocal ]") == 0:
         return "nestlocal: installed (run.sh --mqtt HOST bridges it)"
-    return ("nestlocal: not installed (for --mqtt: python3 ha/qemu_install.py"
-            + (" --gen2)" if board == "j49" else ")"))
+    return (f"nestlocal: not installed (for --mqtt: see {board} installation "
+            "instructions in the ha/ project)")
 
 
 # QEMU's user-mode network is fixed: the guest gets .15, the host is
@@ -467,14 +467,14 @@ def factory(con):
     return f"factory: emptied {', '.join(FACTORY_WIPE)}"
 
 
-GEN2_FACTORY_FILES = ("wl1271-nvs.bin",)   # system-config's, from the factory
+J49_FACTORY_FILES = ("wl1271-nvs.bin",)   # system-config's, from the factory
 
 
-def gen2_factory(con):
+def j49_factory(con):
     """Erase the MTD partitions the running firmware writes (their JFFS2
     starts over, empty, at the next mount), and system-config down to what
     the factory put there."""
-    keep = " ".join(GEN2_FACTORY_FILES)
+    keep = " ".join(J49_FACTORY_FILES)
     if con.run("mount -t jffs2 /dev/mtdblock10 /media/system-config && "
                "cd /media/system-config && for f in * .[!.]*; do "
                f"case \" {keep} \" in *\" $f \"*) ;; *) rm -rf \"$f\" ;; esac; "
@@ -507,9 +507,9 @@ def main():
                     help="empty the firmware's writable volumes instead")
     ap.add_argument("--root", type=int, choices=(0, 1),
                     help="boot this root file system first from now on "
-                         "(the gen 3's U-Boot env; run.sh --root0/--root1)")
-    ap.add_argument("--gen2", metavar="NAND",
-                    help="the gen 2 (j49) whose NAND image this is")
+                         "(the diamond3's U-Boot env; run.sh --root0/--root1)")
+    ap.add_argument("--j49", metavar="NAND",
+                    help="the j49 whose NAND image this is")
     ap.add_argument("--transcript", help="save the console session here")
     ap.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- then the QEMU command line")
@@ -520,8 +520,8 @@ def main():
 
     print("provision: preparing the unit...",
           file=sys.stderr)
-    if args.gen2:
-        gen2(args, cmd)
+    if args.j49:
+        j49(args, cmd)
         return
     con = Console(cmd, args.transcript)
     done = []
@@ -560,21 +560,21 @@ def main():
     print(*("provision: " + d for d in done), sep="\n", file=sys.stderr)
 
 
-def gen2(args, cmd):
+def j49(args, cmd):
     done = []
     try:
-        mac, root, restore = gen2_prepare(args.gen2)
+        mac, root, restore = j49_prepare(args.j49)
     except (RuntimeError, ValueError) as e:
         print(f"provision: failed: {e}", file=sys.stderr)
         sys.exit(1)
     con = Console(cmd, args.transcript)
     try:
         if args.factory:
-            gen2_shell(con, root_rw=False)
-            done.append(gen2_factory(con))
+            j49_shell(con, root_rw=False)
+            done.append(j49_factory(con))
             con.run("sync")
         else:
-            gen2_shell(con)
+            j49_shell(con)
             done.append(f"root file system: {root}")
             done.append(root_login(con, replace=True))
             done.append(console_login(con))
@@ -598,7 +598,7 @@ def gen2(args, cmd):
         sys.exit(1)
     finally:
         con.quit()
-        load("j49_env", "boards/j49/j49_env.py").set_env(args.gen2, restore)
+        load("j49_env", "boards/j49/j49_env.py").set_env(args.j49, restore)
     print(*("provision: " + d for d in done), sep="\n", file=sys.stderr)
 
 

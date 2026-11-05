@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 22:00:00 -0500
+Subject: [PATCH] hw/arm: onyx: load U-Boot from the NAND boot partition
+
+Read the IVT at NAND offset 0x100400 and its boot data, validate the
+load range, and load U-Boot into DDR after device reset. Keep -bios
+as an optional development override, not a launch requirement.
+---
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -13,10 +13,14 @@
+ #include "hw/core/boards.h"
+ #include "hw/core/qdev-properties.h"
+ #include "system/block-backend-global-state.h"
++#include "system/block-backend-io.h"
+ #include "system/reset.h"
+ #include "system/qtest.h"
+ 
+ #define ONYX_RAM_SIZE (128 * MiB)
++#define ONYX_FW_NAND_OFF 0x100000
++#define ONYX_FW_IVT_OFF  0x400
++#define ONYX_FW_MAX_SIZE 0x180000
+ 
+ static void onyx_boot(void *opaque)
+ {
+@@ -25,28 +29,64 @@
+         object_resolve_path_component(OBJECT(machine), "soc"));
+     g_autofree char *image = NULL;
+     gsize len;
+-    uint32_t self, entry;
++    uint32_t start, entry;
+ 
+     cpu_reset(first_cpu);
+     /* Boot-ROM clock setup: 792 MHz PLL, divided by two by U-Boot. */
+     soc->ccm.analog[CCM_ANALOG_PLL_ARM] = BIT(31) | BIT(13) | 66;
+     soc->ccm.analog[USB_ANALOG_DIGPROG] = 0x00640002;
+-    if (!g_file_get_contents(machine->firmware, &image, &len, NULL) ||
+-        len < 32 || (uint8_t)image[0] != 0xd1 ||
+-        lduw_be_p(image + 1) != 32) {
+-        error_report("onyx: -bios requires an i.MX IVT image (.imx)");
+-        exit(1);
++    if (machine->firmware) {
++        if (!g_file_get_contents(machine->firmware, &image, &len, NULL) ||
++            len < 32 || (uint8_t)image[0] != 0xd1 ||
++            lduw_be_p(image + 1) != 32) {
++            error_report("onyx: -bios requires an i.MX IVT image (.imx)");
++            exit(1);
++        }
++        entry = ldl_le_p(image + 4);
++        start = ldl_le_p(image + 20);
++    } else {
++        BlockBackend *nand = blk_by_name("nand");
++        uint8_t ivt[32], data[12];
++        uint32_t self, boot_data;
++
++        if (blk_pread(nand, ONYX_FW_NAND_OFF + ONYX_FW_IVT_OFF,
++                      sizeof(ivt), ivt, 0) < 0 ||
++            ivt[0] != 0xd1 || lduw_be_p(ivt + 1) != sizeof(ivt)) {
++            error_report("onyx: NAND has no valid U-Boot IVT");
++            exit(1);
++        }
++        entry = ldl_le_p(ivt + 4);
++        self = ldl_le_p(ivt + 20);
++        boot_data = ldl_le_p(ivt + 16);
++        if (boot_data < self || boot_data - self >
++            ONYX_FW_MAX_SIZE - ONYX_FW_IVT_OFF - sizeof(data) ||
++            blk_pread(nand, ONYX_FW_NAND_OFF + ONYX_FW_IVT_OFF +
++                      (uint64_t)boot_data - self, sizeof(data), data, 0) < 0) {
++            error_report("onyx: NAND has invalid U-Boot boot data");
++            exit(1);
++        }
++        start = ldl_le_p(data);
++        len = ldl_le_p(data + 4);
++        if ((uint64_t)start + ONYX_FW_IVT_OFF != self ||
++            len < ONYX_FW_IVT_OFF + sizeof(ivt) ||
++            len > ONYX_FW_MAX_SIZE || ldl_le_p(data + 8) != 0) {
++            error_report("onyx: unsupported NAND U-Boot image layout");
++            exit(1);
++        }
++        image = g_malloc(len);
++        if (blk_pread(nand, ONYX_FW_NAND_OFF, len, image, 0) < 0) {
++            error_report("onyx: cannot read U-Boot from NAND");
++            exit(1);
++        }
+     }
+-    entry = ldl_le_p(image + 4);
+-    self = ldl_le_p(image + 20);
+-    if (self < FSL_IMX6UL_MMDC_ADDR ||
+-        (uint64_t)self + len > FSL_IMX6UL_MMDC_ADDR + ONYX_RAM_SIZE ||
+-        entry < self || (uint64_t)entry >= (uint64_t)self + len) {
++    if (start < FSL_IMX6UL_MMDC_ADDR ||
++        (uint64_t)start + len > FSL_IMX6UL_MMDC_ADDR + ONYX_RAM_SIZE ||
++        entry < start || (uint64_t)entry >= (uint64_t)start + len) {
+         error_report("onyx: firmware loads outside DDR or entry outside image");
+         exit(1);
+     }
+     /* DDR is host RAM; DCD execution and DDR training are not modelled. */
+-    cpu_physical_memory_write(self, image, len);
++    cpu_physical_memory_write(start, image, len);
+     cpu_set_pc(first_cpu, entry);
+ }
+ 
+@@ -83,11 +123,9 @@
+     stl_le_p(fuses + 0x4e0, 1500U << 20);
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6UL_MMDC_ADDR,
+                                 machine->ram);
+-    if (!qtest_enabled()) {
+-        if (!machine->firmware) {
+-            error_report("onyx: supply U-Boot with -bios FILE.imx");
+-            exit(1);
+-        }
++    if (!qtest_enabled() && !machine->firmware && !nand) {
++        error_report("onyx: supply NAND with -drive if=none,id=nand,file=FILE");
++        exit(1);
+     }
+ }
+ 

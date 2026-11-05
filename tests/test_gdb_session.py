@@ -107,6 +107,7 @@ class OwnershipTest(unittest.TestCase):
     def test_http_mcp_and_qmp_exclusion(self):
         self.attach()
         qmp = Mock()
+        qmp.execute.return_value = {"return": {}}
         server = ui.Server(("127.0.0.1", 0), ui.make_handler(
             None, None, None, qmp, {}, "Test", filesystem=self.files, debugger=self.session))
         thread = threading.Thread(target=server.serve_forever)
@@ -121,6 +122,12 @@ class OwnershipTest(unittest.TestCase):
                     mcp_server.t_pull_file({"path": "/proc/1/comm", "via": "sidechannel"})
                 qmp.execute.assert_not_called()
                 mcp_server.t_gdb({"action": "detach"})
+                with self.session.lock:
+                    with self.assertRaisesRegex(mcp_server.ToolError, "debugger busy"):
+                        mcp_server.t_qmp({"command": "system_reset"})
+                qmp.execute.assert_not_called()
+                mcp_server.t_qmp({"command": "system_reset"})
+                qmp.execute.assert_called_once_with("system_reset", None)
         finally:
             server.shutdown()
             thread.join(5)
@@ -133,7 +140,7 @@ QEMU = os.environ.get("QEMU_SYSTEM_ARM")
 @unittest.skipUnless(QEMU, "set QEMU_SYSTEM_ARM to exercise the live GDB stub")
 class LiveQemuTest(unittest.TestCase):
     def setUp(self):
-        machine = "flintstone" if "flintstone" in self._testMethodName else "virt"
+        machine = "diamond3" if "diamond3" in self._testMethodName else "virt"
         self.address = 0x40000000 if machine == "virt" else 0x80000000
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -210,7 +217,7 @@ class LiveQemuTest(unittest.TestCase):
         self.assertTrue(call("status")["running"], "detach left a breakpoint behind")
         call("detach")
 
-    def test_flintstone(self):
+    def test_diamond3(self):
         self.test_step_breakpoint_watchpoint_interrupt_and_detach()
 
     def test_trace_thumb_instruction_widths(self):
@@ -273,7 +280,7 @@ class LiveQemuTest(unittest.TestCase):
         call({"action": "detach"})
         self.assertFalse(self.session.exec_active)
 
-    def test_exec_log_flintstone(self):
+    def test_exec_log_diamond3(self):
         self.test_exec_log_and_auto_resume()
 
 if __name__ == "__main__":

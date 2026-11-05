@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check live MCP file access through a UI with no console, QMP or SSH.
 
-Start an isolated stock gen 3 unit with --ui --no-provision --fs rw, then
+Start an isolated stock diamond3 unit with --ui --no-provision --fs rw, then
 pass its filesystem debugger endpoint (from ui.py's --fs argument).
 Do not use another debugger or that unit's file API concurrently.
 

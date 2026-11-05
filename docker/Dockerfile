@@ -1,4 +1,4 @@
-# Build environment for the flintstone QEMU machine (see qemu/setup.sh docker).
+# Build environment for the Nest QEMU machines (see qemu/setup.sh docker).
 # Matches the monorepo approach: Debian + the minimal set QEMU needs for a
 # TCG-only qemu-system-arm build; run.sh runs QEMU in this same image. Host
 # arch is followed (--platform), which is what we want: the guest is always

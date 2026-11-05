@@ -84,11 +84,14 @@ jobs:
           name: UDC bridge
           command: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m pytest tests/test_cihdrc_bridge.py --junitxml=.work/test-results/udc/junit.xml
       - run:
-          name: GDB protocol on virt and flintstone
+          name: Onyx hardware and firmware loader
+          command: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m pytest tests/test_onyx*.py --junitxml=.work/test-results/onyx/junit.xml
+      - run:
+          name: GDB protocol on virt and diamond3
           command: QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" python3 -m pytest tests/test_gdb*.py --junitxml=.work/test-results/gdb/junit.xml
       # QEMU's own ARM tests: the stack changes models upstream boards share
       # (the i.MX watchdog, I2C and uSDHC among them), and qom-test and
-      # test-hmp build every machine, flintstone and j49 included. meson
+      # test-hmp build every machine, diamond3 and j49 included. meson
       # writes their JUnit report itself.
       - run:
           name: qtest

@@ -1,4 +1,4 @@
-# j49 (Nest Learning Thermostat gen 2, AM3703) QEMU machine — hardware spec
+# j49 (Nest Learning Thermostat, AM3703) QEMU machine — hardware spec
 
 The model boots the stock chain end to end from its NAND image: the
 GP x-loader, U-Boot 2012.10, Linux 2.6.37 and the Nest userspace, with the

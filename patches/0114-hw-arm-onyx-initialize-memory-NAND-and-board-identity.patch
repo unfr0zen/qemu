@@ -1,0 +1,341 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:00:00 -0500
+Subject: [PATCH] hw/arm: onyx: initialize memory, NAND and board identity
+
+Wire the shared MMDC and GPMI/BCH models into i.MX6UL. Acknowledge
+LPDDR2 mode-register commands and expose an ONFI parameter page with
+the NAND geometry and ECC requirements. Reset the NAND controller state
+and interrupt outputs together with the chip.
+
+Onyx has 128 MiB LPDDR2, an i.MX6UL rev1.2 and a 792 MHz ARM PLL.
+Provide read-only synthetic shadow fuses for identity, closed security
+configuration and temperature calibration. Complete temperature
+measurements immediately with a fixed sensor count.
+
+Run the Onyx ROM loader after device reset so its clock setup remains
+in effect when U-Boot starts.
+---
+diff --git a/hw/arm/fsl-imx6ul.c b/hw/arm/fsl-imx6ul.c
+--- a/hw/arm/fsl-imx6ul.c
++++ b/hw/arm/fsl-imx6ul.c
+@@ -48,6 +48,8 @@
+      * CCM
+      */
+     object_initialize_child(obj, "ccm", &s->ccm, TYPE_IMX6UL_CCM);
++    object_initialize_child(obj, "mmdc", &s->mmdc, TYPE_IMX6_MMDC);
++    object_initialize_child(obj, "gpmi", &s->gpmi, TYPE_IMX_GPMI_NAND);
+ 
+     /*
+      * SRC
+@@ -198,14 +200,17 @@
+     /*
+      * MMDC
+      */
+-    create_unimplemented_device("a7mpcore-mmdc", FSL_IMX6UL_MMDC_CFG_ADDR,
+-                                FSL_IMX6UL_MMDC_CFG_SIZE);
++    sysbus_realize(SYS_BUS_DEVICE(&s->mmdc), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mmdc), 0, FSL_IMX6UL_MMDC_CFG_ADDR);
+ 
+     /*
+      * OCOTP
+      */
+-    create_unimplemented_device("a7mpcore-ocotp", FSL_IMX6UL_OCOTP_CTRL_ADDR,
+-                                FSL_IMX6UL_OCOTP_CTRL_SIZE);
++    /* Read-only shadow fuses; idle CTRL reads zero and writes are ignored. */
++    memory_region_init_rom(&s->ocotp, OBJECT(dev), "imx6ul.ocotp",
++                           FSL_IMX6UL_OCOTP_CTRL_SIZE, &error_abort);
++    memory_region_add_subregion(get_system_memory(),
++                                FSL_IMX6UL_OCOTP_CTRL_ADDR, &s->ocotp);
+ 
+     /*
+      * QSPI
+@@ -633,11 +638,13 @@
+                                     FSL_IMX6UL_CANn_SIZE);
+     }
+ 
+-    /*
+-     * APHB_DMA
+-     */
+-    create_unimplemented_device("aphb_dma", FSL_IMX6UL_APBH_DMA_ADDR,
+-                                FSL_IMX6UL_APBH_DMA_SIZE);
++    /* GPMI/BCH NAND and its APBH DMA engine share one bus segment. */
++    sysbus_realize(SYS_BUS_DEVICE(&s->gpmi), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpmi), 0, FSL_IMX6UL_APBH_DMA_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmi), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6UL_RAWNAND1_IRQ));
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpmi), 1,
++                       qdev_get_gpio_in(gic, FSL_IMX6UL_APBH_DMA_IRQ));
+ 
+     /*
+      * ADCs
+diff --git a/include/hw/arm/fsl-imx6ul.h b/include/hw/arm/fsl-imx6ul.h
+--- a/include/hw/arm/fsl-imx6ul.h
++++ b/include/hw/arm/fsl-imx6ul.h
+@@ -19,6 +19,8 @@
+ 
+ #include "hw/cpu/a15mpcore.h"
+ #include "hw/misc/imx6ul_ccm.h"
++#include "hw/misc/imx6_mmdc.h"
++#include "hw/misc/imx_gpmi_nand.h"
+ #include "hw/misc/imx6_src.h"
+ #include "hw/misc/imx7_snvs.h"
+ #include "hw/intc/imx_gpcv2.h"
+@@ -73,6 +75,8 @@
+     IMXEPITState       epit[FSL_IMX6UL_NUM_EPITS];
+     IMXGPIOState       gpio[FSL_IMX6UL_NUM_GPIOS];
+     IMX6ULCCMState     ccm;
++    Imx6MmdcState      mmdc;
++    ImxGpmiNandState  gpmi;
+     IMX6SRCState       src;
+     IMX7SNVSState      snvs;
+     IMXGPCv2State      gpcv2;
+@@ -85,6 +89,7 @@
+     IMXUSBPHYState     usbphy[FSL_IMX6UL_NUM_USB_PHYS];
+     ChipideaState      usb[FSL_IMX6UL_NUM_USBS];
+     MemoryRegion       rom;
++    MemoryRegion       ocotp;
+     MemoryRegion       caam;
+     MemoryRegion       ocram;
+     MemoryRegion       ocram_alias;
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -14,16 +14,21 @@
+ #include "system/reset.h"
+ #include "system/qtest.h"
+ 
+-#define ONYX_RAM_SIZE (256 * MiB)
++#define ONYX_RAM_SIZE (128 * MiB)
+ 
+ static void onyx_boot(void *opaque)
+ {
+     MachineState *machine = opaque;
++    FslIMX6ULState *soc = FSL_IMX6UL(
++        object_resolve_path_component(OBJECT(machine), "soc"));
+     g_autofree char *image = NULL;
+     gsize len;
+     uint32_t self, entry;
+ 
+     cpu_reset(first_cpu);
++    /* Boot-ROM clock setup: 792 MHz PLL, divided by two by U-Boot. */
++    soc->ccm.analog[CCM_ANALOG_PLL_ARM] = BIT(31) | BIT(13) | 66;
++    soc->ccm.analog[USB_ANALOG_DIGPROG] = 0x00640002;
+     if (!g_file_get_contents(machine->firmware, &image, &len, NULL) ||
+         len < 32 || (uint8_t)image[0] != 0xd1 ||
+         lduw_be_p(image + 1) != 32) {
+@@ -43,17 +48,32 @@
+     cpu_set_pc(first_cpu, entry);
+ }
+ 
++static void onyx_reset(MachineState *machine, ResetType type)
++{
++    qemu_devices_reset(type);
++    if (!qtest_enabled()) {
++        onyx_boot(machine);
++    }
++}
++
+ static void onyx_init(MachineState *machine)
+ {
+     DeviceState *soc;
++    uint8_t *fuses;
+ 
+     if (machine->ram_size != ONYX_RAM_SIZE) {
+-        error_report("onyx: this board has 256 MiB of DDR3");
++        error_report("onyx: this board has 128 MiB of LPDDR2");
+         exit(1);
+     }
+     soc = qdev_new(TYPE_FSL_IMX6UL);
+     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
++    /* Synthetic identity, closed security configuration and thermal trim. */
++    fuses = memory_region_get_ram_ptr(&FSL_IMX6UL(soc)->ocotp);
++    stl_le_p(fuses + 0x410, 0x00000001);
++    stl_le_p(fuses + 0x420, 0x51454d55);
++    stl_le_p(fuses + 0x460, 0x00000002);
++    stl_le_p(fuses + 0x4e0, 1500U << 20);
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6UL_MMDC_ADDR,
+                                 machine->ram);
+     if (!qtest_enabled()) {
+@@ -61,7 +81,6 @@
+             error_report("onyx: supply U-Boot with -bios FILE.imx");
+             exit(1);
+         }
+-        qemu_register_reset(onyx_boot, machine);
+     }
+ }
+ 
+@@ -69,6 +88,7 @@
+ {
+     mc->desc = "Nest Thermostat E (Onyx, i.MX6UL)";
+     mc->init = onyx_init;
++    mc->reset = onyx_reset;
+     mc->max_cpus = FSL_IMX6UL_NUM_CPUS;
+     mc->ignore_memory_transaction_failures = true;
+     mc->default_ram_size = ONYX_RAM_SIZE;
+diff --git a/hw/misc/imx6_mmdc.c b/hw/misc/imx6_mmdc.c
+--- a/hw/misc/imx6_mmdc.c
++++ b/hw/misc/imx6_mmdc.c
+@@ -41,6 +41,10 @@
+ #include "qemu/module.h"
+ 
+ #define MMDC_MDMISC     0x018
++#define MMDC_MDSCR      0x01c
++#define MDSCR_CON_REQ   BIT(15)
++#define MDSCR_CON_ACK   BIT(14)
++#define MDSCR_MRR_ACK   BIT(10)
+ #define MMDC_MAPSR      0x404
+ #define BP_MAPSR_PSD    0       /* power saving disable (RW) */
+ #define BP_MAPSR_PSS    4       /* power saving status (RO, follows !PSD) */
+@@ -75,7 +79,16 @@
+ {
+     Imx6MmdcState *s = IMX6_MMDC(opaque);
+ 
+-    if (off == MMDC_MPZQHWCTRL) {
++    if (off == MMDC_MDSCR) {
++        /* Configuration and LPDDR2 mode-register reads complete at once. */
++        val &= ~(MDSCR_CON_ACK | MDSCR_MRR_ACK);
++        if (val & MDSCR_CON_REQ) {
++            val |= MDSCR_CON_ACK;
++            if (((val >> 4) & 7) == 6) {
++                val |= MDSCR_MRR_ACK;
++            }
++        }
++    } else if (off == MMDC_MPZQHWCTRL) {
+         val = deposit32(val, BP_ZQ_HW_FOR, 1, 0);
+     } else if (off == MMDC_MPDGCTRL0) {
+         val = deposit32(val, BP_RST_RD_FIFO, 1, 0);
+diff --git a/hw/misc/imx6ul_ccm.c b/hw/misc/imx6ul_ccm.c
+--- a/hw/misc/imx6ul_ccm.c
++++ b/hw/misc/imx6ul_ccm.c
+@@ -54,6 +54,7 @@
+ };
+ 
+ static const uint32_t analog_mask[CCM_ANALOG_MAX] = {
++    [TEMPMON_TEMPSENSE0] = 0x000fff00, /* Read-only temperature count. */
+     [CCM_ANALOG_PLL_ARM] = 0xfff60f80,
+     [CCM_ANALOG_PLL_USB1] = 0xfffe0fbc,
+     [CCM_ANALOG_PLL_USB2] = 0xfffe0fbc,
+@@ -780,6 +781,9 @@
+     case USB_ANALOG_USB2_VBUS_DETECT_SET:
+     case USB_ANALOG_USB2_CHRG_DETECT_SET:
+     case USB_ANALOG_USB2_MISC_SET:
++    case TEMPMON_TEMPSENSE0_SET:
++    case TEMPMON_TEMPSENSE1_SET:
++    case TEMPMON_TEMPSENSE2_SET:
+         /*
+          * All REG_NAME_SET register access are in fact targeting
+          * the REG_NAME register. So we change the value of the
+@@ -805,6 +809,9 @@
+     case USB_ANALOG_USB2_VBUS_DETECT_CLR:
+     case USB_ANALOG_USB2_CHRG_DETECT_CLR:
+     case USB_ANALOG_USB2_MISC_CLR:
++    case TEMPMON_TEMPSENSE0_CLR:
++    case TEMPMON_TEMPSENSE1_CLR:
++    case TEMPMON_TEMPSENSE2_CLR:
+         /*
+          * All REG_NAME_CLR register access are in fact targeting
+          * the REG_NAME register. So we change the value of the
+@@ -830,6 +837,9 @@
+     case USB_ANALOG_USB2_VBUS_DETECT_TOG:
+     case USB_ANALOG_USB2_CHRG_DETECT_TOG:
+     case USB_ANALOG_USB2_MISC_TOG:
++    case TEMPMON_TEMPSENSE0_TOG:
++    case TEMPMON_TEMPSENSE1_TOG:
++    case TEMPMON_TEMPSENSE2_TOG:
+         /*
+          * All REG_NAME_TOG register access are in fact targeting
+          * the REG_NAME register. So we change the value of the
+@@ -841,6 +851,16 @@
+         s->analog[index] = (s->analog[index] & analog_mask[index]) |
+                            (value & ~analog_mask[index]);
+         break;
++    }
++    if ((index == TEMPMON_TEMPSENSE0 ||
++         index == TEMPMON_TEMPSENSE0_SET ||
++         index == TEMPMON_TEMPSENSE0_TOG) &&
++        (value & BIT(1)) &&
++        (s->analog[TEMPMON_TEMPSENSE0] & 3) == 2) {
++        /* Complete immediately with a fixed synthetic sensor count. */
++        s->analog[TEMPMON_TEMPSENSE0] =
++            (s->analog[TEMPMON_TEMPSENSE0] & ~0x000fff00) |
++            (1460 << 8) | BIT(2);
+     }
+ }
+ 
+diff --git a/hw/misc/imx_gpmi_nand.c b/hw/misc/imx_gpmi_nand.c
+--- a/hw/misc/imx_gpmi_nand.c
++++ b/hw/misc/imx_gpmi_nand.c
+@@ -76,6 +76,29 @@
+  */
+ static const uint8_t nand_id[8] = { 0x2c, 0xdc, 0x90, 0x95, 0x56, 0, 0, 0 };
+ 
++/* ONFI 1.0: 512 MiB, 2 KiB pages, 64 B OOB, BCH4 per 512 B. */
++static const uint8_t nand_onfi[256] = {
++    [0] = 'O', 'N', 'F', 'I',
++    [4] = 2,
++    [14] = 3, /* Three redundant parameter pages. */
++    [32] = 'Q', 'E', 'M', 'U', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
++    [44] = 'G', 'P', 'M', 'I', ' ', '5', '1', '2', 'M', 'i', 'B', ' ',
++           'N', 'A', 'N', 'D', ' ', ' ', ' ', ' ',
++    [64] = 0x2c,
++    [81] = 8,    /* 2048 data bytes/page. */
++    [84] = 64,   /* Spare bytes/page. */
++    [87] = 8,    /* 2048 data bytes/partial page. */
++    [90] = 64,   /* Spare bytes/partial page. */
++    [92] = 64,   /* Pages/block. */
++    [97] = 0x10, /* 4096 blocks/LUN. */
++    [100] = 1,   /* LUNs. */
++    [101] = 0x23, /* Two column and three row address cycles. */
++    [102] = 1,   /* Bits/cell. */
++    [112] = 4,   /* Required ECC bits per 512 bytes. */
++    [129] = 0x3f, /* Asynchronous timing modes 0-5. */
++    [254] = 0x64, 0x63, /* ONFI CRC16, seed 0x4f4e, polynomial 0x8005. */
++};
++
+ static void nand_reset_chip(ImxGpmiNandState *s)
+ {
+     s->last_cmd = 0;
+@@ -151,8 +174,8 @@
+         s->stream = GPMI_STREAM_ID;
+         s->stream_pos = 0;
+         break;
+-    case 0xec: /* read parameter page (ONFI): fail gracefully */
+-    case 0xed: /* read unique ID: ditto */
++    case 0xec: /* read ONFI parameter pages */
++    case 0xed: /* read unique ID: unsupported */
+         s->last_cmd = cmd;
+         s->addr_expect = 1;
+         s->stream = GPMI_STREAM_PARAM;
+@@ -240,11 +263,17 @@
+ {
+     switch (s->stream) {
+     case GPMI_STREAM_ID:
++        if (s->addr_bytes[0] == 0x20) {
++            return s->stream_pos < 4 ? nand_onfi[s->stream_pos++] : 0;
++        }
+         return s->stream_pos < ARRAY_SIZE(nand_id) ?
+                nand_id[s->stream_pos++] : 0;
+     case GPMI_STREAM_STATUS:
+         return s->status;
+-    case GPMI_STREAM_PARAM: /* no valid ONFI table: all-ones */
++    case GPMI_STREAM_PARAM:
++        if (s->last_cmd == 0xec && s->stream_pos < 3 * sizeof(nand_onfi)) {
++            return nand_onfi[s->stream_pos++ % sizeof(nand_onfi)];
++        }
+         return 0xff;
+     case GPMI_STREAM_PAGE:
+         /*
+@@ -857,6 +886,11 @@
+ {
+     ImxGpmiNandState *s = IMX_GPMI_NAND(obj);
+ 
++    /* All controller registers and NAND scratch state follow apbh_ctrl0. */
++    memset(&s->apbh_ctrl0, 0,
++           sizeof(*s) - offsetof(ImxGpmiNandState, apbh_ctrl0));
++    qemu_irq_lower(s->irq_bch);
++    qemu_irq_lower(s->irq_apbh);
+     nand_reset_chip(s);
+ }
+ 

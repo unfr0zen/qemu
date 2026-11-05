@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Serve a web page that shows the emulated Nest (the gen 3's Display-3.4,
-"Flintstone", or the gen 2, "j49"; --name says which) as a person would see it — the round face with its screen, the rotating
-wheel and the button — with the device's console alongside.
+Serve a web page that shows the emulated Nest (diamond3, j49 or diamond;
+--name says which) as a person would see it — the round face with its
+screen, the rotating wheel and the button — with the console alongside.
 
 run.sh --ui starts this next to QEMU. Everything it knows comes from the
 flintstone.board chardev (see hw/arm/flintstone_board.c): the page's
@@ -18,7 +18,7 @@ The log is the guest's serial console, which QEMU serves on a socket
 
 Standard library only:
 
-    ui.py --board /tmp/flintstone-ui.XXXX/board.sock
+    ui.py --board /tmp/nest-ui.XXXX/board.sock
           [--qmp QMP.sock] [--console tcp:HOST:PORT] [--port 8075]
           [--pins button=HU-BUTTON,...]
           [--parent PID --cleanup DIR]
@@ -1122,7 +1122,7 @@ def main():
     ap.add_argument("--port", type=int, default=8075, help="port to serve on")
     ap.add_argument("--pins", help="name=LINE,... from the board's wiring")
     ap.add_argument("--name", default="Nest",
-                    help="the unit, as the page titles it (e.g. 'Nest gen 3')")
+                    help="the unit, as the page titles it (e.g. 'Nest diamond3')")
     ap.add_argument("--screen-period", type=float, default=0.01,
                     help="seconds between screendumps")
     ap.add_argument("--parent", type=int,
@@ -1146,7 +1146,7 @@ def main():
     qmp = Qmp(args.qmp) if args.qmp else None
     screen = Screen(qmp, args.screen_file or
                     os.path.join(os.environ.get("TMPDIR", "/tmp"),
-                                 "flintstone-screen.ppm"),
+                                 "nest-screen.ppm"),
                     args.screen_period)
     threading.Thread(target=screen.run, daemon=True).start()
 
@@ -1165,7 +1165,7 @@ def main():
         threading.Thread(target=Keyboard(log, qmp, args.parent).run,
                          daemon=True).start()
     if not args.parent:     # run.sh prints it before QEMU takes the tty
-        print(f"Flintstone UI: http://127.0.0.1:{args.port}", file=sys.stderr)
+        print(f"{args.name} UI: http://127.0.0.1:{args.port}", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

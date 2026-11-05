@@ -24,7 +24,7 @@ class UdcTest(unittest.TestCase):
         self.sockets = []
         self.streams = []
         self.proc = subprocess.Popen([
-            os.environ["QEMU_SYSTEM_ARM"], "-M", "flintstone,usb0-hostchar=usb",
+            os.environ["QEMU_SYSTEM_ARM"], "-M", "diamond3,usb0-hostchar=usb",
             "-accel", "qtest", "-display", "none", "-nodefaults",
             "-qtest", f"unix:{self.root}/qtest,server=on,wait=off",
             "-qmp", f"unix:{self.root}/qmp,server=on,wait=off",

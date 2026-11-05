@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Boot stock firmware in the flintstone, j49 or diamond machine.
+# Boot stock firmware in the diamond3, j49, diamond or onyx machine.
 #
 # The stock U-Boot image is carved out of the NAND image by the machine's
 # boot ROM stub itself: nothing external is loaded, the ROM reads the NAND
@@ -20,7 +20,7 @@
 #                                   #   default it gets DHCP and no further)
 #   ./run.sh --no-provision      # boot the NAND exactly as it is
 #   ./run.sh --hostname NAME     # NAME in the console prompt instead of
-#                                   #   the serial number (gen 3)
+#                                   #   the serial number (diamond3)
 #   ./run.sh --sleep             # the display's stock 20 s timeout (by
 #                                   #   default the pre-boot keeps it on)
 #   ./run.sh --nand FILE         # seed the NAND state from FILE (only
@@ -30,7 +30,7 @@
 #                                   #   10.0.2.100:1883, and nothing else
 #   ./run.sh --nic-extra OPTS    # more -nic user options (guestfwd=...)
 #   ./run.sh --ssh PORT          # the unit's port 22 on 127.0.0.1:PORT
-#   ./run.sh --ui --fs ro        # live files through QEMU's debugger (gen 3)
+#   ./run.sh --ui --fs ro        # live files through QEMU's debugger (diamond3)
 #   ./run.sh --ui --fs rw        # also allow atomic writes through the kernel
 #   ./run.sh --ui --gdb          # MCP ARM debugging (shares --fs when enabled)
 #   ./run.sh --stock-image FILE  # write FILE: the image as a unit that
@@ -39,8 +39,10 @@
 #   ./run.sh --root1             # boot root1 first from now on (the other
 #                                   #   system-update slot; --root0 back), as
 #                                   #   a system update switches it
-#   ./run.sh --gen2 [--ui]       # the gen 2 (j49) from its own image
-#   ./run.sh --gen1 [--ui]       # the gen 1 (diamond) from its own raw NAND
+#   ./run.sh --diamond3 [--ui]   # diamond3 (the default machine)
+#   ./run.sh --j49 [--ui]        # j49 from its own image
+#   ./run.sh --diamond [--ui]    # diamond from its own raw NAND
+#   ./run.sh --onyx [--ui]       # Onyx NAND bring-up (serial/QMP only)
 #   ./run.sh --machine diamond   # explicit machine selection
 #
 # QEMU_FORCE_DOCKER=1 runs a native build through Linux/Docker as well.
@@ -93,10 +95,12 @@ root=""
 nand_arg=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --gen2) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=j49; shift ;;
-        --gen1) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=diamond; shift ;;
+        --diamond3) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=diamond3; shift ;;
+        --j49) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=j49; shift ;;
+        --diamond) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=diamond; shift ;;
+        --onyx) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }; machine_option=onyx; shift ;;
         --machine) [ -z "$machine_option" ] || { echo "ERROR: choose one machine" >&2; exit 1; }
-                   case "$2" in flintstone|j49|diamond) machine_option=$2 ;; *) echo "ERROR: unknown machine: $2" >&2; exit 1 ;; esac
+                   case "$2" in diamond3|j49|diamond|onyx) machine_option=$2 ;; *) echo "ERROR: unknown machine: $2" >&2; exit 1 ;; esac
                    shift 2 ;;
         --root0) root=0; shift ;;
         --root1) root=1; shift ;;
@@ -118,10 +122,10 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
-machine=${machine_option:-flintstone}
+machine=${machine_option:-diamond3}
 if [ -n "$fs_mode" ]; then
-    if [ "$machine" != flintstone ] || [ "$ui" != 1 ] || [ -n "$stock_image" ]; then
-        echo "ERROR: --fs needs gen 3 and --ui" >&2
+    if [ "$machine" != diamond3 ] || [ "$ui" != 1 ] || [ -n "$stock_image" ]; then
+        echo "ERROR: --fs needs diamond3 and --ui" >&2
         exit 1
     fi
 fi
@@ -138,8 +142,17 @@ if [ "$machine" = diamond ] && [ -n "$stock_image" ]; then
     echo "ERROR: --stock-image needs a validated Diamond NAND image" >&2
     exit 1
 fi
+if [ "$machine" = onyx ]; then
+    if [ "$usb" = 1 ] || [ "$cloud" = 1 ] || [ "$sleep" = 1 ] ||
+        [ -n "$hostname$stock_image$mqtt$nic_extra$ssh_port$root" ] || [ "$gdb" = 1 ]; then
+        echo "ERROR: Onyx supports --nand, --ui and --ui-port; provisioning, networking and board helpers are not modelled" >&2
+        exit 1
+    fi
+    usb=0
+    provision=0
+fi
 omap=0
-if [ "$machine" != flintstone ]; then omap=1; fi
+if [ "$machine" = j49 ] || [ "$machine" = diamond ]; then omap=1; fi
 if [ "$machine" = diamond ]; then provision=0; fi
 
 usb_attach=""
@@ -148,7 +161,7 @@ if [ "$omap" = 1 ] && [ "$usb" = auto ]; then
 fi
 if [ "$usb" != 0 ]; then
     if [ "$omap" = 1 ]; then
-        echo "ERROR: --usb requires gen 3 (flintstone); the OMAP machines have no UDC bridge." >&2
+        echo "ERROR: --usb requires diamond3; the OMAP machines have no UDC bridge." >&2
         exit 1
     fi
     if [ "$(uname -s)" = Linux ]; then
@@ -224,10 +237,10 @@ pick_port() {
 # (or $NAND) names, else .qemu/nand.bin. It is only needed to seed the
 # state; once the state exists, a plain run boots that alone.
 NAND_PRISTINE="$repo_root/.qemu/nand.bin"
-MACHINE_ARGS="-M flintstone -m 512M"
+MACHINE_ARGS="-M diamond3 -m 512M"
 NAND_STATE_DEFAULT="$repo_root/.qemu/nand-state.bin"
 if [ "$machine" = j49 ]; then
-    # The gen 2 boots its raw NAND (data + OOB pages), as nand.raw. No
+    # The j49 boots its raw NAND (data + OOB pages), as nand.raw. No
     # image ships here: it carries the unit's data and its owner's
     # credentials.
     MACHINE_ARGS="-M j49 -m 64M"
@@ -239,6 +252,10 @@ if [ "$machine" = diamond ]; then
     NAND_PRISTINE="$repo_root/.qemu/diamond-nand.raw"
     NAND_STATE_DEFAULT="$repo_root/.qemu/diamond-nand-state.raw"
 fi
+if [ "$machine" = onyx ]; then
+    NAND_PRISTINE="$repo_root/.qemu/onyx/nand.bin"
+    NAND_STATE_DEFAULT="$repo_root/.qemu/onyx/nand-state.bin"
+fi
 [ -n "$nand_arg" ] && NAND="$nand_arg"
 nand_given="$NAND"
 NAND="${NAND:-$NAND_PRISTINE}"
@@ -248,7 +265,7 @@ use_state=0
     [ "$NAND_FRESH" != "1" ] && [ -f "$NAND_STATE" ] && use_state=1
 if [ "$use_state" = 0 ] && [ ! -f "$NAND" ]; then
     echo "ERROR: NAND image not found: $NAND" >&2
-    echo "  no NAND state at $NAND_STATE either: seed it with ./run.sh$([ "$machine" = diamond ] && echo " --gen1")$([ "$machine" = j49 ] && echo " --gen2") --nand FILE" >&2
+    echo "  no NAND state at $NAND_STATE either: seed it with ./run.sh$([ "$machine" = diamond ] && echo " --diamond")$([ "$machine" = j49 ] && echo " --j49")$([ "$machine" = onyx ] && echo " --onyx") --nand FILE" >&2
     exit 1
 fi
 if [ "$use_state" = 1 ] && [ -n "$nand_given" ]; then
@@ -257,6 +274,7 @@ fi
 # The backplate MCU's flash (backplate.py --flash) belongs to the unit the
 # NAND is: it sits next to the image, and a copy of the NAND takes it along.
 clone_backplate() {                # clone_backplate SRC_NAND DST_NAND
+    [ "$machine" = onyx ] && return 0
     rm -f "$2.backplate"
     [ -f "$1.backplate" ] && cp "$1.backplate" "$2.backplate"
     return 0
@@ -272,6 +290,7 @@ elif [ "$NAND_SNAPSHOT" = "1" ]; then
     # A scratch clone, made anew each run: the provisioning boot below
     # writes to the NAND, and the pristine image must never be written.
     NAND_SCRATCH="$repo_root/.qemu/nand-snapshot.bin"
+    [ "$machine" = onyx ] && NAND_SCRATCH="$repo_root/.qemu/onyx/nand-snapshot.bin"
     mkdir -p "$(dirname "$NAND_SCRATCH")"
     rm -f "$NAND_SCRATCH"
     cp -c "$NAND" "$NAND_SCRATCH" 2>/dev/null ||
@@ -301,6 +320,18 @@ fi
 QEMU_ICOUNT="${QEMU_ICOUNT:-off}"
 ICOUNT_ARGS=""
 [ "$QEMU_ICOUNT" != "off" ] && ICOUNT_ARGS="-icount $QEMU_ICOUNT"
+
+if [ "$machine" = onyx ]; then
+    set -- -- "$@"
+    if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
+        tag="imx6-qemu-build:$(shasum -a 256 "$script_path/docker/Dockerfile" | cut -c1-12)"
+        set -- --docker "$tag" "$@"
+    fi
+    [ "$ui" = 1 ] && set -- --ui "$@"
+    exec python3 "$script_path/boards/onyx/launch.py" \
+        --qemu "$QEMU" --nand "$NAND" --snapshot "$NAND_SNAP" \
+        --ui-port "$ui_port" "$@"
+fi
 
 extra=""
 case "$*" in
@@ -362,7 +393,7 @@ fi
 # nothing is kept on the host, so any checkout and any NAND boot the same.
 PROVISION_QEMU="$MACHINE_ARGS -nographic -nic none"
 run_provision() {
-    [ "$machine" = j49 ] && set -- --gen2 "$NAND" "$@"
+    [ "$machine" = j49 ] && set -- --j49 "$NAND" "$@"
     [ "$machine" != j49 ] && [ -n "$root" ] && set -- --root "$root" "$@"
     [ "$sleep" = 1 ] && set -- --sleep "$@"
     [ "$machine" != j49 ] && [ -n "$hostname" ] && set -- --hostname "$hostname" "$@"
@@ -377,14 +408,14 @@ run_provision() {
     fi
 }
 # --root0/--root1: the boot slot, which a system update switches through
-# U-Boot's bootcmd and the unit keeps from then on. The gen 2's environment
-# is edited here, as fw_setenv would; the gen 3's at U-Boot's prompt, by the
+# U-Boot's bootcmd and the unit keeps from then on. The j49's environment
+# is edited here, as fw_setenv would; the diamond3's at U-Boot's prompt, by the
 # pre-boot.
 if [ -n "$root" ] && [ "$omap" = 1 ]; then
     slot=$(python3 "$script_path/boards/j49/j49_env.py" "$NAND" --root "$root") || exit 1
     echo "boot slot: $slot" >&2
 elif [ -n "$root" ] && [ "$provision" = 0 ] && [ -z "$stock_image" ]; then
-    echo "ERROR: --root$root needs the pre-boot on gen 3 (drop --no-provision)" >&2
+    echo "ERROR: --root$root needs the pre-boot on diamond3 (drop --no-provision)" >&2
     exit 1
 fi
 if [ "$machine" = j49 ] && { [ "$provision" = 1 ] || [ -n "$stock_image" ]; }; then
@@ -401,7 +432,7 @@ if [ -n "$stock_image" ]; then
         exit 1
     fi
     echo "stock image: $NAND (boot it with NAND=$NAND NAND_SNAPSHOT=1" \
-         "./run.sh$([ "$machine" = j49 ] && echo " --gen2") --no-provision)" >&2
+         "./run.sh$([ "$machine" = j49 ] && echo " --j49") --no-provision)" >&2
     exit 0
 elif [ "$provision" = 1 ]; then
     run_provision || echo "provision: booting the unit as it is" >&2
@@ -525,7 +556,7 @@ $FS_QEMU_ARGS $SERIAL_ARGS $BOARD_ARGS \
         --screen-file "$ui_dir/screen.ppm" \
         --port "$http_port" \
         --pins "$PINS" \
-        --name "Nest gen $([ "$machine" = diamond ] && echo 1 || { [ "$machine" = j49 ] && echo 2 || echo 3; })" \
+        --name "Nest $machine" \
         --backplate "tcp:127.0.0.1:$bpctl_port" \
         $FS_UI_ARGS \
         --parent $$ --cleanup "$ui_dir" < "$ui_stdin" &
@@ -535,9 +566,9 @@ $FS_QEMU_ARGS $SERIAL_ARGS $BOARD_ARGS \
     python3 "$script_path/ui/backplate.py" --serial "tcp:127.0.0.1:$bp_port" \
         --control "tcp:127.0.0.1:$bpctl_port" \
         --flash "$NAND.backplate" --board "$machine" --parent $$ &
-    # The Thread radio (em35x-ncp on ECSPI3, McSPI2 on the gen 2): the
+    # The Thread radio (em35x-ncp on ECSPI3, McSPI2 on the j49): the
     # ConnectIP network co-processor wpantund drives (ui/em35x.py
-    # --debug logs it). The gen 2's EUI-64 is the unit's own, from its
+    # --debug logs it). The j49's EUI-64 is the unit's own, from its
     # environment (hwaddr1), as the unit reports its 15.4 MAC address.
     NCP_ARGS=""
     if [ "$machine" = j49 ]; then

@@ -208,11 +208,11 @@ BSL = dict(version="3.1", description="BSL",
 # The j49's Backplate-2.2x uses these firmware identities. Diamond uses
 # this model provisionally. The suffix is a guess within the image's
 # Backplate-2.20 to 2.30.
-GEN2_MODEL = b"Backplate-2.21"
-GEN2_MONO = dict(version="4.2.8", description="TFE (BP_D2D)",
+J49_MODEL = b"Backplate-2.21"
+J49_MONO = dict(version="4.2.8", description="TFE (BP_D2D)",
                  host="jenkins-agent-143-v17-emb-prod", user="jenkins-slave",
                  date="2019-04-03 17:36:54")
-GEN2_BSL = dict(GEN2_MONO, version="3.1", description="BSL")
+J49_BSL = dict(J49_MONO, version="3.1", description="BSL")
 
 
 def srec_image(records):
@@ -278,7 +278,7 @@ class Backplate:
                  temp_c=21.5, rh=45.0, presence=True, period=2.0,
                  wires=("Rh", "C", "W1", "Y1", "G"), flash_file=None,
                  ambient=16.0, heat_rate=3.0, cool_rate=2.5, room_tau=8.0,
-                 board="flintstone"):
+                 board="diamond3"):
         self.spec = spec
         self.debug = debug
         self.als_vis = als_vis
@@ -305,15 +305,15 @@ class Backplate:
         self.wires = wires
         self.attached = threading.Event()     # the front unit reset us
         self.board = board
-        self.model = GEN2_MODEL if board != "flintstone" else b"Backplate-6.0"
-        self.mono = dict(GEN2_MONO if board != "flintstone" else MONO)
-        self.bsl = dict(GEN2_BSL if board != "flintstone" else BSL)
+        self.model = J49_MODEL if board != "diamond3" else b"Backplate-6.0"
+        self.mono = dict(J49_MONO if board != "diamond3" else MONO)
+        self.bsl = dict(J49_BSL if board != "diamond3" else BSL)
         self.flash_file = flash_file
         if flash_file and os.path.exists(flash_file):
             with open(flash_file) as f:
                 saved = json.load(f)
             # Keep saved firmware only for the selected backplate family.
-            if saved["mono"]["description"].startswith("TFE (BP_D2") == (board != "flintstone"):
+            if saved["mono"]["description"].startswith("TFE (BP_D2") == (board != "diamond3"):
                 self.mono, self.bsl = saved["mono"], saved["bsl"]
         self.update = None                    # (kind, {seq: record}) in the BSL
         self.buf = b""
@@ -447,8 +447,8 @@ class Backplate:
             self.als_samples = self.als_samples[-(MAX_ALS - 1):] + [struct.pack("<HHH", 0, v, v)]
         if self.presence:
             self.send(MSG_PIR, struct.pack("<HH", 0x03E8, 0x03E8))
-            # The gen 2's near PIR: someone close, past stock's threshold (15).
-            if self.board != "flintstone":
+            # The j49's near PIR: someone close, past stock's threshold (15).
+            if self.board != "diamond3":
                 self.send(MSG_NEAR_PIR, struct.pack("<H", 100))
 
     def flush(self):
@@ -563,7 +563,7 @@ class Backplate:
         if (low is not None and self.temp_c < low) or (high is not None and self.temp_c > high):
             fired |= WAKE_TEMP
         if self.presence:
-            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.board != "flintstone" else 0)
+            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.board != "diamond3" else 0)
         return fired & (self.wake_sources | WAKE_TIMER)
 
     def serve_forever(self):
@@ -704,7 +704,7 @@ def main():
                     help="connected terminals, of " + ",".join(WIRE_INDEX))
     ap.add_argument("--control", metavar="tcp:HOST:PORT",
                     help="take room and wiring changes as JSON lines here")
-    ap.add_argument("--board", choices=("flintstone", "j49", "diamond"), default="flintstone",
+    ap.add_argument("--board", choices=("diamond3", "j49", "diamond"), default="diamond3",
                     help="backplate board model; Diamond uses the provisional j49 model")
     ap.add_argument("--flash", metavar="FILE",
                     help="the MCU's flash: the firmware it runs, kept across "

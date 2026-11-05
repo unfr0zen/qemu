@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check real MCP cable control, stock firmware, and Linux USB/IP attachment.
 
-Run against a booted gen 3 unit with host USB attached:
+Run against a booted diamond3 unit with host USB attached:
     python3 tests/check_usb_cable.py --url http://127.0.0.1:8075 --host-busid 5-1
 
 The selected host device must belong to this unit. JSON observations go to

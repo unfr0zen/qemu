@@ -2,19 +2,22 @@
 
 QEMU machines that boot the stock firmware of Nest Learning Thermostats from their NAND image.
 
-![The gen 3 running in the --ui web page](docs/assets/ui.png)
+![The diamond3 running in the --ui web page](docs/assets/ui.png)
 
 ## Support
 
 | Machine | Unit | SoC | Firmware |
 | --- | --- | --- | --- |
-| `-M flintstone` | gen 3 (Display-3.4) | i.MX6SoloX | U-Boot 2014.04, Linux 4.1.15, UBIFS root |
-| `-M j49` | gen 2 (Display-2.x) | TI AM3703 | x-loader, U-Boot 2012.10, Linux 2.6.37, JFFS2 root |
+| `-M diamond3` | diamond3 (Display-3.4) | i.MX6SoloX | U-Boot 2014.04, Linux 4.1.15, UBIFS root |
+| `-M j49` | j49 (Display-2.x) | TI AM3703 | x-loader, U-Boot 2012.10, Linux 2.6.37, JFFS2 root |
+
+[Nest Thermostat E (`onyx`)](docs/qemu-onyx.md) has a separate U-Boot UART
+bring-up target, not full firmware boot support.
 
 - Modelled: display, ring, button, piezo, backplate, WiFi, Thread radio.
-- Gen 3 USB: automatic host attachment on supported Linux hosts;
+- diamond3 USB: automatic host attachment on supported Linux hosts;
   [USB/IP export](docs/usb-host-bridge-protocol.md) on macOS.
-- Not modelled: gen 2 USB device mode, ENET, other Thread nodes.
+- Not modelled: j49 USB device mode, ENET, other Thread nodes.
 - Hosts: Linux, macOS (Apple silicon and Intel).
 
 ## Setup
@@ -57,16 +60,24 @@ You supply the NAND image; formats in [docs/nand-image.md](docs/nand-image.md).
 `--nand` seeds a working copy in `.qemu/`; the source image is never written.
 
 ```sh
-# gen 3: 512 MiB logical image (data pages only)
+# diamond3: 512 MiB logical image (data pages only)
 ./run.sh --nand nand-logical.bin   # first boot
 ./run.sh                           # later boots
 ./run.sh --ui                      # + web page at http://127.0.0.1:8075
 ./run.sh --no-usb                  # opt out of automatic Linux USB attachment
 
-# gen 2: raw chip, data + OOB pages
-./run.sh --gen2 --nand nand-j49.raw
-./run.sh --gen2 --ui
+# j49: raw chip, data + OOB pages
+./run.sh --j49 --nand nand-j49.raw
+./run.sh --j49 --ui
+
+# Onyx bring-up: firmware is embedded in the prepared NAND image
+./run.sh --onyx --ui              # uses .qemu/onyx/nand-state.bin
 ```
+
+Onyx's UI provides serial console and QMP only; display, ring, backplate,
+radio, networking and USB are not modelled. It skips provisioning and disables
+watchdog resets for bring-up. `--onyx --nand FILE` seeds its working copy from
+a prepared Onyx NAND image; no `-bios` or separate firmware files are required.
 
 | Option | Effect |
 | --- | --- |
@@ -76,7 +87,7 @@ You supply the NAND image; formats in [docs/nand-image.md](docs/nand-image.md).
 | `--mqtt HOST[:PORT]` | guest reaches a broker at `10.0.2.100:1883` |
 | `--no-provision` | boot the NAND unmodified |
 | `--sleep` | keep the stock 20 s screen timeout |
-| `--hostname NAME` | NAME in the console prompt instead of the serial number (gen 3) |
+| `--hostname NAME` | NAME in the console prompt instead of the serial number (diamond3) |
 | `--nlclient FILE` | isolated NAND, install FILE as nlclient after boot |
 | `--root0` / `--root1` | select the boot slot |
 | `NAND_FRESH=1` | re-seed `.qemu/` from `--nand FILE` |

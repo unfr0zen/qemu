@@ -1,0 +1,324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:30:00 -0500
+Subject: [PATCH] hw/misc: add i.MX6UL IOMUXC UART1 pad routing
+
+Store the IOMUXC mux, pad-control and input-select registers and route
+UART1 DCE through its TX/RX pads and receive daisy selector. Redrive pad
+connections on reset and after migration.
+
+Give the i.MX UART external TX/RX connection inputs. Disconnecting TX
+discards host output without stalling transmission; disconnected RX
+discards input and break events instead of buffering them for reconnect.
+Boards without mux wiring retain their directly connected UARTs.
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -904,8 +904,10 @@
+ F: hw/arm/mcimx6ul-evk.c
+ F: hw/arm/fsl-imx6ul.c
+ F: hw/misc/imx6ul_ccm.c
++F: hw/misc/imx6ul_iomuxc.c
+ F: include/hw/arm/fsl-imx6ul.h
+ F: include/hw/misc/imx6ul_ccm.h
++F: include/hw/misc/imx6ul_iomuxc.h
+ F: docs/system/arm/mcimx6ul-evk.rst
+ 
+ MCIMX7D SABRE / i.MX7
+diff --git a/hw/char/imx_serial.c b/hw/char/imx_serial.c
+--- a/hw/char/imx_serial.c
++++ b/hw/char/imx_serial.c
+@@ -288,7 +288,9 @@
+         if (s->ucr2 & UCR2_TXEN) {
+             /* XXX this blocks entire thread. Rewrite to use
+              * qemu_chr_fe_write and background I/O callbacks */
+-            qemu_chr_fe_write_all(&s->chr, &ch, 1);
++            if (s->tx_connected) {
++                qemu_chr_fe_write_all(&s->chr, &ch, 1);
++            }
+             s->usr1 &= ~USR1_TRDY;
+             s->usr2 &= ~USR2_TXDC;
+             imx_update(s);
+@@ -387,6 +389,10 @@
+ {
+     IMXSerialState *s = (IMXSerialState *)opaque;
+ 
++    /* Host bytes on a disconnected RX pad are lost, not buffered. */
++    if (!s->rx_connected) {
++        return FIFO_SIZE;
++    }
+     return s->ucr2 & UCR2_RXEN ? fifo32_num_free(&s->rx_fifo) : 0;
+ }
+ 
+@@ -417,6 +423,9 @@
+ {
+     IMXSerialState *s = (IMXSerialState *)opaque;
+ 
++    if (!s->rx_connected) {
++        return;
++    }
+     s->usr2 |= USR2_WAKE;
+ 
+     for (int i = 0; i < size; i++) {
+@@ -426,7 +435,9 @@
+ 
+ static void imx_event(void *opaque, QEMUChrEvent event)
+ {
+-    if (event == CHR_EVENT_BREAK) {
++    IMXSerialState *s = IMX_SERIAL(opaque);
++
++    if (event == CHR_EVENT_BREAK && s->rx_connected) {
+         imx_put_data(opaque, URXD_BRK | URXD_FRMERR | URXD_ERR);
+     }
+ }
+@@ -452,6 +463,19 @@
+                              imx_event, NULL, s, NULL, true);
+ }
+ 
++static void imx_serial_tx_connected(void *opaque, int n, int level)
++{
++    IMX_SERIAL(opaque)->tx_connected = level;
++}
++
++static void imx_serial_rx_connected(void *opaque, int n, int level)
++{
++    IMXSerialState *s = IMX_SERIAL(opaque);
++
++    s->rx_connected = level;
++    qemu_chr_fe_accept_input(&s->chr);
++}
++
+ static void imx_serial_init(Object *obj)
+ {
+     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+@@ -461,6 +485,13 @@
+                           TYPE_IMX_SERIAL, 0x1000);
+     sysbus_init_mmio(sbd, &s->iomem);
+     sysbus_init_irq(sbd, &s->irq);
++    /* Boards without pin-mux wiring retain the directly connected UART. */
++    s->tx_connected = true;
++    s->rx_connected = true;
++    qdev_init_gpio_in_named(DEVICE(obj), imx_serial_tx_connected,
++                            "tx-connected", 1);
++    qdev_init_gpio_in_named(DEVICE(obj), imx_serial_rx_connected,
++                            "rx-connected", 1);
+ }
+ 
+ static const Property imx_serial_properties[] = {
+diff --git a/include/hw/char/imx_serial.h b/include/hw/char/imx_serial.h
+--- a/include/hw/char/imx_serial.h
++++ b/include/hw/char/imx_serial.h
+@@ -123,6 +123,8 @@
+ 
+     qemu_irq irq;
+     CharFrontend chr;
++    bool tx_connected;
++    bool rx_connected;
+ };
+ 
+ #endif
+diff --git a/hw/arm/fsl-imx6ul.c b/hw/arm/fsl-imx6ul.c
+--- a/hw/arm/fsl-imx6ul.c
++++ b/hw/arm/fsl-imx6ul.c
+@@ -48,6 +48,7 @@
+      * CCM
+      */
+     object_initialize_child(obj, "ccm", &s->ccm, TYPE_IMX6UL_CCM);
++    object_initialize_child(obj, "iomuxc", &s->iomuxc, TYPE_IMX6UL_IOMUXC);
+     object_initialize_child(obj, "mmdc", &s->mmdc, TYPE_IMX6_MMDC);
+     object_initialize_child(obj, "gpmi", &s->gpmi, TYPE_IMX_GPMI_NAND);
+ 
+@@ -321,8 +322,14 @@
+     /*
+      * IOMUXC
+      */
+-    create_unimplemented_device("iomuxc", FSL_IMX6UL_IOMUXC_ADDR,
+-                                FSL_IMX6UL_IOMUXC_SIZE);
++    sysbus_realize(SYS_BUS_DEVICE(&s->iomuxc), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->iomuxc), 0, FSL_IMX6UL_IOMUXC_ADDR);
++    qdev_connect_gpio_out_named(DEVICE(&s->iomuxc), "uart1-tx-connected", 0,
++                                qdev_get_gpio_in_named(DEVICE(&s->uart[0]),
++                                                       "tx-connected", 0));
++    qdev_connect_gpio_out_named(DEVICE(&s->iomuxc), "uart1-rx-connected", 0,
++                                qdev_get_gpio_in_named(DEVICE(&s->uart[0]),
++                                                       "rx-connected", 0));
+     create_unimplemented_device("iomuxc_gpr", FSL_IMX6UL_IOMUXC_GPR_ADDR,
+                                 FSL_IMX6UL_IOMUXC_GPR_SIZE);
+ 
+diff --git a/include/hw/arm/fsl-imx6ul.h b/include/hw/arm/fsl-imx6ul.h
+--- a/include/hw/arm/fsl-imx6ul.h
++++ b/include/hw/arm/fsl-imx6ul.h
+@@ -19,6 +19,7 @@
+ 
+ #include "hw/cpu/a15mpcore.h"
+ #include "hw/misc/imx6ul_ccm.h"
++#include "hw/misc/imx6ul_iomuxc.h"
+ #include "hw/misc/imx6_mmdc.h"
+ #include "hw/misc/imx_gpmi_nand.h"
+ #include "hw/misc/imx6_src.h"
+@@ -75,6 +76,7 @@
+     IMXEPITState       epit[FSL_IMX6UL_NUM_EPITS];
+     IMXGPIOState       gpio[FSL_IMX6UL_NUM_GPIOS];
+     IMX6ULCCMState     ccm;
++    IMX6ULIOMUXCState  iomuxc;
+     Imx6MmdcState      mmdc;
+     ImxGpmiNandState  gpmi;
+     IMX6SRCState       src;
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -64,6 +64,7 @@
+   'imx6_ccm.c',
+   'imx6_src.c',
+   'imx6ul_ccm.c',
++  'imx6ul_iomuxc.c',
+   'imx7_ccm.c',
+   'imx7_src.c',
+   'imx7_gpr.c',
+diff --git a/hw/misc/imx6ul_iomuxc.c b/hw/misc/imx6ul_iomuxc.c
+new file mode 100644
+--- /dev/null
++++ b/hw/misc/imx6ul_iomuxc.c
+@@ -0,0 +1,116 @@
++/*
++ * i.MX6UL IOMUXC register storage and UART1 DCE pad routing.
++ *
++ * Other peripheral routes and electrical pad characteristics are not modelled.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "hw/misc/imx6ul_iomuxc.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/module.h"
++
++#define UART1_TX_MUX  0x084
++#define UART1_RX_MUX  0x088
++#define UART1_RX_SEL  0x624
++#define MUX_MODE_MASK 0xf
++
++static void imx6ul_iomuxc_update(IMX6ULIOMUXCState *s)
++{
++    qemu_set_irq(s->uart1_tx,
++                 (s->regs[UART1_TX_MUX / 4] & MUX_MODE_MASK) == 0);
++    qemu_set_irq(s->uart1_rx,
++                 (s->regs[UART1_RX_MUX / 4] & MUX_MODE_MASK) == 0 &&
++                 (s->regs[UART1_RX_SEL / 4] & 7) == 3);
++}
++
++static uint64_t imx6ul_iomuxc_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX6ULIOMUXCState *s = IMX6UL_IOMUXC(opaque);
++
++    return s->regs[offset / 4];
++}
++
++static void imx6ul_iomuxc_write(void *opaque, hwaddr offset, uint64_t value,
++                               unsigned size)
++{
++    IMX6ULIOMUXCState *s = IMX6UL_IOMUXC(opaque);
++
++    s->regs[offset / 4] = value;
++    if (offset == UART1_TX_MUX || offset == UART1_RX_MUX ||
++        offset == UART1_RX_SEL) {
++        imx6ul_iomuxc_update(s);
++    }
++}
++
++static const MemoryRegionOps imx6ul_iomuxc_ops = {
++    .read = imx6ul_iomuxc_read,
++    .write = imx6ul_iomuxc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void imx6ul_iomuxc_reset_hold(Object *obj, ResetType type)
++{
++    IMX6ULIOMUXCState *s = IMX6UL_IOMUXC(obj);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    imx6ul_iomuxc_update(s);
++}
++
++static int imx6ul_iomuxc_post_load(void *opaque, int version_id)
++{
++    imx6ul_iomuxc_update(IMX6UL_IOMUXC(opaque));
++    return 0;
++}
++
++static const VMStateDescription vmstate_imx6ul_iomuxc = {
++    .name = TYPE_IMX6UL_IOMUXC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = imx6ul_iomuxc_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, IMX6ULIOMUXCState, IMX6UL_IOMUXC_SIZE / 4),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx6ul_iomuxc_init(Object *obj)
++{
++    IMX6ULIOMUXCState *s = IMX6UL_IOMUXC(obj);
++
++    memory_region_init_io(&s->iomem, obj, &imx6ul_iomuxc_ops, s,
++                          TYPE_IMX6UL_IOMUXC, IMX6UL_IOMUXC_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->uart1_tx,
++                             "uart1-tx-connected", 1);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->uart1_rx,
++                             "uart1-rx-connected", 1);
++}
++
++static void imx6ul_iomuxc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->vmsd = &vmstate_imx6ul_iomuxc;
++    dc->desc = "i.MX6UL IOMUXC (UART1 DCE routing)";
++    dc->user_creatable = false;
++    rc->phases.hold = imx6ul_iomuxc_reset_hold;
++}
++
++static const TypeInfo imx6ul_iomuxc_info = {
++    .name = TYPE_IMX6UL_IOMUXC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX6ULIOMUXCState),
++    .instance_init = imx6ul_iomuxc_init,
++    .class_init = imx6ul_iomuxc_class_init,
++};
++
++static void imx6ul_iomuxc_register_types(void)
++{
++    type_register_static(&imx6ul_iomuxc_info);
++}
++
++type_init(imx6ul_iomuxc_register_types)
+diff --git a/include/hw/misc/imx6ul_iomuxc.h b/include/hw/misc/imx6ul_iomuxc.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/misc/imx6ul_iomuxc.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef IMX6UL_IOMUXC_H
++#define IMX6UL_IOMUXC_H
++
++#include "hw/core/sysbus.h"
++
++#define TYPE_IMX6UL_IOMUXC "imx6ul-iomuxc"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX6ULIOMUXCState, IMX6UL_IOMUXC)
++
++#define IMX6UL_IOMUXC_SIZE 0x700
++
++struct IMX6ULIOMUXCState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t regs[IMX6UL_IOMUXC_SIZE / 4];
++    qemu_irq uart1_tx;
++    qemu_irq uart1_rx;
++};
++
++#endif

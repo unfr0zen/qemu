@@ -1,4 +1,4 @@
-# QEMU emulator (`-M flintstone`)
+# QEMU emulator (`-M diamond3`)
 
 This repo builds a QEMU machine for the Nest Display-3.4 board (`diamond3`,
 i.MX6SoloX) that boots the device's own firmware from a NAND image:
@@ -7,7 +7,7 @@ with no emulator-specific image. The unit reaches `login:` in about 30 s,
 draws nlclient's UI, reads a live wheel, button and backplate, and joins
 WiFi with internet access. The hardware facts the model is built from
 (`fdt@3`, the U-Boot IVT/DCD, the kernel config) are in
-[`spec-flintstone.md`](spec-flintstone.md). The gen 2 has a machine of its own,
+[`spec-flintstone.md`](spec-flintstone.md). The j49 has a machine of its own,
 `-M j49` ([`qemu-j49.md`](qemu-j49.md)).
 
 ## Quick start
@@ -35,6 +35,7 @@ in the same image.
 
 | Option / variable | Effect |
 | --- | --- |
+| `--diamond3`, `--j49`, `--diamond` | Select the board (default: `diamond3`); `--machine NAME` selects the same codenames |
 | `--ui` | Serve the web page (default `http://127.0.0.1:8075`); the terminal stays a console too (Ctrl-] or Ctrl-A X quits) |
 | `--ui-port N`, `UI_PORT=N` | Web page port |
 | `--cloud` | Let the unit reach the internet; by default it gets DHCP (10.0.2.x) and nothing past the virtual router |
@@ -44,7 +45,7 @@ in the same image.
 | `--mqtt HOST[:PORT]` | Relay `10.0.2.100:1883` in the guest to an MQTT broker, and nothing else (for nestlocal, imx6-stuff's `ha/`) |
 | `--nic-extra OPTS` | More `-nic user` options, e.g. a `guestfwd=` |
 | `--stock-image FILE` | Write FILE, the image as a unit that was never set up (below), and exit |
-| `--root0`, `--root1` | Boot that system-update slot first from now on, as an update switches it (U-Boot's `bootcmd`; on the gen 3 through the pre-boot, so not with `--no-provision`). Without either, the unit boots the slot it chose itself |
+| `--root0`, `--root1` | Boot that system-update slot first from now on, as an update switches it (U-Boot's `bootcmd`; on the diamond3 through the pre-boot, so not with `--no-provision`). Without either, the unit boots the slot it chose itself |
 | `NAND_FRESH=1` | Discard the NAND working copy and start again from `--nand` |
 | `NAND_SNAPSHOT=1` | Throwaway run: nothing written survives |
 | `NAND_RW=1` | Write straight into the `--nand` image; never point it at your only copy |
@@ -108,7 +109,7 @@ about 10 s, and `login:` arrives at about 30 s.
 
 ## The web page (`--ui`)
 
-`run.sh --ui` serves the product drawn after the 3rd-generation Nest, with
+`run.sh --ui` serves the product drawn after the diamond3, with
 nothing in the firmware aware of it:
 
 - the screen: QMP `screendump` polled at 100 Hz, faster than the panel's
@@ -194,7 +195,7 @@ on its command line), and looks again when that unit stops answering;
 | Tool | What |
 | --- | --- |
 | `status` | QEMU up or not, the board lines, the wheel, the console's last lines |
-| `screenshot` | the screen now, upright as the glass shows it (480×480 on the gen 3); `settle_ms` waits for an animation to end |
+| `screenshot` | the screen now, upright as the glass shows it (480×480 on the diamond3); `settle_ms` waits for an animation to end |
 | `capture_frames` | up to 32 screenshots at an interval, in one result |
 | `record_start`, `record_stop` | every frame the unit shows, to an MP4 (`.qemu/recordings/` by default, ffmpeg; PNG frames without it), with a few frames back as images |
 | `press_button`, `turn_wheel` | the glass (held for `hold_ms`), the ring (by detents, at once or one every `pace_ms`) |
@@ -203,7 +204,7 @@ on its command line), and looks again when that unit stops answering;
 | `console_send`, `console_read`, `console_wait` | raw keystrokes (interactive programs, U-Boot), output after a cursor, waiting for a regex |
 | `pull_file`, `push_file` | files out of and into the guest: QEMU debugger with `--fs ro` / `--fs rw`, otherwise ssh with `--ssh PORT` (about 3 MB/s), else the console, md5-checked (about 60 KB/s in, 130 KB/s out). Uploads are staged beside the destination and renamed into place |
 | `set_time` | the guest's clock and RTC: `+40m`, `-2h`, `HH:MM` today, `YYYY-MM-DD HH:MM`, or `host`. Stock treats a jump as a clock change, not as time passing: it shifts its timers, so a schedule point jumped over does not fire; for schedule tests set the time, reboot, then let points pass |
-| `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `als` (the light count), `mono` / `bsl` (firmware fields reported, to trigger an update), `wires`, and `detached` (the board's detect line, flintstone: the display off its base); with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
+| `backplate` | the simulated room and wiring while running: `temp`, `rh`, `ambient`, `heat_rate`, `cool_rate`, `room_tau`, `presence`, `als` (the light count), `mono` / `bsl` (firmware fields reported, to trigger an update), `wires`, and `detached` (the board's detect line, diamond3: the display off its base); with no arguments, the state and the circuits switched on. New wiring reaches the unit as a backplate reset does |
 | `qmp` | any QMP command: `system_reset`, `stop`/`cont`, `human-monitor-command` |
 | `gdb` | ARM CPU attach/detach, interrupt/continue, single-step, registers, virtual memory and breakpoints/watchpoints; enabled by `--ui --gdb` or `--fs` |
 
@@ -221,7 +222,7 @@ keys (re-enabled for these connections) and has no `sftp-server`, so a
 file goes as `cat` over a plain session rather than `scp`. The password
 comes from `SSH_ASKPASS`, no `sshpass` needed. `via: console` forces the
 console; `auto` falls back to it when ssh fails. Over the console a file
-is base64 (`openssl base64` on the gen 3, whose busybox has none), or
+is base64 (`openssl base64` on the diamond3, whose busybox has none), or
 `od`/`printf` without either.
 
 Live filesystem access without SSH, a console login, networking or USB:
@@ -231,10 +232,10 @@ Live filesystem access without SSH, a console login, networking or USB:
 ./run.sh --ui --no-provision --fs rw   # also atomically replace files
 ```
 
-This gen 3 option uses QEMU's GDB remote protocol from the host. It
+This diamond3 option uses QEMU's GDB remote protocol from the host. It
 installs no executable, service or init entry in the guest and requires
 no firmware changes, provisioning, login or compiler. Python uses only
-the standard library. Gen 1 and gen 2 are not supported by this channel.
+the standard library. `diamond` and `j49` are not supported by this channel.
 
 For each transfer, the host catches a root task at the ARM Linux EABI
 syscall dispatcher, saves its registers and 80-byte syscall frame, and
@@ -277,7 +278,7 @@ The HTTP interface is `GET /fs` for the channel mode,
 
 ### MCP CPU debugging
 
-Start with `./run.sh --ui --gdb` (add `--gen2` for j49). `--fs ro` or
+Start with `./run.sh --ui --gdb` (add `--j49` for j49). `--fs ro` or
 `--fs rw` also enables the MCP `gdb` tool on the same endpoint; both
 features use one lock. Do not attach an external debugger to that endpoint.
 
@@ -552,7 +553,7 @@ The machine is a patch series on QEMU v11.0.0 (`98b060d`) in
 
 | Patches | Model |
 | --- | --- |
-| 0001–0005 | i.MX6SX SoC container (Cortex-A9, GIC, the 6SX memory map from `fdt@3`) and the `flintstone` machine |
+| 0001–0005 | i.MX6SX SoC container (Cortex-A9, GIC, the 6SX memory map from `fdt@3`) and the `diamond3` machine |
 | 0006, 0014 | GPMI NAND controller with APBH DMA and BCH |
 | 0007 | Boot ROM stub: loads U-Boot from NAND, resets the CPU on watchdog reboot |
 | 0008, 0009 | SDMA and MMDC stubs, enough for their probes |
@@ -591,7 +592,7 @@ The machine is a patch series on QEMU v11.0.0 (`98b060d`) in
 
 ## Developing the machine
 
-Work in `qemu-src/` (branch `flintstone`), commit, and regenerate the
+Work in `qemu-src/`, commit, and regenerate the
 series; the patches are the source of truth:
 
 ```sh
@@ -612,7 +613,7 @@ layout moved) bakes that path in: remove it and run `setup.sh` again.
   --app-easyload`) fails. None is needed, as the chip reports the version
   the firmware ships.
 - USB host attachment on macOS: local enumeration needs a virtual USB
-  host controller driver. Linux attachment and the gen 3 UDC bridge are
+  host controller driver. Linux attachment and the diamond3 UDC bridge are
   described in [the USB bridge guide](usb-host-bridge-protocol.md).
 - ENET: QEMU warns `nic imx.enet.0 has no peer`, which is harmless because
   the guest does not use it.

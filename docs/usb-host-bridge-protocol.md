@@ -1,6 +1,6 @@
 # CI HDRC UDC <-> virtual USB host protocol
 
-`cihdrc-udc` emulates the gen 3 guest's ChipIdea USB device controller:
+`cihdrc-udc` emulates the diamond3 guest's ChipIdea USB device controller:
 registers, DMA and interrupts. A host process connects through the
 machine's `usb0-hostchar` chardev. Lines end with `\n`; data is lowercase hex.
 `ui/usbhost.py` provides a local virtual host, and `ui/usbip.py` forwards
@@ -14,7 +14,7 @@ Mass storage and CDC-ACM use the host's normal drivers. This requires
 `vhci_hcd`, `modprobe`, `usbip`, and root or non-interactive sudo access.
 Without them, a plain run boots without host USB. `--usb` requires USB;
 `--no-usb` disables it. The exporter detaches on exit and reattaches after
-a gadget reconnect. Gen 2 has no USB bridge.
+a gadget reconnect. j49 has no USB bridge.
 
 macOS has no local virtual USB host controller in this project. `./run.sh
 --usb` exports the gadget on loopback TCP port 3240 (or the next free port).
@@ -37,7 +37,7 @@ unplug and `{"connected": true}` to plug the cable back in. An empty
 object reads the state. The UI API exposes the same control through
 `POST /usb`; `GET /usb` reads it. Both return `connected` (the requested
 cable state) and `vbus` (the effective voltage, which also requires an
-open host bridge). Gen 2 does not expose this control.
+open host bridge). j49 does not expose this control.
 
 Unplugging drops OTGSC B-session-valid and USB1 analog VBUS/charger
 status, and latches the VBUS-change interrupt. The stock driver updates

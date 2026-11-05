@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Clone/patch/build the flintstone QEMU machine.
+# Clone/patch/build the Nest QEMU machines.
 #
 # Usage:
 #   ./setup.sh            # native build (Linux, or macOS with brew deps)
@@ -23,7 +23,7 @@ if [ ! -e "$src/.git" ]; then
         https://gitlab.com/qemu-project/qemu.git "$src"
 fi
 
-# The flintstone machine lives on top of the clone as the patch stack in
+# The diamond3 machine lives on top of the clone as the patch stack in
 # patches/. They are applied directly into the tree (not via submodule
 # commits) so they stay the single source of truth, like the t33 series.
 if [ ! -f "$src/hw/arm/flintstone.c" ]; then

@@ -4,9 +4,9 @@ This repo carries no NAND image: a stock image carries its unit's data
 and its owner's credentials. `run.sh --nand FILE` takes an image you
 provide, and seeds the working copy in `.qemu/` from it on the first boot
 ([NAND state](qemu.md#nand-state)). The machines expect a different format
-per generation.
+per board.
 
-## Gen 3 (`flintstone`)
+## diamond3
 
 A **logical** full-chip image: 512 MiB, data pages only (2048 bytes each),
 with the BCH parity and the spare area removed and the bad-block-marker swap
@@ -68,7 +68,7 @@ hardware rather than the owner. The pre-boot (`provision.py`) writes
 `/etc/shadow` and `/etc/sysctl.conf`. `--stock-image` empties the five
 writable volumes ([a never-set-up unit](qemu.md#a-never-set-up-unit)).
 
-## Gen 2 (`j49`)
+## j49
 
 The **raw** chip: 2112-byte pages, the 2048 data bytes then the 64-byte
 OOB, with the GPMC's BCH4 parity in the OOB (7 bytes per 512 at OOB

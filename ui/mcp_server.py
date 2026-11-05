@@ -138,7 +138,7 @@ def png_size(png):
 
 def upright(png):
     """
-    The frame as the unit shows it. The gen 3 scans out a 480x640 portrait
+    The frame as the unit shows it. The diamond3 scans out a 480x640 portrait
     framebuffer that the panel shows turned a quarter anticlockwise (the
     page draws it with rotate(-90)), of which the round glass shows the
     top 480 rows: the result is that 480x480 square. Other sizes are
@@ -506,7 +506,7 @@ def md5_of(path):
 
 def guest_base64():
     """The guest's base64 coder: (encode FILE, decode SRC DST) command
-    templates, or None. busybox may lack base64; the gen 3 has openssl."""
+    templates, or None. busybox may lack base64; the diamond3 has openssl."""
     # openssl's stderr goes too: it warns of a missing openssl.cnf, and the
     # console carries stderr in with the data.
     for tool, enc, dec in (
@@ -1067,10 +1067,10 @@ TOOLS = {
                           "mono": d({"type": "object"}, "firmware fields the MCU reports (version, description, user, host, date), as if flashed; it restarts"),
                           "bsl": d({"type": "object"}, "the bootloader's fields, likewise"),
                           "als": d(INT, "the ambient light's visible count (live and the 5-minute ALS_BUF samples Sunblock learns from)"),
-                          "detached": d(BOOL, "lift the display off its base (the detect line; flintstone only); false puts it back"),
+                          "detached": d(BOOL, "lift the display off its base (the detect line; diamond3 only); false puts it back"),
                           "wires": {"type": "array", "items": {"type": "string"},
                                     "description": "terminals with a wire, e.g. [\"Rh\", \"W1\", \"Y1\", \"G\", \"C\"]; the unit sees the new wiring"}})),
-    "usb": (t_usb, "Plug or unplug the gen 3 USB cable. connected=false drops VBUS and detaches the host USB/IP device; true restores VBUS and allows re-enumeration. Omit connected to read cable and VBUS state. Requires a QEMU build with USB cable control; firmware charger notifications are asynchronous.",
+    "usb": (t_usb, "Plug or unplug the diamond3 USB cable. connected=false drops VBUS and detaches the host USB/IP device; true restores VBUS and allows re-enumeration. Omit connected to read cable and VBUS state. Requires a QEMU build with USB cable control; firmware charger notifications are asynchronous.",
             schema({"connected": BOOL})),
     "qmp": (t_qmp, "Send a QMP command to QEMU, e.g. system_reset (reboot), stop/cont (pause), human-monitor-command (HMP). quit ends QEMU and with it ui.py.",
             schema({"command": STR, "arguments": {"type": "object"}}, ["command"])),

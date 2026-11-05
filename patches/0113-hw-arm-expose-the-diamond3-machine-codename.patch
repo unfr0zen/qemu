@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 19:30:00 -0500
+Subject: [PATCH] hw/arm: expose the diamond3 machine codename
+
+Expose diamond3 as the public machine alias while preserving the
+flintstone implementation name and device interfaces.
+---
+diff --git a/hw/arm/flintstone.c b/hw/arm/flintstone.c
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -510,7 +510,8 @@
+     object_class_property_add_str(oc, "usb0-hostchar",
+                                   flintstone_get_usb0_hostchar,
+                                   flintstone_set_usb0_hostchar);
+-    mc->desc = "Nest Display-3.4 (i.MX6SX, 'Flintstone')";
++    mc->desc = "Nest diamond3 (Display-3.4, i.MX6SX)";
++    mc->alias = "diamond3";
+     mc->init = flintstone_init;
+     /* The vendor boot software pokes registers we do not model yet; treat
+      * those accesses as reads-0/writes-ignored instead of data aborts. */

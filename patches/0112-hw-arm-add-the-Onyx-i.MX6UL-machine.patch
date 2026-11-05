@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 19:30:00 -0500
+Subject: [PATCH] hw/arm: add the Onyx i.MX6UL machine
+
+Model the Nest Thermostat E with the existing i.MX6UL SoC and 256 MiB
+of DDR. Load a user-supplied IVT-wrapped U-Boot image with -bios at
+its self address and start execution at its entry point on reset.
+
+This is an early UART bring-up machine: DCD execution, DDR training,
+NAND boot and the thermostat peripherals are not implemented.
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -891,6 +891,11 @@
+ F: include/hw/*/max78000*
+ F: tests/functional/arm/test_max78000fthr.py
+ 
++Nest Onyx / i.MX6UL
++L: qemu-arm@nongnu.org
++S: Orphan
++F: hw/arm/onyx.c
++
+ MCIMX6UL EVK / i.MX6ul
+ M: Peter Maydell <peter.maydell@linaro.org>
+ R: Jean-Christophe Dubois <jcd@tribudubois.net>
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -207,6 +207,12 @@
+     select LM3695
+     select EM35X_NCP
+ 
++config ONYX
++    bool
++    default y
++    depends on TCG && ARM
++    select FSL_IMX6UL
++
+ config J49
+     bool
+     default y
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -92,6 +92,7 @@
+ arm_ss.add(when: 'CONFIG_ARM_SMMUV3', if_true: files('smmuv3.c'))
+ arm_ss.add(when: 'CONFIG_ARM_SMMUV3_ACCEL', if_true: files('smmuv3-accel.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6UL', if_true: files('fsl-imx6ul.c', 'mcimx6ul-evk.c'))
++arm_common_ss.add(when: 'CONFIG_ONYX', if_true: files('onyx.c'))
+ arm_common_ss.add(when: 'CONFIG_NRF51_SOC', if_true: files('nrf51_soc.c'))
+ arm_common_ss.add(when: 'CONFIG_XEN', if_true: files(
+   'xen-stubs.c',
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+new file mode 100644
+--- /dev/null
++++ b/hw/arm/onyx.c
+@@ -0,0 +1,78 @@
++/*
++ * Nest Thermostat E (Onyx), i.MX6UL.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/bswap.h"
++#include "qemu/error-report.h"
++#include "qemu/units.h"
++#include "hw/arm/fsl-imx6ul.h"
++#include "hw/arm/machines-qom.h"
++#include "hw/core/boards.h"
++#include "system/reset.h"
++#include "system/qtest.h"
++
++#define ONYX_RAM_SIZE (256 * MiB)
++
++static void onyx_boot(void *opaque)
++{
++    MachineState *machine = opaque;
++    g_autofree char *image = NULL;
++    gsize len;
++    uint32_t self, entry;
++
++    cpu_reset(first_cpu);
++    if (!g_file_get_contents(machine->firmware, &image, &len, NULL) ||
++        len < 32 || (uint8_t)image[0] != 0xd1 ||
++        lduw_be_p(image + 1) != 32) {
++        error_report("onyx: -bios requires an i.MX IVT image (.imx)");
++        exit(1);
++    }
++    entry = ldl_le_p(image + 4);
++    self = ldl_le_p(image + 20);
++    if (self < FSL_IMX6UL_MMDC_ADDR ||
++        (uint64_t)self + len > FSL_IMX6UL_MMDC_ADDR + ONYX_RAM_SIZE ||
++        entry < self || (uint64_t)entry >= (uint64_t)self + len) {
++        error_report("onyx: firmware loads outside DDR or entry outside image");
++        exit(1);
++    }
++    /* DDR is host RAM; DCD execution and DDR training are not modelled. */
++    cpu_physical_memory_write(self, image, len);
++    cpu_set_pc(first_cpu, entry);
++}
++
++static void onyx_init(MachineState *machine)
++{
++    DeviceState *soc;
++
++    if (machine->ram_size != ONYX_RAM_SIZE) {
++        error_report("onyx: this board has 256 MiB of DDR3");
++        exit(1);
++    }
++    soc = qdev_new(TYPE_FSL_IMX6UL);
++    object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
++    qdev_realize_and_unref(soc, NULL, &error_fatal);
++    memory_region_add_subregion(get_system_memory(), FSL_IMX6UL_MMDC_ADDR,
++                                machine->ram);
++    if (!qtest_enabled()) {
++        if (!machine->firmware) {
++            error_report("onyx: supply U-Boot with -bios FILE.imx");
++            exit(1);
++        }
++        qemu_register_reset(onyx_boot, machine);
++    }
++}
++
++static void onyx_machine_init(MachineClass *mc)
++{
++    mc->desc = "Nest Thermostat E (Onyx, i.MX6UL)";
++    mc->init = onyx_init;
++    mc->max_cpus = FSL_IMX6UL_NUM_CPUS;
++    mc->ignore_memory_transaction_failures = true;
++    mc->default_ram_size = ONYX_RAM_SIZE;
++    mc->default_ram_id = "onyx.ram";
++}
++
++DEFINE_MACHINE_ARM("onyx", onyx_machine_init)

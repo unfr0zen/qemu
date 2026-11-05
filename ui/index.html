@@ -50,7 +50,7 @@
   .state { font-size: 12px; color: var(--on-bg-muted); display: flex; align-items: center; gap: 6px; }
   .state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #b5b1a8; }
   .state.on::before { background: #7ec495; box-shadow: 0 0 6px #7ec495; }
-  .head-right { display: flex; align-items: center; gap: 12px; }
+  .head-right { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 12px; }
   .sound { font: inherit; font-size: 12px; color: var(--on-bg-muted); background: none;
            border: 1px solid currentColor; border-radius: 10px; padding: 0 8px; cursor: pointer; }
   .sound.on { color: var(--on-bg); }
@@ -124,6 +124,8 @@
     <header>
       <h1 id="title">Nest · QEMU</h1>
       <span class="head-right">
+        <button class="sound" id="reset" type="button"
+                title="Reset QEMU in software, not a physical button press">reset</button>
         <button class="sound" id="sound" type="button"
                 title="Play the piezo: the clicks and tones the firmware makes">sound off</button>
         <span class="state" id="state">waiting for QEMU…</span>
@@ -219,6 +221,12 @@
             pointer-events="none"/>
       <g id="screenHolder" clip-path="url(#screenClip)">
         <rect id="screenPlaceholder" x="58" y="58" width="224" height="224" fill="#000"/>
+        <text id="screenUnavailable" x="170" y="170" text-anchor="middle"
+              dominant-baseline="middle" font-family="monospace" font-size="8"
+              fill="#fff" pointer-events="none">
+          <tspan x="170" dy="-6">Guest has not initialized</tspan>
+          <tspan x="170" dy="12">the display (yet).</tspan>
+        </text>
         <image id="screen" x="58" y="58" width="224" height="299" preserveAspectRatio="none"
                transform="rotate(-90 170 170)" href="" style="display:none"/>
       </g>
@@ -285,6 +293,21 @@
   const post = (path, body) =>
     fetch(path, { method: "POST", body: body && JSON.stringify(body) }).catch(() => {});
 
+  $("reset").addEventListener("click", async () => {
+    $("reset").disabled = true;
+    try {
+      const r = await fetch("/qmp", { method: "POST",
+        body: JSON.stringify({ execute: "system_reset" }) });
+      if (!r.ok) throw new Error((await r.text()).trim());
+      const result = await r.json();
+      if (result.error) throw new Error(result.error.desc);
+    } catch (error) {
+      alert(`Software reset failed: ${error.message}`);
+    } finally {
+      $("reset").disabled = false;
+    }
+  });
+
   /* Tick marks on the ring: 24 detents, one lights as the wheel passes it. */
   const STEPS = 24;
   const CX = 170, CY = 170;
@@ -307,17 +330,18 @@
 
   /* ---------- screen ---------- */
   let gotFrame = false;
-  // The panel (480x640) shows its top square turned upright; anything else
-  // (QEMU's own "not initialized" text before the LCDIF runs) is shown as is.
-  // The gen 2's panel (320x320) is a smaller display: 1.75" across to the
-  // gen 3's 2.08", so its circle is that much smaller in the same face.
+  // The panel (480x640) shows its top square turned upright; generic
+  // screendumps fit entirely inside the circular display, centered on both axes.
+  // The j49's panel (320x320) is a smaller display: 1.75" across to the
+  // diamond3's 2.08", so its circle is that much smaller in the same face.
   function placeScreen(b64) {
     const hdr = atob(b64.slice(0, 32));       // PNG signature + IHDR
     const u32 = (o) => ((hdr.charCodeAt(o) << 24) | (hdr.charCodeAt(o + 1) << 16) |
                         (hdr.charCodeAt(o + 2) << 8) | hdr.charCodeAt(o + 3)) >>> 0;
-    const panel = u32(16) === 480 && u32(20) === 640;
-    const gen2 = u32(16) === 320 && u32(20) === 320;
-    const r = gen2 ? 94 : 112;                        // the display's radius
+    const width = u32(16), height = u32(20);
+    const panel = width === 480 && height === 640;
+    const j49 = width === 320 && height === 320;
+    const r = j49 ? 94 : 112;                        // the display's radius
     $("screenCircle").setAttribute("r", r);
     for (const el of [$("screen"), $("screenPlaceholder")]) {
       el.setAttribute("x", 170 - r);
@@ -330,10 +354,21 @@
     img.setAttribute("preserveAspectRatio", panel ? "none" : "xMidYMid meet");
     if (panel) img.setAttribute("transform", "rotate(-90 170 170)");
     else img.removeAttribute("transform");
+    if (!panel && !j49) {
+      const scale = 2 * r / Math.hypot(width, height);
+      img.setAttribute("x", 170 - width * scale / 2);
+      img.setAttribute("y", 170 - height * scale / 2);
+      img.setAttribute("width", width * scale);
+      img.setAttribute("height", height * scale);
+    }
   }
   function openScreen(es) {
     es.addEventListener("frame", (e) => {
-      if (!gotFrame) { gotFrame = true; $("screen").style.display = ""; }
+      if (!gotFrame) {
+        gotFrame = true;
+        $("screenUnavailable").style.display = "none";
+        $("screen").style.display = "";
+      }
       placeScreen(e.data);
       $("screen").setAttribute("href", "data:image/png;base64," + e.data);
     });
@@ -604,7 +639,7 @@
 
   /* ---------- wire it up ---------- */
   fetch("/config").then((r) => r.json()).then((cfg) => {
-    // which unit this is (run.sh: "Nest gen 3", "Nest gen 2")
+    // which unit this is (run.sh: "Nest diamond3", "Nest j49")
     if (cfg.name) {
       document.title = $("title").textContent = cfg.name + " · QEMU";
       $("device").setAttribute("aria-label", cfg.name);

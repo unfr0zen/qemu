@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the flintstone UDC to Linux vhci_hcd over USB/IP (TCP 3240).
+"""Export the diamond3 UDC to Linux vhci_hcd over USB/IP (TCP 3240).
 
 The guest owns descriptors and USB functions. This process translates URBs
 into acknowledged bridge tokens; it does not interpret mass-storage data.
@@ -152,7 +152,7 @@ class Device:
     def description(self):
         d = self.descriptor
         interfaces = [i for i in self.config.interfaces if i.alt == 0]
-        return struct.pack("!256s32sIIIHHHBBBBBB", b"/qemu/flintstone/usb0",
+        return struct.pack("!256s32sIIIHHHBBBBBB", b"/qemu/diamond3/usb0",
                            BUSID, 1, 1, 3, d.vendor, d.product, d.bcd_device,
                            d.dev_class, d.dev_subclass, d.dev_protocol,
                            self.config.cfg_value, d.num_configs, len(interfaces))
