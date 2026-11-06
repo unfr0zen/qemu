@@ -273,3 +273,7 @@ as the OMAP thermal driver reports.
 
 The board bridge accepts `set BP-DETACHED 0|1`; it drives GPIO65, the stock
 active-low backplate detect input. Zero means attached.
+
+Bulk endpoints NAK until their maximum packet size is configured (patch
+0130). This keeps host traffic pending while the gadget driver enables an
+endpoint; endpoint zero retains its 64-byte control packet size.

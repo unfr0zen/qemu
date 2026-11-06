@@ -1,0 +1,15 @@
+From: Will
+Subject: [PATCH] hw/usb: nak unconfigured omap3 musb endpoints
+
+--- a/hw/usb/omap3_musb.c
++++ b/hw/usb/omap3_musb.c
+@@ -407,7 +407,8 @@
+     const char *direction = in ? "IN" : "OUT";
+ 
+     g_string_append_printf(reply, "TOKEN %u %s ", ep, direction);
+-    if (!s->connected || s->resetting) {
++    if (!s->connected || s->resetting ||
++        (ep && !(lduw_le_p(s->ep[ep] + (in ? 0 : 4)) & 0x7ff))) {
+         g_string_append(reply, "NAK");
+     } else if (csr & stall) {
+         csr |= ep ? (in ? TX_SENTSTALL : RX_SENTSTALL) : CSR0_SENTSTALL;
