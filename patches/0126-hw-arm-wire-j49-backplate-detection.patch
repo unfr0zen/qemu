@@ -1,0 +1,50 @@
+Subject: [PATCH] hw/arm: wire j49 backplate detection
+
+diff --git a/hw/arm/j49.c b/hw/arm/j49.c
+--- a/hw/arm/j49.c
++++ b/hw/arm/j49.c
+@@ -326,6 +326,8 @@
+     object_property_add_child(OBJECT(machine), "board", OBJECT(board));
+     qdev_realize_and_unref(board, NULL, &error_fatal);
+     qdev_connect_gpio_out(board, 0, qdev_get_gpio_in(DEVICE(pmic), 0));
++    qdev_connect_gpio_out_named(board, "backplate-detached", 0,
++        qdev_get_gpio_in(DEVICE(&soc->gpio[2]), 1));
+     qdev_connect_gpio_out(DEVICE(&soc->gpio[5]), 1,
+                           qdev_get_gpio_in(board, J49_BOARD_IN_POWEROFF));
+     qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 26,
+diff --git a/hw/arm/j49_board.c b/hw/arm/j49_board.c
+--- a/hw/arm/j49_board.c
++++ b/hw/arm/j49_board.c
+@@ -61,6 +61,8 @@
+ 
+     qemu_irq button;            /* into the TPS65921's PWRON */
+     bool button_level;
++    qemu_irq detached;
++    bool detached_level;
+ 
+     bool lines[J49_BOARD_IN];
+     int beeper_hz;
+@@ -123,6 +125,15 @@
+             board_emit(s, j49_board_in_names[i], 'o', s->lines[i] ? 1000 : 0);
+         }
+         board_emit(s, "BEEPER", 'o', s->beeper_hz);
++        board_emit(s, "BP-DETACHED", 'i', s->detached_level ? 1000 : 0);
++        return;
++    }
++    if (!strcmp(argv[0], "set") && argv[1] && argv[2] && !argv[3] &&
++        !strcmp(argv[1], "BP-DETACHED") &&
++        (!strcmp(argv[2], "0") || !strcmp(argv[2], "1"))) {
++        s->detached_level = argv[2][0] == '1';
++        qemu_set_irq(s->detached, s->detached_level);
++        board_emit(s, "BP-DETACHED", 'i', s->detached_level ? 1000 : 0);
+         return;
+     }
+     if ((!strcmp(argv[0], "set") || !strcmp(argv[0], "hold")) &&
+@@ -210,6 +221,7 @@
+     J49BoardState *s = J49_BOARD(dev);
+ 
+     qdev_init_gpio_out(dev, &s->button, 1);
++    qdev_init_gpio_out_named(dev, &s->detached, "backplate-detached", 1);
+     qdev_init_gpio_in(dev, board_gpio_in, J49_BOARD_IN);
+     qdev_init_gpio_in_named(dev, board_beeper, J49_BOARD_BEEPER, 1);
+ 

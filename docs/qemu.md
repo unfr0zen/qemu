@@ -636,3 +636,9 @@ vectors `0x0..0xff`. These partial dumps cannot boot from reset and are
 rejected rather than being loaded at the wrong address. The complete dump
 is tracked at `roms/diamond3/bootrom.bin`; its checksum and invocation are
 in `roms/diamond3/README.md`. Signed firmware remains external.
+
+The `imx6sx-tempmon` device exposes ANATOP temperature sampling and a
+synthetic, read-only OCOTP calibration word. Its
+`die-temperature-millicelsius` property defaults to 45000. Mainline Linux
+can read the result through thermal and hwmon. Thermal alarm interrupts
+and authentic HAB fuse contents are not modelled by this calibration shadow.

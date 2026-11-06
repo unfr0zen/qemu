@@ -1,0 +1,386 @@
+Subject: [PATCH] hw/misc: model thermostat die temperature
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -891,6 +891,11 @@
+ F: include/hw/*/max78000*
+ F: tests/functional/arm/test_max78000fthr.py
+ 
++Nest Diamond3 / i.MX6SoloX
++L: qemu-arm@nongnu.org
++S: Orphan
++F: hw/misc/imx6sx_tempmon.c
++
+ Nest Onyx / i.MX6UL
+ L: qemu-arm@nongnu.org
+ S: Orphan
+diff --git a/hw/arm/fsl-imx6sx.c b/hw/arm/fsl-imx6sx.c
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -644,6 +644,22 @@
+                                     FSL_IMX6SX_ANATOP_ADDR + 0x1C0,
+                                     &usb_analog_mr);
+     }
++    /* Temperature sampling overlays the ANATOP register bank. */
++    {
++        DeviceState *tempmon = qdev_new("imx6sx-tempmon");
++        SysBusDevice *sbd = SYS_BUS_DEVICE(tempmon);
++
++        object_property_add_child(OBJECT(s), "tempmon", OBJECT(tempmon));
++        if (!sysbus_realize_and_unref(sbd, errp)) {
++            return;
++        }
++        memory_region_add_subregion_overlap(get_system_memory(),
++            FSL_IMX6SX_ANATOP_ADDR + 0x180, sysbus_mmio_get_region(sbd, 0), 2);
++        memory_region_add_subregion_overlap(get_system_memory(),
++            FSL_IMX6SX_ANATOP_ADDR + 0x290, sysbus_mmio_get_region(sbd, 1), 2);
++        sysbus_mmio_map(sbd, 2, FSL_IMX6SX_OCOTP_ADDR);
++    }
++
+ }
+ 
+ static const Property fsl_imx6sx_properties[] = {
+diff --git a/hw/misc/omap3_prcm.c b/hw/misc/omap3_prcm.c
+--- a/hw/misc/omap3_prcm.c
++++ b/hw/misc/omap3_prcm.c
+@@ -29,6 +29,7 @@
+ #include "system/runstate.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
++#include "qapi/visitor.h"
+ 
+ /* CM: one block per domain */
+ #define CM_IVA2         0x0000
+@@ -427,12 +428,47 @@
+ #define START_PADCONF_SAVE      (1 << 1)
+ #define PADCONF_SAVE_DONE       (1 << 0)
+ 
++/* OMAP36xx bandgap transfer table, TI's GPL-2.0 kernel thermal driver. */
++static const int omap36xx_adc_to_temp[128] = {
++    -40000, -40000, -40000, -40000, -40000, -40000, -40000, -40000,
++    -40000, -40000, -40000,    -40000, -40000, -38000, -35000, -34000,
++    -32000, -30000, -28000, -26000, -24000, -22000,    -20000, -18500,
++    -17000, -15000, -13500, -12000, -10000, -8000, -6500, -5000, -3500,
++    -1500, 0, 2000, 3500, 5000, 6500, 8500, 10000, 12000, 13500,
++    15000, 17000, 19000, 21000, 23000, 25000, 27000, 28500, 30000,
++    32000, 33500, 35000, 37000, 38500, 40000, 42000, 43500, 45000,
++    47000, 48500, 50000, 52000, 53500, 55000, 57000, 58500, 60000,
++    62000, 64000, 66000, 68000, 70000, 71500, 73500, 75000, 77000,
++    78500, 80000, 82000, 83500, 85000, 87000, 88500, 90000, 92000,
++    93500, 95000, 97000, 98500, 100000, 102000, 103500, 105000, 107000,
++    109000, 111000, 113000, 115000, 117000, 118500, 120000, 122000,
++    123500, 125000, 125000, 125000, 125000, 125000, 125000, 125000,
++    125000, 125000, 125000, 125000, 125000, 125000, 125000, 125000,
++    125000, 125000, 125000, 125000, 125000, 125000,    125000
++};
++
++static unsigned scm_temperature_count(Omap3ScmState *s)
++{
++    unsigned best = 0;
++
++    for (unsigned i = 1; i < ARRAY_SIZE(omap36xx_adc_to_temp); i++) {
++        if (llabs((int64_t)omap36xx_adc_to_temp[i] - s->temperature) <
++            llabs((int64_t)omap36xx_adc_to_temp[best] - s->temperature)) {
++            best = i;
++        }
++    }
++    return best;
++}
++
+ static uint64_t scm_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     Omap3ScmState *s = opaque;
+     uint32_t word;
+ 
+     switch (addr & ~3) {
++    case 0x524:
++        word = (s->regs[addr / 4] & ~0xffU) | scm_temperature_count(s);
++        break;
+     case CONTROL_STATUS:
+         word = CONTROL_STATUS_GP | s->sys_boot;
+         break;
+@@ -451,6 +487,12 @@
+ 
+     s->regs[addr / 4] = deposit32(s->regs[addr / 4], (addr & 3) * 8, size * 8,
+                                   val);
++    if ((addr & ~3) == 0x524) {
++        uint32_t *sensor = &s->regs[0x524 / 4];
++
++        *sensor = (*sensor & ~0x1ffU) | scm_temperature_count(s) |
++                  ((*sensor & BIT(9)) ? BIT(8) : 0);
++    }
+     /*
+      * The pad configuration save (before the core domain goes off)
+      * completes at once: the kernel polls for it.
+@@ -503,12 +545,35 @@
+     Omap3ScmState *s = OMAP3_SCM(dev);
+ 
+     memset(s->regs, 0, sizeof(s->regs));
++    s->regs[0x524 / 4] = scm_temperature_count(s);
++}
++
++static void scm_get_temperature(Object *obj, Visitor *v,
++                                    const char *name, void *opaque,
++                                    Error **errp)
++{
++    Omap3ScmState *s = OMAP3_SCM(obj);
++
++    visit_type_int32(v, name, &s->temperature, errp);
++}
++
++static void scm_set_temperature(Object *obj, Visitor *v,
++                                    const char *name, void *opaque,
++                                    Error **errp)
++{
++    Omap3ScmState *s = OMAP3_SCM(obj);
++
++    visit_type_int32(v, name, &s->temperature, errp);
+ }
+ 
+ static void scm_init(Object *obj)
+ {
+     Omap3ScmState *s = OMAP3_SCM(obj);
+ 
++    s->temperature = 45000;
++    object_property_add(obj, "die-temperature-millicelsius", "int",
++                        scm_get_temperature, scm_set_temperature,
++                        NULL, NULL);
+     memory_region_init_io(&s->iomem, obj, &scm_ops, s, "omap3-scm", 0x1000);
+     memory_region_init_io(&s->tap, obj, &tap_ops, s, "omap3-tap", 0x1000);
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+@@ -529,10 +594,11 @@
+ 
+ static const VMStateDescription scm_vmstate = {
+     .name = TYPE_OMAP3_SCM,
+-    .version_id = 1,
++    .version_id = 2,
+     .minimum_version_id = 1,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT32_ARRAY(regs, Omap3ScmState, 0x1000 / 4),
++        VMSTATE_INT32_V(temperature, Omap3ScmState, 2),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+diff --git a/include/hw/misc/omap3_prcm.h b/include/hw/misc/omap3_prcm.h
+--- a/include/hw/misc/omap3_prcm.h
++++ b/include/hw/misc/omap3_prcm.h
+@@ -70,6 +70,7 @@
+     uint32_t regs[0x1000 / 4];
+     uint32_t idcode;            /* properties */
+     uint32_t die_id[4];
++    int32_t temperature;        /* bandgap die temperature, millicelsius */
+     uint32_t omap_status;
+     uint32_t sys_boot;
+ };
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -72,6 +72,7 @@
+   'imx_ccm.c',
+   'imx_gpmi_nand.c',
+   'imx6_mmdc.c',
++  'imx6sx_tempmon.c',
+   'imx6_sdma.c',
+   'imx_pwm.c',
+   'imx_rngc.c',
+diff --git a/hw/misc/imx6sx_tempmon.c b/hw/misc/imx6sx_tempmon.c
+new file mode 100644
+--- /dev/null
++++ b/hw/misc/imx6sx_tempmon.c
+@@ -0,0 +1,195 @@
++/*
++ * i.MX6SX temperature monitor and read-only calibration shadow.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "migration/vmstate.h"
++#include "qemu/module.h"
++#include "qapi/visitor.h"
++
++#define TYPE_IMX6SX_TEMPMON "imx6sx-tempmon"
++OBJECT_DECLARE_SIMPLE_TYPE(Imx6sxTempmonState, IMX6SX_TEMPMON)
++
++/* Synthetic ANA1 calibration count for the i.MX6SX transfer function. */
++#define CALIBRATION_COUNT 1500
++#define CALIBRATION_MILLIC 28581
++
++struct Imx6sxTempmonState {
++    SysBusDevice parent_obj;
++    MemoryRegion sensor0, sensor2, otp;
++    uint32_t regs[3];
++    int32_t temperature;
++};
++
++static uint32_t sensor_read(Imx6sxTempmonState *s, hwaddr addr)
++{
++    uint32_t value = s->regs[addr / 16];
++
++    if (addr / 16 == 0) {
++        int64_t slope = 10000000000LL /
++                        (15423 * CALIBRATION_COUNT - 4148468);
++        int64_t count = CALIBRATION_COUNT +
++                        ((int64_t)CALIBRATION_MILLIC - s->temperature) / slope;
++
++        value &= ~((0xfff << 8) | BIT(2));
++        if ((value & 3) == 2) {
++            value |= (CLAMP(count, 0, 4095) << 8) | BIT(2);
++        }
++    }
++    return value;
++}
++
++static void sensor_write(Imx6sxTempmonState *s, hwaddr addr, uint32_t value)
++{
++    uint32_t *reg = &s->regs[addr / 16];
++
++    switch (addr & 15) {
++    case 0:
++        *reg = value;
++        break;
++    case 4:
++        *reg |= value;
++        break;
++    case 8:
++        *reg &= ~value;
++        break;
++    case 12:
++        *reg ^= value;
++        break;
++    }
++}
++
++static uint64_t sensor0_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return sensor_read(opaque, addr);
++}
++
++static void sensor0_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    sensor_write(opaque, addr, value);
++}
++
++static uint64_t sensor2_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return sensor_read(opaque, addr + 0x20);
++}
++
++static void sensor2_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    sensor_write(opaque, addr + 0x20, value);
++}
++
++static uint64_t otp_read(void *opaque, hwaddr addr, unsigned size)
++{
++    /* Fuse word 14, exposed as the nvmem cell at byte offset 0x38. */
++    return addr == 0x4e0 ? CALIBRATION_COUNT << 20 : 0;
++}
++
++static void otp_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    /* Programming physical fuses is not part of the calibration shadow. */
++}
++
++static const MemoryRegionOps sensor0_ops = {
++    .read = sensor0_read,
++    .write = sensor0_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static const MemoryRegionOps sensor2_ops = {
++    .read = sensor2_read,
++    .write = sensor2_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static const MemoryRegionOps otp_ops = {
++    .read = otp_read,
++    .write = otp_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void tempmon_reset(DeviceState *dev)
++{
++    Imx6sxTempmonState *s = IMX6SX_TEMPMON(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->regs[0] = 1; /* POWER_DOWN */
++}
++
++static void tempmon_get_temperature(Object *obj, Visitor *v,
++                                    const char *name, void *opaque,
++                                    Error **errp)
++{
++    Imx6sxTempmonState *s = IMX6SX_TEMPMON(obj);
++
++    visit_type_int32(v, name, &s->temperature, errp);
++}
++
++static void tempmon_set_temperature(Object *obj, Visitor *v,
++                                    const char *name, void *opaque,
++                                    Error **errp)
++{
++    Imx6sxTempmonState *s = IMX6SX_TEMPMON(obj);
++
++    visit_type_int32(v, name, &s->temperature, errp);
++}
++
++static void tempmon_init(Object *obj)
++{
++    Imx6sxTempmonState *s = IMX6SX_TEMPMON(obj);
++
++    s->temperature = 45000;
++    object_property_add(obj, "die-temperature-millicelsius", "int",
++                        tempmon_get_temperature, tempmon_set_temperature,
++                        NULL, NULL);
++    memory_region_init_io(&s->sensor0, obj, &sensor0_ops, s,
++                           "imx6sx-tempsense01", 0x20);
++    memory_region_init_io(&s->sensor2, obj, &sensor2_ops, s,
++                           "imx6sx-tempsense2", 0x10);
++    memory_region_init_io(&s->otp, obj, &otp_ops, s,
++                           "imx6sx-calibration-shadow", 0x4000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->sensor0);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->sensor2);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->otp);
++}
++
++static const VMStateDescription tempmon_vmstate = {
++    .name = TYPE_IMX6SX_TEMPMON,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, Imx6sxTempmonState, 3),
++        VMSTATE_INT32(temperature, Imx6sxTempmonState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void tempmon_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, tempmon_reset);
++    dc->vmsd = &tempmon_vmstate;
++    dc->desc = "i.MX6SX temperature sampling and calibration shadow";
++}
++
++static const TypeInfo tempmon_info = {
++    .name = TYPE_IMX6SX_TEMPMON,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Imx6sxTempmonState),
++    .instance_init = tempmon_init,
++    .class_init = tempmon_class_init,
++};
++
++static void tempmon_register_types(void)
++{
++    type_register_static(&tempmon_info);
++}
++
++type_init(tempmon_register_types)

@@ -264,3 +264,12 @@ reconnection. This virtual host does not create a host OS USB interface.
 - The WL1271's PLT (calibration) mode: the calibrator's `autocalibrate`
   would produce an empty NVS, which the stock image avoids by keeping the
   factory's.
+
+The OMAP36xx SCM bandgap register at `0x48002524` implements SOC/EOC
+sampling using the kernel's ADC transfer table. Its
+`die-temperature-millicelsius` property defaults to 45000. Linux's thermal
+zone adds the configured 20 °C hotspot offset. This sensor is approximate,
+as the OMAP thermal driver reports.
+
+The board bridge accepts `set BP-DETACHED 0|1`; it drives GPIO65, the stock
+active-low backplate detect input. Zero means attached.
