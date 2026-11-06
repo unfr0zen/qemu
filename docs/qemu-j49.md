@@ -197,6 +197,23 @@ per patch, applied after the diamond3's (0001–0036):
 | 0085–0086 | The AM3703 (OMAP3630) SoC and its boot ROM |
 | 0087–0088 | `j49.board`: the button and the firmware's lines over a chardev |
 | 0089–0091 | The `j49` machine |
+| 0120 | Halfword GPIO revision reads for gpio-omap |
+| 0121 | GPMC READ0 resumes page data after NAND status polling |
+| 0122 | DISPC reset clock divisors |
+| 0123 | Selectable WL1271 firmware API version |
+
+## Homebrew Linux
+
+The sibling `buildroot/` repository supplies a Linux 7.3.1 board configuration,
+legacy kernel image, UBIFS root and a runner that preserves the stock
+x-loader/U-Boot region. Its `make j49-qemu-ui NAND=/path/to/stock.raw FRESH=1`
+starts a separate NAND image and UI on port 8076. The raw input remains
+unchanged. See that repository's README for the build and calibration files.
+
+The WL1271 model defaults to the stock v4 firmware API. For a kernel using
+v6 firmware, pass `-global 'wl1271.fw-version=Rev 6.3.10.0.133'`; the Buildroot
+runner supplies it. The model responds to the driver's firmware boot and
+command interface; it does not execute uploaded radio firmware.
 
 ## Debugging
 

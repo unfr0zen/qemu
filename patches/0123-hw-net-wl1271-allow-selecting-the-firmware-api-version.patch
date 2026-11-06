@@ -1,0 +1,58 @@
+Subject: [PATCH] hw/net: wl1271: allow selecting the firmware API version
+
+Expose fw-version so kernels using the v6 firmware API can negotiate the
+existing command and packet interface. Keep the stock v4 API as default.
+
+--- a/hw/net/wl1271.c
++++ b/hw/net/wl1271.c
+@@ -39,6 +39,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/cutils.h"
+ #include "qemu/bswap.h"
+ #include "qemu/log.h"
+ #include "qemu/timer.h"
+@@ -171,6 +172,7 @@
+     NICConf conf;
+     NICState *nic;
+     char *ssid;
++    char *fw_version;
+     uint8_t channel;
+     bool trace;
+ 
+@@ -743,8 +745,7 @@
+ static void wl_fw_start(WL1271State *s)
+ {
+     uint8_t *sd = s->mem + CMD_BOX;
+-    /* what the unit's own WL1271 reports with wl127x-fw-4-sr.bin */
+-    static const char version[] = "Rev 4.0.0.0.4";
++    const char *version = s->fw_version;
+ 
+     s->running = true;
+     s->regs[(SCR_PAD0 - REGISTERS_BASE) / 4] = CMD_BOX;
+@@ -752,7 +753,7 @@
+     /* wl1271_static_data: mac, padding, fw_version[20], hw_version */
+     memset(sd, 0, 64);
+     memcpy(sd, s->conf.macaddr.a, 6);
+-    memcpy(sd + 8, version, sizeof(version));
++    pstrcpy((char *)sd + 8, 20, version);
+     stl_le_p(sd + 28, CHIP_ID_1271_PG20);
+     wl_sync_status(s);
+     s->intr |= INTR_INIT_COMPLETE;
+@@ -1081,6 +1082,7 @@
+ 
+ static const Property wl1271_props[] = {
+     DEFINE_PROP_STRING("ssid", WL1271State, ssid),
++    DEFINE_PROP_STRING("fw-version", WL1271State, fw_version),
+     DEFINE_PROP_UINT8("channel", WL1271State, channel, 6),
+     DEFINE_PROP_BOOL("trace", WL1271State, trace, false),
+     DEFINE_NIC_PROPERTIES(WL1271State, conf),
+@@ -1091,6 +1093,7 @@
+     WL1271State *s = WL1271(obj);
+ 
+     s->ssid = g_strdup("QEMU");
++    s->fw_version = g_strdup("Rev 4.0.0.0.4");
+ }
+ 
+ static void wl1271_class_init(ObjectClass *oc, const void *data)

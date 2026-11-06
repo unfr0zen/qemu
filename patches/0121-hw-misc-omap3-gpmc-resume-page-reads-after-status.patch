@@ -1,0 +1,21 @@
+From: Will <will@localhost>
+Subject: [PATCH] hw/misc: omap3-gpmc: resume page reads after status
+
+READ0 exits status mode without a new address sequence. This is used by
+mainline NAND software ready polling before reading page data.
+
+--- a/hw/misc/omap3_gpmc.c
++++ b/hw/misc/omap3_gpmc.c
+@@ -201,8 +201,11 @@
+         s->status = NAND_STATUS_READY | NAND_STATUS_NOT_WP;
+         gpmc_nand_ready(s);
+         break;
++    case 0x00:                  /* READ, or resume after READ STATUS */
++        s->out_mode = OUT_PAGE;
++        s->naddr = 0;
++        break;
+     case 0x90:                  /* READ ID */
+-    case 0x00:                  /* READ */
+     case 0x05:                  /* CHANGE READ COLUMN */
+     case 0x60:                  /* BLOCK ERASE */
+         s->naddr = 0;

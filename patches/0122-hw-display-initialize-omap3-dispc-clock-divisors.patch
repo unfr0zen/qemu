@@ -1,0 +1,31 @@
+Subject: [PATCH] hw/display: initialize OMAP3 DISPC clock divisors
+
+The LCD clock divisors reset to one and two. Linux reads them while
+setting up the first framebuffer before programming its display mode.
+
+--- a/hw/display/omap3_dss.c
++++ b/hw/display/omap3_dss.c
+@@ -35,6 +35,7 @@
+ #define DISPC_IRQSTATUS         0x018
+ #define DISPC_IRQENABLE         0x01c
+ #define DISPC_CONTROL           0x040
++#define DISPC_DIVISOR           0x070
+ #define DISPC_SIZE_LCD          0x07c
+ #define DISPC_GFX_BA0           0x080
+ #define DISPC_GFX_SIZE          0x08c
+@@ -234,6 +235,7 @@
+     memset(s->rfbi, 0, sizeof(s->rfbi));
+     memset(s->venc, 0, sizeof(s->venc));
+     memset(s->dsi, 0, sizeof(s->dsi));
++    s->dispc[DISPC_DIVISOR / 4] = 0x00010002;
+     s->dispc[DISPC_GFX_PIXEL_INC / 4] = 1;
+     s->dispc[DISPC_GFX_ROW_INC / 4] = 1;
+     s->dispc_irqstatus = 0;
+@@ -259,6 +261,7 @@
+         case DISPC_SYSCONFIG:
+             if (val & 2) {
+                 memset(s->dispc, 0, sizeof(s->dispc));
++                s->dispc[DISPC_DIVISOR / 4] = 0x00010002;
+                 s->dispc[DISPC_GFX_PIXEL_INC / 4] = 1;
+                 s->dispc[DISPC_GFX_ROW_INC / 4] = 1;
+                 s->dispc_irqstatus = 0;
