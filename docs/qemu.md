@@ -633,5 +633,6 @@ boot is not guaranteed and must not be inferred from stub-based boots.
 The captured `imx6sx-rev1.2-rom.bin` covers addresses `0x400..0x17fff`.
 Its companion low dump covers `0x100..0x3ff`; neither contains exception
 vectors `0x0..0xff`. These partial dumps cannot boot from reset and are
-rejected rather than being loaded at the wrong address. ROM and signed
-firmware files remain external to this repository.
+rejected rather than being loaded at the wrong address. The complete dump
+is tracked at `roms/diamond3/bootrom.bin`; its checksum and invocation are
+in `roms/diamond3/README.md`. Signed firmware remains external.

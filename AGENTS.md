@@ -2,7 +2,7 @@
 
 Guidance for coding agents working in this repository.
 
-QEMU machines that boot the stock firmware of Nest Learning Thermostats from a user-supplied NAND image: `-M diamond3` (i.MX6SoloX), `-M j49` (TI AM3703), and early U-Boot bring-up for `-M onyx` (Nest Thermostat E, i.MX6UL). No firmware or NAND images are in the repo, and none may be added.
+QEMU machines that boot the stock firmware of Nest Learning Thermostats from a user-supplied NAND image: `-M diamond3` (i.MX6SoloX), `-M j49` (TI AM3703), and early U-Boot bring-up for `-M onyx` (Nest Thermostat E, i.MX6UL). The user-supplied Diamond3 mask ROM is tracked at `roms/diamond3/bootrom.bin`. NAND images, signed U-Boot and other firmware remain external and must not be added.
 
 ## Commands
 
