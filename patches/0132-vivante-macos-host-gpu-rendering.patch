@@ -1,0 +1,1013 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: render gc400 shaders on macos host gpu
+
+--- a/hw/display/vivante_3d.c
++++ b/hw/display/vivante_3d.c
+@@ -2195,6 +2195,9 @@
+     return true;
+ }
+ 
++/* Host backend shares the decoded ISA and surface conversion helpers. */
++#include "vivante_host_gl.inc.c"
++
+ void viv3d_draw(VivGCState *s, uint32_t prim, uint32_t start, uint32_t count,
+                 bool indexed, uint32_t index_offset)
+ {
+@@ -2210,6 +2213,12 @@
+     if (!n || n > VIV_MAX_VERTICES || !viv_draw_setup(d)) {
+         return;
+     }
++
++    if (viv_host_draw(d, prim, start, n, indexed, index_offset)) {
++        goto release;
++    }
++    viv3d_flush(s);
++    s->software_draws++;
+ 
+     v = g_new0(VivVertex, n);
+     for (unsigned i = 0; i < n; i += 4) {
+@@ -2269,6 +2278,7 @@
+ 
+     viv_raster(d, e);
+ 
++release:
+     viv_samplers_release(d);
+     g_free(d->win);
+     g_free(d->tri);
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -333,6 +333,7 @@
+     if (i == ntiles / 4) {
+         return;
+     }
++    viv3d_flush(s);
+     viv_surf_init(&m, s, surf_base + first * 64, ntiles * 64, true, true);
+     for (i = start - first; i < end - first; i++) {
+         uint8_t *tile;
+@@ -476,6 +477,7 @@
+     VivSurf src, dst;
+     uint8_t fill[8];
+ 
++    viv3d_flush(s);
+     viv_rs_surface(cfg & RS_CFG_SRC_TILED, st[RS_SOURCE_STRIDE], &slayout,
+                    &sstride);
+     viv_rs_surface(cfg & RS_CFG_DST_TILED, st[RS_DEST_STRIDE], &dlayout,
+@@ -781,6 +783,7 @@
+ 
+ static void viv_soft_reset(VivGCState *s)
+ {
++    viv3d_flush(s);
+     timer_del(s->fe_timer);
+     s->fe_running = false;
+     s->intr_pending = 0;
+@@ -882,12 +885,24 @@
+                           VIV_REGS_SIZE);
+     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++    object_property_add_uint64_ptr(OBJECT(s), "host-draws",
++                                   &s->host_draws, OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(OBJECT(s), "host-flushes",
++                                   &s->host_flushes, OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(OBJECT(s), "software-draws",
++                                   &s->software_draws, OBJ_PROP_FLAG_READ);
+     s->states = g_new0(uint32_t, VIV_NUM_STATES);
+     s->fe_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, viv_fe_tick, s);
+ }
+ 
++static void viv_unrealize(DeviceState *dev)
++{
++    viv3d_fini(VIVANTE_GC(dev));
++}
++
+ static const Property viv_props[] = {
+     DEFINE_PROP_BOOL("trace", VivGCState, trace, false),
++    DEFINE_PROP_BOOL("host-gpu", VivGCState, host_gpu, true),
+ };
+ 
+ static void viv_class_init(ObjectClass *oc, const void *data)
+@@ -896,6 +911,7 @@
+ 
+     dc->desc = "Vivante GC400T GPU";
+     dc->realize = viv_realize;
++    dc->unrealize = viv_unrealize;
+     device_class_set_legacy_reset(dc, viv_reset);
+     device_class_set_props(dc, viv_props);
+ }
+--- a/hw/display/vivante_gc_int.h
++++ b/hw/display/vivante_gc_int.h
+@@ -25,6 +25,9 @@
+     qemu_irq irq;
+     QEMUTimer *fe_timer;
+     bool trace;
++    bool host_gpu;
++    void *host_gl;
++    uint64_t host_draws, host_flushes, software_draws;
+ 
+     uint32_t regs[VIV_REGS_SIZE / 4];
+     uint32_t *states;
+@@ -142,6 +145,8 @@
+ }
+ 
+ void viv_ts_resolve(VivGCState *s, uint32_t surf, uint32_t size, bool depth);
++void viv3d_fini(VivGCState *s);
++void viv3d_flush(VivGCState *s);
+ void viv3d_draw(VivGCState *s, uint32_t prim, uint32_t start, uint32_t count,
+                 bool indexed, uint32_t index_offset);
+ 
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -16,6 +16,10 @@
+ system_ss.add(when: 'CONFIG_SSD0303', if_true: files('ssd0303.c'))
+ system_ss.add(when: 'CONFIG_LM3695', if_true: files('lm3695.c'))
+ system_ss.add(when: 'CONFIG_VIVANTE_GC', if_true: files('vivante_gc.c', 'vivante_3d.c'))
++if host_os == 'darwin'
++  system_ss.add(when: 'CONFIG_VIVANTE_GC',
++                if_true: dependency('appleframeworks', modules: ['OpenGL']))
++endif
+ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
+ system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
+ 
+--- /dev/null
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -0,0 +1,881 @@
++/*
++ * GC400 shader translation and offscreen rendering on a macOS host GPU.
++ * Guest surfaces remain authoritative at resolve and CPU fallback boundaries.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifdef CONFIG_DARWIN
++#define GL_SILENCE_DEPRECATION
++#include <OpenGL/OpenGL.h>
++#include <OpenGL/gl3.h>
++#include "qemu/xxhash.h"
++#include "qemu/error-report.h"
++
++typedef struct VivHostTexture {
++    GLuint name;
++    uint64_t hash;
++    uint32_t cfg[5];
++} VivHostTexture;
++
++typedef struct VivHostGL {
++    CGLContextObj context;
++    GHashTable *programs;
++    GLuint fbo, color, depth, vao, vertices, uniforms;
++    bool valid;
++    unsigned width, height;
++    VivDraw target;
++    VivHostTexture textures[256];
++    unsigned next_texture;
++} VivHostGL;
++
++static VivHostGL *viv_host_init(VivGCState *s)
++{
++    VivHostGL *h = s->host_gl;
++    CGLPixelFormatObj format;
++    GLint count;
++    CGLPixelFormatAttribute attrs[] = {
++        kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
++        kCGLPFAAccelerated, (CGLPixelFormatAttribute)0,
++    };
++
++    if (h || !s->host_gpu) {
++        return h;
++    }
++    h = g_new0(VivHostGL, 1);
++    if (CGLChoosePixelFormat(attrs, &format, &count) != kCGLNoError) {
++        goto fail;
++    }
++    CGLError result = CGLCreateContext(format, NULL, &h->context);
++    CGLDestroyPixelFormat(format);
++    if (result != kCGLNoError) {
++        goto fail;
++    }
++    CGLSetCurrentContext(h->context);
++    h->programs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
++    glGenFramebuffers(1, &h->fbo);
++    glGenTextures(1, &h->color);
++    glGenTextures(1, &h->depth);
++    glGenVertexArrays(1, &h->vao);
++    glGenBuffers(1, &h->vertices);
++    glGenBuffers(1, &h->uniforms);
++    glBindVertexArray(h->vao);
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    info_report("vivante-gc: host GPU %s", glGetString(GL_RENDERER));
++    s->host_gl = h;
++    return h;
++fail:
++    warn_report("vivante-gc: accelerated CGL context unavailable");
++    s->host_gpu = false;
++    g_free(h);
++    return NULL;
++}
++
++void viv3d_fini(VivGCState *s)
++{
++    VivHostGL *h = s->host_gl;
++    GHashTableIter iter;
++    gpointer value;
++
++    if (!h) {
++        return;
++    }
++    CGLSetCurrentContext(h->context);
++    g_hash_table_iter_init(&iter, h->programs);
++    while (g_hash_table_iter_next(&iter, NULL, &value)) {
++        glDeleteProgram(GPOINTER_TO_UINT(value));
++    }
++    g_hash_table_destroy(h->programs);
++    for (unsigned i = 0; i < ARRAY_SIZE(h->textures); i++) {
++        glDeleteTextures(1, &h->textures[i].name);
++    }
++    glDeleteTextures(1, &h->color);
++    glDeleteTextures(1, &h->depth);
++    glDeleteFramebuffers(1, &h->fbo);
++    glDeleteBuffers(1, &h->vertices);
++    glDeleteBuffers(1, &h->uniforms);
++    glDeleteVertexArrays(1, &h->vao);
++    CGLSetCurrentContext(NULL);
++    CGLDestroyContext(h->context);
++    g_free(h);
++    s->host_gl = NULL;
++}
++
++static void viv_gl_src(GString *text, const VivSrc *src, unsigned base)
++{
++    const char *xyzw = "xyzw";
++
++    if (!src->use) {
++        g_string_append(text, "vec4(0.0)");
++        return;
++    }
++    if (src->rgroup == RG_IMMEDIATE) {
++        g_string_append_printf(text, "vec4(uintBitsToFloat(%uu))", src->imm);
++        return;
++    }
++    if (src->neg) {
++        g_string_append(text, "-");
++    }
++    if (src->abs) {
++        g_string_append(text, "abs(");
++    }
++    if (src->rgroup == RG_TEMP) {
++        g_string_append_printf(text, "t[(%u", src->reg);
++    } else if (src->rgroup == RG_UNIFORM0 || src->rgroup == RG_UNIFORM1) {
++        g_string_append_printf(text, "u[(%u", base + src->reg +
++                               (src->rgroup == RG_UNIFORM1 ? 128 : 0));
++    } else {
++        g_string_append(text, "vec4(gl_FrontFacing ? 1.0 : -1.0)");
++        goto swizzle;
++    }
++    if (src->amode) {
++        g_string_append_printf(text, "+a0.%c", xyzw[src->amode - 1]);
++    }
++    g_string_append_printf(text, ")&%u]", src->rgroup == RG_TEMP ? 63 : 1023);
++swizzle:
++    g_string_append_printf(text, ".%c%c%c%c", xyzw[src->swz[0]],
++                           xyzw[src->swz[1]], xyzw[src->swz[2]],
++                           xyzw[src->swz[3]]);
++    if (src->abs) {
++        g_string_append_c(text, ')');
++    }
++}
++
++static void viv_gl_cond(GString *text, unsigned cond, const char *a,
++                        const char *b, const char *domain)
++{
++    static const char *compare[] = {
++        NULL, "greaterThan", "lessThan", "greaterThanEqual",
++        "lessThanEqual", "equal", "notEqual",
++    };
++
++    if (!cond) {
++        g_string_append(text, "bvec4(true)");
++    } else if (cond < ARRAY_SIZE(compare)) {
++        g_string_append_printf(text, "%s(%s,%s)", compare[cond], a, b);
++    } else if (cond >= 10 && cond <= 15) {
++        static const char *zero[] = {
++            "equal", "notEqual", "greaterThanEqual", "greaterThan",
++            "lessThanEqual", "lessThan",
++        };
++        g_string_append_printf(text, "%s(%s,%s(0))",
++                               zero[cond - 10], a, domain);
++    } else {
++        /* Per-component boolean operators do not accept vector operands. */
++        const char *op = cond == 7 ? "&&" : cond == 8 ? "||" : "!=";
++        g_string_append(text, "bvec4(");
++        for (unsigned c = 0; c < 4; c++) {
++            g_string_append_printf(text, "%s(%s[%u]!=0)%s(%s[%u]!=0)",
++                                   c ? "," : "", a, c, op, b, c);
++        }
++        g_string_append_c(text, ')');
++    }
++}
++
++static bool viv_gl_instruction(GString *text, const VivInst *in,
++                               const VivProg *p)
++{
++    const char *expression = NULL;
++    const char *xyzw = "xyzw";
++
++    if (in->op == OP_NOP) {
++        return true;
++    }
++    if (!viv_is_float(in) && in->op != OP_I2F && in->op != OP_F2I &&
++        in->op != OP_F2IRND) {
++        return false;
++    }
++    g_string_append(text, "{vec4 a=");
++    viv_gl_src(text, &in->src[0], p->ubase);
++    g_string_append(text, ",b=");
++    viv_gl_src(text, &in->src[1], p->ubase);
++    g_string_append(text, ",c=");
++    viv_gl_src(text, &in->src[2], p->ubase);
++    g_string_append(text, ",r;\n");
++    switch (in->op) {
++    case OP_ADD:
++        expression = "a+c";
++        break;
++    case OP_MAD:
++        expression = "a*b+c";
++        break;
++    case OP_MUL:
++        expression = "a*b";
++        break;
++    case OP_DP2:
++        expression = "vec4(dot(a.xy,b.xy))";
++        break;
++    case OP_DP3:
++        expression = "vec4(dot(a.xyz,b.xyz))";
++        break;
++    case OP_DP4:
++        expression = "vec4(dot(a,b))";
++        break;
++    case OP_MOV:
++        expression = "c";
++        break;
++    case OP_RCP:
++        expression = "vec4(1.0/c.x)";
++        break;
++    case OP_RSQ:
++        expression = "vec4(inversesqrt(c.x))";
++        break;
++    case OP_SQRT:
++        expression = "vec4(sqrt(c.x))";
++        break;
++    case OP_EXP:
++        expression = "vec4(exp2(c.x))";
++        break;
++    case OP_LOG:
++        expression = "vec4(log2(c.x))";
++        break;
++    case OP_SIN:
++        expression = "vec4(sin(c.x*1.5707963267948966))";
++        break;
++    case OP_COS:
++        expression = "vec4(cos(c.x*1.5707963267948966))";
++        break;
++    case OP_DIV:
++        expression = "vec4(b.x/c.x)";
++        break;
++    case OP_FRC:
++        expression = "fract(c)";
++        break;
++    case OP_FLOOR:
++        expression = "floor(c)";
++        break;
++    case OP_CEIL:
++        expression = "ceil(c)";
++        break;
++    case OP_SIGN:
++        expression = "sign(c)";
++        break;
++    case OP_DSX:
++        expression = "dFdx(a)";
++        break;
++    case OP_DSY:
++        expression = "dFdy(a)";
++        break;
++    case OP_I2F:
++        expression = "vec4(floatBitsToInt(c))";
++        break;
++    case OP_F2I:
++        expression = "intBitsToFloat(ivec4(c))";
++        break;
++    case OP_F2IRND:
++        expression = "intBitsToFloat(ivec4(round(c)))";
++        break;
++    case OP_MOVAR:
++        g_string_append(text, "a0=ivec4(c);}\n");
++        return true;
++    case OP_SELECT:
++    case OP_SET:
++    case OP_CMP:
++        g_string_append(text, "r=mix(");
++        g_string_append(text, in->op == OP_SELECT ? "c,b," :
++                        in->op == OP_SET ? "vec4(0.0),vec4(1.0)," :
++                        "vec4(0.0),c,");
++        viv_gl_cond(text, in->cond, "a", "b", "vec4");
++        g_string_append(text, ");\n");
++        break;
++    case OP_TEXKILL:
++        g_string_append(text, "if(any(");
++        viv_gl_cond(text, in->cond, "a", "b", "vec4");
++        g_string_append(text, "))discard;}\n");
++        return true;
++    case OP_TEXLD:
++    case OP_TEXLDB:
++    case OP_TEXLDL:
++    case OP_TEXLDD:
++        g_string_append_printf(text, "r=%s(tex%u,a.xy",
++                               in->op == OP_TEXLDL ? "textureLod" :
++                               in->op == OP_TEXLDD ? "textureGrad" : "texture",
++                               in->tex_id);
++        if (in->op == OP_TEXLDD) {
++            g_string_append(text, ",b.xy,c.xy");
++        } else if (in->op != OP_TEXLD) {
++            g_string_append(text, ",a.w");
++        }
++        g_string_append_printf(text, ").%c%c%c%c;\n", xyzw[in->tex_swz[0]],
++                               xyzw[in->tex_swz[1]], xyzw[in->tex_swz[2]],
++                               xyzw[in->tex_swz[3]]);
++        break;
++    default:
++        return false;
++    }
++    if (expression) {
++        g_string_append_printf(text, "r=%s;\n", expression);
++    }
++    if (in->sat) {
++        g_string_append(text, "r=clamp(r,0.0,1.0);\n");
++    }
++    if (in->dst_use && in->dst_mask) {
++        g_string_append_printf(text, "t[(%u", in->dst_reg);
++        if (in->dst_amode) {
++            g_string_append_printf(text, "+a0.%c", xyzw[in->dst_amode - 1]);
++        }
++        g_string_append(text, ")&63]");
++        g_string_append_c(text, '.');
++        for (unsigned c = 0; c < 4; c++) {
++            if (in->dst_mask & (1 << c)) {
++                g_string_append_c(text, xyzw[c]);
++            }
++        }
++        g_string_append(text, "=r.");
++        for (unsigned c = 0; c < 4; c++) {
++            if (in->dst_mask & (1 << c)) {
++                g_string_append_c(text, xyzw[c]);
++            }
++        }
++        g_string_append(text, ";\n");
++    }
++    g_string_append(text, "}\n");
++    return true;
++}
++
++static char *viv_gl_shader(VivDraw *d, bool fragment)
++{
++    const VivProg *p = fragment ? &d->ps : &d->vs;
++    GString *text = g_string_new("#version 330\n"
++        "layout(std140) uniform Uniforms{vec4 u[1024];};\n");
++    bool samplers[VIV_SAMPLERS] = {};
++
++    for (unsigned i = 1; i < d->ps_inputs; i++) {
++        bool flat = PA_SHADE_MODEL(d->st[ST_PA_CONFIG]) == 0 &&
++                    !(d->st[ST_PA_SHADER_ATTRIBUTES + i - 1] & 1);
++        g_string_append_printf(text, "%s%s vec4 v%u;\n", flat ? "flat " : "",
++                               fragment ? "in" : "out", i);
++    }
++    if (fragment) {
++        g_string_append(text, "out vec4 color;\n");
++    } else {
++        for (unsigned i = 0; i < d->vs_inputs; i++) {
++            g_string_append_printf(text, "in vec4 input%u;\n", i);
++        }
++        g_string_append(text, "uniform vec4 scale,offset;\n");
++    }
++    for (unsigned pc = p->start; pc < p->end; pc++) {
++        const VivInst *in = &p->inst[pc];
++        if (in->op >= OP_TEXLD && in->op <= OP_TEXLDL &&
++            in->tex_id < VIV_SAMPLERS && !samplers[in->tex_id]) {
++            samplers[in->tex_id] = true;
++            g_string_append_printf(text, "uniform sampler2D tex%u;\n",
++                                   in->tex_id);
++        }
++    }
++    g_string_append(text, "void main(){vec4 t[64];ivec4 a0=ivec4(0);\n"
++                           "for(int i=0;i<64;i++)t[i]=vec4(0.0);\n");
++    if (fragment) {
++        g_string_append(text, "t[0]=gl_FragCoord;\n");
++        for (unsigned i = 1; i < d->ps_inputs; i++) {
++            g_string_append_printf(text, "t[%u]=v%u;\n", i, i);
++        }
++    } else {
++        for (unsigned i = 0; i < d->vs_inputs; i++) {
++            g_string_append_printf(text, "t[%u]=input%u;\n",
++                                   d->vs_in_reg[i] & 63, i);
++        }
++    }
++    bool flow = false;
++    bool loop = false;
++    for (unsigned pc = p->start; pc < p->end; pc++) {
++        if (p->inst[pc].op == OP_BRANCH) {
++            flow = true;
++            loop |= p->inst[pc].target <= pc;
++        }
++    }
++    if (flow) {
++        g_string_append_printf(text, "int pc=%u;\n", p->start);
++    }
++    if (loop) {
++        g_string_append_printf(text,
++            "for(int step=0;step<65536 && pc<%u;step++){switch(pc){\n",
++            p->end);
++    }
++    for (unsigned pc = p->start; pc < p->end; pc++) {
++        const VivInst *in = &p->inst[pc];
++        if (loop) {
++            g_string_append_printf(text, "case %u:{pc=%u;\n", pc, pc + 1);
++        } else if (flow) {
++            g_string_append_printf(text, "if(pc<=%u){pc=%u;\n", pc, pc + 1);
++        }
++        if (in->op == OP_BRANCH) {
++            g_string_append(text, "{vec4 a=");
++            viv_gl_src(text, &in->src[0], p->ubase);
++            g_string_append(text, ",b=");
++            viv_gl_src(text, &in->src[1], p->ubase);
++            if (viv_is_float(in)) {
++                g_string_append(text, ";if((");
++                viv_gl_cond(text, in->cond, "a", "b", "vec4");
++            } else {
++                bool sign = in->type != TYPE_U32;
++                g_string_append_printf(text, ";%svec4 ia=floatBitsTo%s(a),"
++                                       "ib=floatBitsTo%s(b);if((",
++                                       sign ? "i" : "u", sign ? "Int" : "Uint",
++                                       sign ? "Int" : "Uint");
++                viv_gl_cond(text, in->cond, "ia", "ib",
++                            sign ? "ivec4" : "uvec4");
++            }
++            g_string_append_printf(text, ").x)pc=%u;}\n", in->target);
++        } else if (!viv_gl_instruction(text, in, p)) {
++            VIV_UNIMP(d->s, 12, "host shader fallback: opcode 0x%x type %u",
++                      p->inst[pc].op, p->inst[pc].type);
++            g_string_free(text, true);
++            return NULL;
++        }
++        if (loop) {
++            g_string_append(text, "break;}\n");
++        } else if (flow) {
++            g_string_append(text, "}\n");
++        }
++    }
++    if (loop) {
++        g_string_append_printf(text, "default:pc=%u;break;}}\n", p->end);
++    }
++    if (fragment) {
++        g_string_append_printf(text, "color=t[%u];\n", d->ps_out_reg & 63);
++        uint32_t alpha = d->st[ST_PE_ALPHA_OP];
++        if (alpha & 1) {
++            static const char *ops[] = { "false", "<", "==", "<=", ">",
++                                       "!=", ">=", "true" };
++            unsigned func = (alpha >> 4) & 7;
++            if (func == 0) {
++                g_string_append(text, "discard;\n");
++            } else if (func != 7) {
++                g_string_append_printf(text, "if(!(floor(clamp(color.a,0.0,1.0)"
++                                       "*255.0+0.5)%s%u.0))discard;\n",
++                                       ops[func], (alpha >> 8) & 255);
++            }
++        }
++    } else {
++        g_string_append_printf(text, "vec4 pos=t[%u];\n"
++                               "gl_Position=vec4(pos.xyz*scale.xyz+"
++                               "pos.w*offset.xyz,pos.w);\n",
++                               d->vs_out_reg[0] & 63);
++        for (unsigned i = 1; i < d->ps_inputs; i++) {
++            g_string_append_printf(text, "v%u=t[%u];\n", i,
++                                   d->vs_out_reg[i] & 63);
++        }
++    }
++    g_string_append(text, "}\n");
++    return g_string_free(text, false);
++}
++
++static GLuint viv_gl_compile(GLenum type, const char *source)
++{
++    GLuint shader = glCreateShader(type);
++    GLint ok;
++
++    glShaderSource(shader, 1, &source, NULL);
++    glCompileShader(shader);
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[2048];
++        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
++        warn_report("vivante-gc: host shader: %s", log);
++        glDeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
++
++static GLuint viv_gl_program(VivHostGL *h, VivDraw *d)
++{
++    g_autofree char *vs = viv_gl_shader(d, false);
++    g_autofree char *ps = viv_gl_shader(d, true);
++    GLuint program, vertex, fragment;
++    GLint linked;
++
++    if (!vs || !ps) {
++        return 0;
++    }
++    char *key = g_strconcat(vs, ps, NULL);
++    gpointer cached;
++    if (g_hash_table_lookup_extended(h->programs, key, NULL, &cached)) {
++        g_free(key);
++        return GPOINTER_TO_UINT(cached);
++    }
++    vertex = viv_gl_compile(GL_VERTEX_SHADER, vs);
++    fragment = viv_gl_compile(GL_FRAGMENT_SHADER, ps);
++    if (!vertex || !fragment) {
++        if (vertex) {
++            glDeleteShader(vertex);
++        }
++        if (fragment) {
++            glDeleteShader(fragment);
++        }
++        g_hash_table_insert(h->programs, key, NULL);
++        return 0;
++    }
++    program = glCreateProgram();
++    glAttachShader(program, vertex);
++    glAttachShader(program, fragment);
++    for (unsigned i = 0; i < d->vs_inputs; i++) {
++        char name[24];
++        snprintf(name, sizeof(name), "input%u", i);
++        glBindAttribLocation(program, i, name);
++    }
++    glBindFragDataLocation(program, 0, "color");
++    glLinkProgram(program);
++    glGetProgramiv(program, GL_LINK_STATUS, &linked);
++    glDeleteShader(vertex);
++    glDeleteShader(fragment);
++    if (!linked) {
++        char log[2048];
++        glGetProgramInfoLog(program, sizeof(log), NULL, log);
++        warn_report("vivante-gc: host shader link: %s", log);
++        glDeleteProgram(program);
++        program = 0;
++    } else {
++        GLuint block = glGetUniformBlockIndex(program, "Uniforms");
++        if (block != GL_INVALID_INDEX) {
++            glUniformBlockBinding(program, block, 0);
++        }
++    }
++    g_hash_table_insert(h->programs, key, GUINT_TO_POINTER(program));
++    return program;
++}
++
++void viv3d_flush(VivGCState *s)
++{
++    VivHostGL *h = s->host_gl;
++    VivDraw *d;
++    unsigned pixels;
++    g_autofree uint8_t *color = NULL;
++    g_autofree uint8_t *depth = NULL;
++
++    if (!h || !h->valid) {
++        return;
++    }
++    CGLSetCurrentContext(h->context);
++    d = &h->target;
++    pixels = h->width * h->height;
++    color = g_malloc(pixels * 4);
++    glBindFramebuffer(GL_FRAMEBUFFER, h->fbo);
++    glReadPixels(0, 0, h->width, h->height, GL_RGBA, GL_UNSIGNED_BYTE, color);
++    viv_surf_init(&d->rt, s, d->rt.base, d->rt.size, false, true);
++    d->rt_mask = 15;
++    if (d->zs) {
++        depth = g_malloc(pixels * d->z_bpp);
++        glReadPixels(0, 0, h->width, h->height,
++                     d->z_bpp == 4 ? GL_DEPTH_STENCIL : GL_DEPTH_COMPONENT,
++                     d->z_bpp == 4 ? GL_UNSIGNED_INT_24_8 : GL_UNSIGNED_SHORT,
++                     depth);
++        viv_surf_init(&d->zb, s, d->zb.base, d->zb.size, false, true);
++    }
++    for (unsigned y = 0; y < h->height; y++) {
++        for (unsigned x = 0; x < h->width; x++) {
++            unsigned i = y * h->width + x;
++            float c[4];
++            uint8_t *p = viv_surf_ptr(&d->rt, viv_pixel_offset(d->rt_layout,
++                                     d->rt_stride, d->rt_bpp, x, y));
++            for (unsigned j = 0; j < 4; j++) {
++                c[j] = color[i * 4 + j] / 255.0f;
++            }
++            if (p) {
++                viv_rt_write(d, p, c, c);
++            }
++            if (d->zs) {
++                p = viv_surf_ptr(&d->zb, viv_pixel_offset(d->z_layout,
++                                 d->z_stride, d->z_bpp, x, y));
++                if (p) {
++                    memcpy(p, depth + i * d->z_bpp, d->z_bpp);
++                }
++            }
++        }
++    }
++    viv_surf_release(&d->rt);
++    if (d->zs) {
++        viv_surf_release(&d->zb);
++    }
++    h->valid = false;
++    s->host_flushes++;
++}
++
++static void viv_gl_target(VivHostGL *h, VivDraw *d)
++{
++    unsigned width = d->rt_stride / d->rt_bpp;
++    unsigned height = ROUND_UP(d->ymax, VIV_ROWS(d->rt_layout));
++    g_autofree uint8_t *color = NULL;
++    g_autofree uint8_t *depth = NULL;
++
++    if (h->valid && h->target.rt.base == d->rt.base &&
++        (!d->zs || (h->target.zs && h->target.zb.base == d->zb.base)) &&
++        h->width == width && h->height >= height) {
++        return;
++    }
++    viv3d_flush(d->s);
++    color = g_malloc0(width * height * 4);
++    if (d->zs) {
++        depth = g_malloc0(width * height * d->z_bpp);
++    }
++    for (unsigned y = 0; y < height; y++) {
++        for (unsigned x = 0; x < width; x++) {
++            unsigned i = y * width + x;
++            float c[4] = {};
++            uint8_t *p = viv_surf_ptr(&d->rt, viv_pixel_offset(d->rt_layout,
++                                     d->rt_stride, d->rt_bpp, x, y));
++            if (p) {
++                viv_rt_read(d, p, c);
++            }
++            for (unsigned j = 0; j < 4; j++) {
++                color[i * 4 + j] = viv_q(c[j], 255);
++            }
++            if (d->zs) {
++                p = viv_surf_ptr(&d->zb, viv_pixel_offset(d->z_layout,
++                                 d->z_stride, d->z_bpp, x, y));
++                if (p) {
++                    memcpy(depth + i * d->z_bpp, p, d->z_bpp);
++                }
++            }
++        }
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER, h->fbo);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, h->color);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
++                 GL_RGBA, GL_UNSIGNED_BYTE, color);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_2D, h->color, 0);
++    glBindTexture(GL_TEXTURE_2D, h->depth);
++    glTexImage2D(GL_TEXTURE_2D, 0,
++                 d->zs && d->z_bpp == 2 ? GL_DEPTH_COMPONENT16 :
++                                        GL_DEPTH24_STENCIL8,
++                 width, height, 0,
++                 d->zs && d->z_bpp == 2 ? GL_DEPTH_COMPONENT : GL_DEPTH_STENCIL,
++                 d->zs && d->z_bpp == 2 ? GL_UNSIGNED_SHORT :
++                                        GL_UNSIGNED_INT_24_8,
++                 depth);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
++                           GL_TEXTURE_2D, h->depth, 0);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
++                           GL_TEXTURE_2D,
++                           d->zs && d->z_bpp == 2 ? 0 : h->depth, 0);
++    h->target = *d;
++    h->width = width;
++    h->height = height;
++    h->valid = true;
++}
++
++static void viv_gl_texture(VivHostGL *h, VivDraw *d, unsigned unit,
++                           GLuint program)
++{
++    VivSampler *sm = &d->smp[unit];
++    uint64_t hash = 0;
++    uint32_t cfg[] = {sm->cfg0, sm->cfg1, sm->lod_cfg, sm->w, sm->h};
++    unsigned maxlevel = 0;
++    VivHostTexture *texture = NULL;
++    char name[24];
++    static const GLint wrap[] = {
++        GL_REPEAT, GL_MIRRORED_REPEAT, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_BORDER,
++    };
++
++    if (!sm->w || !sm->h || sm->w > 4096 || sm->h > 4096) {
++        return;
++    }
++    while (maxlevel + 1 < VIV_LEVELS && sm->level[maxlevel + 1].addr &&
++           (sm->w >> maxlevel > 1 || sm->h >> maxlevel > 1)) {
++        maxlevel++;
++    }
++    for (unsigned l = 0; l <= maxlevel; l++) {
++        VivLevel *lv = viv_level(d, sm, l);
++        for (unsigned off = 0; off < lv->surf.size;) {
++            uint8_t *p = viv_surf_ptr(&lv->surf, off);
++            unsigned n = MIN(lv->surf.size - off,
++                             4096 - ((lv->surf.base + off) & 4095));
++            if (p) {
++                unsigned i = 0;
++                for (; i + 8 <= n; i += 8) {
++                    hash = XXH64_round(hash, ldq_le_p(p + i));
++                }
++                for (; i < n; i++) {
++                    hash = XXH64_round(hash, p[i]);
++                }
++            }
++            off += n;
++        }
++    }
++    for (unsigned i = 0; i < ARRAY_SIZE(h->textures); i++) {
++        if (h->textures[i].name && h->textures[i].hash == hash &&
++            !memcmp(h->textures[i].cfg, cfg, sizeof(cfg))) {
++            texture = &h->textures[i];
++            break;
++        }
++    }
++    glActiveTexture(GL_TEXTURE0 + unit);
++    if (!texture) {
++        texture = &h->textures[h->next_texture++ % ARRAY_SIZE(h->textures)];
++        if (!texture->name) {
++            glGenTextures(1, &texture->name);
++        }
++        glBindTexture(GL_TEXTURE_2D, texture->name);
++        for (unsigned l = 0; l <= maxlevel; l++) {
++            VivLevel *lv = &sm->level[l];
++            g_autofree uint8_t *pixels = g_malloc(lv->w * lv->h * 4);
++            for (unsigned y = 0; y < lv->h; y++) {
++                for (unsigned x = 0; x < lv->w; x++) {
++                    float c[4];
++                    viv_texel(d, sm, lv, x, y, c);
++                    for (unsigned j = 0; j < 4; j++) {
++                        pixels[(y * lv->w + x) * 4 + j] = viv_q(c[j], 255);
++                    }
++                }
++            }
++            glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, lv->w, lv->h, 0,
++                         GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++        }
++        unsigned min = (sm->cfg0 >> 7) & 3, mip = (sm->cfg0 >> 9) & 3;
++        GLint filter = min == 2 ? GL_LINEAR : GL_NEAREST;
++        if (mip) {
++            filter = mip == 1 ? (min == 2 ? GL_LINEAR_MIPMAP_NEAREST :
++                                GL_NEAREST_MIPMAP_NEAREST) :
++                               (min == 2 ? GL_LINEAR_MIPMAP_LINEAR :
++                                GL_NEAREST_MIPMAP_LINEAR);
++        }
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
++                         ((sm->cfg0 >> 11) & 3) == 2 ? GL_LINEAR : GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
++                         wrap[(sm->cfg0 >> 3) & 3]);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
++                         wrap[(sm->cfg0 >> 5) & 3]);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, maxlevel);
++        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD,
++                         ((sm->lod_cfg >> 11) & 1023) / 32.0f);
++        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD,
++                         ((sm->lod_cfg >> 1) & 1023) / 32.0f);
++        texture->hash = hash;
++        memcpy(texture->cfg, cfg, sizeof(cfg));
++    }
++    glBindTexture(GL_TEXTURE_2D, texture->name);
++    snprintf(name, sizeof(name), "tex%u", unit);
++    glUniform1i(glGetUniformLocation(program, name), unit);
++}
++
++static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
++                           unsigned n, bool indexed, uint32_t index_offset)
++{
++    VivHostGL *h = viv_host_init(d->s);
++    GLuint program;
++    g_autofree VivVec *vertices = NULL;
++    static const GLenum mode[] = {
++        0, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_TRIANGLES,
++        GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_LINE_LOOP,
++    };
++    static const GLenum compare[] = {
++        GL_NEVER, GL_LESS, GL_EQUAL, GL_LEQUAL, GL_GREATER,
++        GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS,
++    };
++    static const GLenum factor[] = {
++        GL_ZERO, GL_ONE, GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR,
++        GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_DST_ALPHA,
++        GL_ONE_MINUS_DST_ALPHA, GL_DST_COLOR, GL_ONE_MINUS_DST_COLOR,
++        GL_SRC_ALPHA_SATURATE, GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA,
++        GL_CONSTANT_COLOR, GL_ONE_MINUS_CONSTANT_COLOR, GL_ONE,
++    };
++    static const GLenum equation[] = {
++        GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT, GL_MIN, GL_MAX,
++    };
++
++    if (!h || prim < 1 || prim >= ARRAY_SIZE(mode) || !d->vs_inputs) {
++        return false;
++    }
++    CGLSetCurrentContext(h->context);
++    program = viv_gl_program(h, d);
++    if (!program) {
++        return false;
++    }
++    viv_gl_target(h, d);
++    glUseProgram(program);
++    glBindVertexArray(h->vao);
++    glBindBuffer(GL_UNIFORM_BUFFER, h->uniforms);
++    glBufferData(GL_UNIFORM_BUFFER, 1024 * 16, &d->st[ST_SH_UNIFORMS],
++                  GL_STREAM_DRAW);
++    glBindBufferBase(GL_UNIFORM_BUFFER, 0, h->uniforms);
++    glUniform4f(glGetUniformLocation(program, "scale"),
++                 2 * d->vp_scale[0] / h->width,
++                 2 * d->vp_scale[1] / h->height, 2 * d->vp_scale[2], 0);
++    glUniform4f(glGetUniformLocation(program, "offset"),
++                 2 * d->vp_offset[0] / h->width - 1,
++                 2 * d->vp_offset[1] / h->height - 1,
++                 2 * d->vp_offset[2] - 1, 0);
++    viv_samplers_prepare(d);
++    for (unsigned i = 0; i < VIV_SAMPLERS; i++) {
++        if (d->smp[i].used) {
++            viv_gl_texture(h, d, i, program);
++        }
++    }
++    vertices = g_new0(VivVec, n * d->vs_inputs);
++    for (unsigned i = 0; i < n; i++) {
++        VivVec temps[VIV_TEMPS] = {};
++        uint32_t idx = viv_index(d, indexed, start, i, index_offset);
++        viv_fetch_vertex(d, idx, temps);
++        for (unsigned j = 0; j < d->vs_inputs; j++) {
++            vertices[i * d->vs_inputs + j] = temps[d->vs_in_reg[j] & 63];
++        }
++    }
++    glBindBuffer(GL_ARRAY_BUFFER, h->vertices);
++    glBufferData(GL_ARRAY_BUFFER, n * d->vs_inputs * sizeof(VivVec),
++                  vertices, GL_STREAM_DRAW);
++    for (unsigned i = 0; i < d->vs_inputs; i++) {
++        glEnableVertexAttribArray(i);
++        glVertexAttribPointer(i, 4, GL_FLOAT, false,
++                               d->vs_inputs * sizeof(VivVec),
++                               (void *)(uintptr_t)(i * sizeof(VivVec)));
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER, h->fbo);
++    glViewport(0, 0, h->width, h->height);
++    glEnable(GL_SCISSOR_TEST);
++    glScissor(d->xmin, d->ymin, d->xmax - d->xmin, d->ymax - d->ymin);
++    glFrontFace(GL_CW);
++    if (d->cull == 1 || d->cull == 2) {
++        glEnable(GL_CULL_FACE);
++        glCullFace(d->cull == 1 ? GL_BACK : GL_FRONT);
++    } else {
++        glDisable(GL_CULL_FACE);
++    }
++    if (d->zs && PE_DEPTH_MODE(d->z_cfg)) {
++        glEnable(GL_DEPTH_TEST);
++        glDepthFunc(compare[PE_DEPTH_FUNC(d->z_cfg)]);
++    } else {
++        glDisable(GL_DEPTH_TEST);
++    }
++    glDepthMask(d->zs && (d->z_cfg & PE_DEPTH_WRITE));
++    glDisable(GL_STENCIL_TEST);
++    glColorMask(d->rt_mask & 1, d->rt_mask & 2,
++                 d->rt_mask & 4, d->rt_mask & 8);
++    uint32_t blend = d->st[ST_PE_ALPHA_CONFIG];
++    if (blend & 1) {
++        bool separate = blend & (1u << 16);
++        unsigned sf = (blend >> 4) & 15, df = (blend >> 8) & 15;
++        unsigned eq = (blend >> 12) & 7;
++        unsigned sa = separate ? (blend >> 20) & 15 : sf;
++        unsigned da = separate ? (blend >> 24) & 15 : df;
++        unsigned ae = separate ? (blend >> 28) & 7 : eq;
++        uint32_t constant = d->st[ST_PE_ALPHA_BLEND_COLOR];
++        glEnable(GL_BLEND);
++        glBlendColor(u8f(constant >> 16), u8f(constant >> 8),
++                       u8f(constant), u8f(constant >> 24));
++        glBlendFuncSeparate(factor[sf], factor[df], factor[sa], factor[da]);
++        glBlendEquationSeparate(equation[MIN(eq, 4)], equation[MIN(ae, 4)]);
++    } else {
++        glDisable(GL_BLEND);
++    }
++    glDrawArrays(mode[prim], 0, n);
++    d->s->host_draws++;
++    return true;
++}
++#else
++void viv3d_fini(VivGCState *s)
++{
++}
++
++void viv3d_flush(VivGCState *s)
++{
++}
++
++static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
++                           unsigned n, bool indexed, uint32_t index_offset)
++{
++    return false;
++}
++#endif

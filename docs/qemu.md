@@ -541,8 +541,14 @@ model of the i.MX6SX's GC400T GPU3D (`hw/display/vivante_gc.c`,
   shader ISA, clipping, rasterisation (split across host threads), texturing
   and the pixel engine (blending, depth/stencil, alpha test).
 
-While the UI animates the unit renders about 50 frames a second; the web
-page shows what its screendumps catch of them. `-global
+On macOS, `host-gpu=on` uses an accelerated OpenGL 4 core context by default.
+The backend translates GC400 vertex/fragment instructions, keeps render targets
+on the host GPU between draws, and writes tiled guest surfaces at resolve or
+software fallback boundaries. Other hosts use the software pipeline. Use
+`-global vivante-gc.host-gpu=off` to select software rendering. QOM properties
+`host-draws`, `software-draws`, and `host-flushes` expose backend counters.
+
+The web page displays the frames captured by QMP screendumps. `-global
 vivante-gc.trace=on -D FILE` logs every register access, command and
 resolve; anything the model does not cover is reported once with `-d unimp`.
 
