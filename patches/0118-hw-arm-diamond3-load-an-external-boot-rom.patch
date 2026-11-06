@@ -1,0 +1,96 @@
+From: Will <will@localhost>
+Subject: [PATCH] hw/arm: diamond3: load an external boot ROM
+
+Allow executing a complete user supplied ROM at the reset vector without
+the NAND boot stub. Fuse state and HAB peripheral support remain separate.
+
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -34,6 +34,7 @@
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/qdev-properties-system.h"
+ #include "hw/core/sysbus.h"
++#include "hw/core/loader.h"
+ #include "hw/core/cpu.h"
+ #include "hw/core/split-irq.h"
+ #include "system/address-spaces.h"
+@@ -55,6 +56,7 @@
+ struct FlintstoneMachineState {
+     MachineState parent_obj;
+     char *usb0_hostchar;
++    char *boot_rom;
+ };
+ 
+ static char *flintstone_get_usb0_hostchar(Object *obj, Error **errp)
+@@ -71,9 +73,24 @@
+     s->usb0_hostchar = g_strdup(value);
+ }
+ 
++static char *flintstone_get_boot_rom(Object *obj, Error **errp)
++{
++    return g_strdup(FLINTSTONE_MACHINE(obj)->boot_rom);
++}
++
++static void flintstone_set_boot_rom(Object *obj, const char *value,
++                                  Error **errp)
++{
++    FlintstoneMachineState *s = FLINTSTONE_MACHINE(obj);
++
++    g_free(s->boot_rom);
++    s->boot_rom = g_strdup(value);
++}
++
+ static void flintstone_machine_finalize(Object *obj)
+ {
+     g_free(FLINTSTONE_MACHINE(obj)->usb0_hostchar);
++    g_free(FLINTSTONE_MACHINE(obj)->boot_rom);
+ }
+ 
+ /*
+@@ -406,7 +423,7 @@
+     }
+     gpmi = DEVICE(object_resolve_path_component(OBJECT(soc), "gpmi"));
+     nand = blk_by_name("nand");
+-    if (nand) {
++    if (nand && !FLINTSTONE_MACHINE(machine)->boot_rom) {
+         struct FlintstoneRomBoot *rom = g_new(struct FlintstoneRomBoot, 1);
+ 
+         qdev_prop_set_drive_err(gpmi, "drive", nand, &error_fatal);
+@@ -416,7 +433,27 @@
+         rom->bios = machine->firmware;
+         qemu_register_reset(flintstone_rom_boot, rom);
+     }
++    if (nand && FLINTSTONE_MACHINE(machine)->boot_rom) {
++        qdev_prop_set_drive_err(gpmi, "drive", nand, &error_fatal);
++    }
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
++    if (FLINTSTONE_MACHINE(machine)->boot_rom) {
++        if (machine->firmware) {
++            error_report("diamond3: boot-rom and -bios are mutually exclusive");
++            exit(1);
++        }
++        if (get_image_size(FLINTSTONE_MACHINE(machine)->boot_rom,
++                           &error_fatal) != FSL_IMX6SX_ROM_SIZE) {
++            error_report("diamond3: boot-rom requires a complete 98304-byte "
++                         "dump including vectors");
++            exit(1);
++        }
++        if (rom_add_file_fixed(FLINTSTONE_MACHINE(machine)->boot_rom,
++                               0, -1) < 0) {
++            error_report("diamond3: cannot load boot-rom");
++            exit(1);
++        }
++    }
+     object_property_add_alias(OBJECT(machine), "usb-connected",
+                               OBJECT(&FSL_IMX6SX(soc)->usb0),
+                               "cable-connected");
+@@ -510,6 +547,9 @@
+     object_class_property_add_str(oc, "usb0-hostchar",
+                                   flintstone_get_usb0_hostchar,
+                                   flintstone_set_usb0_hostchar);
++    object_class_property_add_str(oc, "boot-rom",
++                                  flintstone_get_boot_rom,
++                                  flintstone_set_boot_rom);
+     mc->desc = "Nest diamond3 (Display-3.4, i.MX6SX)";
+     mc->alias = "diamond3";
+     mc->init = flintstone_init;

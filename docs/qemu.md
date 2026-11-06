@@ -621,3 +621,17 @@ layout moved) bakes that path in: remove it and run `setup.sh` again.
   read the temperature.
 - The NAND ID gives a 64-byte OOB; the real part is 2048+128 (it would
   need an ONFI parameter page).
+
+### External Diamond3 boot ROM
+
+`-M diamond3,boot-rom=/absolute/path/rom.bin` loads a complete 98,304-byte
+ROM at address zero and bypasses the NAND ROM stub. `-bios` cannot be used
+with this property. This mode is for ROM bring-up: OCOTP fuse state, boot
+straps, and HAB dependencies are not fully modelled, so a successful HAB
+boot is not guaranteed and must not be inferred from stub-based boots.
+
+The captured `imx6sx-rev1.2-rom.bin` covers addresses `0x400..0x17fff`.
+Its companion low dump covers `0x100..0x3ff`; neither contains exception
+vectors `0x0..0xff`. These partial dumps cannot boot from reset and are
+rejected rather than being loaded at the wrong address. ROM and signed
+firmware files remain external to this repository.
