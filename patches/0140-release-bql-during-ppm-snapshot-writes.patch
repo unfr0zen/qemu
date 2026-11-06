@@ -1,0 +1,37 @@
+From: Will
+Subject: [PATCH] ui: release bql while writing private ppm pixels
+
+--- a/ui/ui-qmp-cmds.c
++++ b/ui/ui-qmp-cmds.c
+@@ -21,6 +21,7 @@
+ #include "qapi/qmp/qerror.h"
+ #include "qemu/coroutine.h"
+ #include "qemu/cutils.h"
++#include "qemu/main-loop.h"
+ #include "trace.h"
+ #include "ui/console.h"
+ #include "ui/dbus-display.h"
+@@ -298,7 +299,7 @@
+     g_autoptr(pixman_image_t) linebuf = NULL;
+     size_t row_bytes = (size_t)width * 3;
+     g_autofree uint8_t *pixels = g_malloc_n(row_bytes, height);
+-    int y;
++    int y, ret;
+ 
+     trace_ppm_save(fd, image);
+ 
+@@ -315,8 +316,12 @@
+                row_bytes);
+     }
+ 
+-    return qio_channel_write_all(QIO_CHANNEL(ioc), (char *)pixels,
+-                                 row_bytes * height, errp) == 0;
++    /* The copied pixels no longer depend on the live display surface. */
++    bql_unlock();
++    ret = qio_channel_write_all(QIO_CHANNEL(ioc), (char *)pixels,
++                                row_bytes * height, errp);
++    bql_lock();
++    return ret == 0;
+ }
+ 
+ /* Safety: coroutine-only, concurrent-coroutine safe, main thread only */
