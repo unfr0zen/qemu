@@ -1,0 +1,23 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: honor smooth shading and bypass-flat
+
+--- a/hw/display/vivante_3d.c
++++ b/hw/display/vivante_3d.c
+@@ -75,6 +75,7 @@
+ #define   PA_HALF_PIXEL_CENTER          (1u << 4)
+ #define ST_PA_CONFIG                    0x028d
+ #define   PA_CULL(v)                    (((v) >> 8) & 3)
++#define   PA_SHADE_MODEL(v)             (((v) >> 16) & 3)
+ #define ST_PA_SHADER_ATTRIBUTES         0x0290
+ #define ST_SE_SCISSOR_LEFT              0x0300
+ #define ST_SE_SCISSOR_TOP               0x0301
+@@ -1761,7 +1762,8 @@
+     x1 = MIN((int)ceilf(MAX(MAX(a->x, b->x), c->x)) + 1, d->xmax);
+     y1 = MIN((int)ceilf(MAX(MAX(a->y, b->y), c->y)) + 1, d->ymax);
+     for (unsigned i = 1; i < d->ps_inputs && i - 1 < 10; i++) {
+-        if (d->st[ST_PA_SHADER_ATTRIBUTES + i - 1] & 1) {
++        if (PA_SHADE_MODEL(d->st[ST_PA_CONFIG]) == 0 &&
++            !(d->st[ST_PA_SHADER_ATTRIBUTES + i - 1] & 1)) {
+             flat_mask |= 1u << i;
+         }
+     }
