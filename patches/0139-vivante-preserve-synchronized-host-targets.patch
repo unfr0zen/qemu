@@ -1,0 +1,319 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: preserve synchronized host render targets
+
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -19,7 +19,8 @@
+     CGLContextObj context;
+     GHashTable *programs;
+     GLuint fbo, color, depth, vao, streams[8], indices, uniforms;
+-    bool valid;
++    bool valid, dirty;
++    uint8_t *color_shadow, *depth_shadow;
+     unsigned width, height;
+     VivDraw target;
+     VivHostTexture textures[256];
+@@ -101,6 +102,8 @@
+     glDeleteVertexArrays(1, &h->vao);
+     CGLSetCurrentContext(NULL);
+     CGLDestroyContext(h->context);
++    g_free(h->color_shadow);
++    g_free(h->depth_shadow);
+     g_free(h);
+     s->host_gl = NULL;
+ }
+@@ -566,25 +569,116 @@
+     return program;
+ }
+ 
+-void viv3d_flush(VivGCState *s)
++/* Each four-pixel row is contiguous in all supported tiled layouts. */
++static void viv_gl_surface_rows(VivSurf *surface, unsigned layout,
++                                unsigned stride, unsigned bpp,
++                                unsigned width, unsigned height,
++                                uint8_t *linear, bool write)
++{
++    for (unsigned y = 0; y < height; y++) {
++        for (unsigned x = 0; x < width; x += 4) {
++            unsigned bytes = MIN(4u, width - x) * bpp;
++            uint8_t *p = viv_surf_ptr(surface,
++                viv_pixel_offset(layout, stride, bpp, x, y));
++            uint8_t *row = linear + (y * width + x) * bpp;
++            if (p) {
++                if (write) {
++                    memcpy(p, row, bytes);
++                } else {
++                    memcpy(row, p, bytes);
++                }
++            } else if (!write) {
++                memset(row, 0, bytes);
++            }
++        }
++    }
++}
++
++static void viv_gl_shadow(VivSurf *surface, uint8_t **shadow)
++{
++    *shadow = g_realloc(*shadow, surface->size);
++    for (unsigned off = 0; off < surface->size;) {
++        unsigned bytes = MIN(surface->size - off,
++                             4096 - ((surface->base + off) & 4095));
++        uint8_t *p = viv_surf_ptr(surface, off);
++        if (p) {
++            memcpy(*shadow + off, p, bytes);
++        } else {
++            memset(*shadow + off, 0, bytes);
++        }
++        off += bytes;
++    }
++}
++
++static bool viv_gl_unchanged(VivSurf *surface, const uint8_t *shadow)
++{
++    VivSurf view;
++    bool equal = true;
++
++    viv_surf_init(&view, surface->s, surface->base, surface->size,
++                   false, false);
++    for (unsigned off = 0; equal && off < view.size;) {
++        unsigned bytes = MIN(view.size - off,
++                             4096 - ((view.base + off) & 4095));
++        uint8_t *p = viv_surf_ptr(&view, off);
++        equal = p && !memcmp(shadow + off, p, bytes);
++        off += bytes;
++    }
++    viv_surf_release(&view);
++    return equal;
++}
++
++static void viv_gl_writeback(VivGCState *s, bool invalidate)
+ {
+     VivHostGL *h = s->host_gl;
+     VivDraw *d;
+     unsigned pixels;
++    bool packed;
+     g_autofree uint8_t *color = NULL;
+     g_autofree uint8_t *depth = NULL;
+ 
+     if (!h || !h->valid) {
+         return;
+     }
++    if (!h->dirty) {
++        if (invalidate) {
++            h->valid = false;
++        }
++        return;
++    }
+     CGLSetCurrentContext(h->context);
+     d = &h->target;
++    packed = d->rt_fmt == 5 || d->rt_fmt == 6;
+     pixels = h->width * h->height;
+     color = g_malloc(pixels * 4);
+     glBindFramebuffer(GL_FRAMEBUFFER, h->fbo);
+-    glReadPixels(0, 0, h->width, h->height, GL_RGBA, GL_UNSIGNED_BYTE, color);
++    glReadPixels(0, 0, h->width, h->height,
++                 packed ? GL_BGRA : GL_RGBA, GL_UNSIGNED_BYTE, color);
+     viv_surf_init(&d->rt, s, d->rt.base, d->rt.size, false, true);
+     d->rt_mask = 15;
++    if (packed) {
++        viv_gl_surface_rows(&d->rt, d->rt_layout, d->rt_stride, 4,
++                             h->width, h->height, color, true);
++    } else {
++        for (unsigned y = 0; y < h->height; y++) {
++            for (unsigned x = 0; x < h->width; x++) {
++                unsigned i = y * h->width + x;
++                float c[4];
++                uint8_t *p = viv_surf_ptr(&d->rt, viv_pixel_offset(
++                    d->rt_layout, d->rt_stride, d->rt_bpp, x, y));
++                for (unsigned j = 0; j < 4; j++) {
++                    c[j] = color[i * 4 + j] / 255.0f;
++                }
++                if (p) {
++                    viv_rt_write(d, p, c, c);
++                }
++            }
++        }
++    }
++    if (!invalidate) {
++        viv_gl_shadow(&d->rt, &h->color_shadow);
++    }
++    viv_surf_release(&d->rt);
+     if (d->zs) {
+         depth = g_malloc(pixels * d->z_bpp);
+         glReadPixels(0, 0, h->width, h->height,
+@@ -592,34 +686,26 @@
+                      d->z_bpp == 4 ? GL_UNSIGNED_INT_24_8 : GL_UNSIGNED_SHORT,
+                      depth);
+         viv_surf_init(&d->zb, s, d->zb.base, d->zb.size, false, true);
+-    }
+-    for (unsigned y = 0; y < h->height; y++) {
+-        for (unsigned x = 0; x < h->width; x++) {
+-            unsigned i = y * h->width + x;
+-            float c[4];
+-            uint8_t *p = viv_surf_ptr(&d->rt, viv_pixel_offset(d->rt_layout,
+-                                     d->rt_stride, d->rt_bpp, x, y));
+-            for (unsigned j = 0; j < 4; j++) {
+-                c[j] = color[i * 4 + j] / 255.0f;
+-            }
+-            if (p) {
+-                viv_rt_write(d, p, c, c);
+-            }
+-            if (d->zs) {
+-                p = viv_surf_ptr(&d->zb, viv_pixel_offset(d->z_layout,
+-                                 d->z_stride, d->z_bpp, x, y));
+-                if (p) {
+-                    memcpy(p, depth + i * d->z_bpp, d->z_bpp);
+-                }
+-            }
+-        }
+-    }
+-    viv_surf_release(&d->rt);
+-    if (d->zs) {
++        viv_gl_surface_rows(&d->zb, d->z_layout, d->z_stride, d->z_bpp,
++                             h->width, h->height, depth, true);
++        if (!invalidate) {
++            viv_gl_shadow(&d->zb, &h->depth_shadow);
++        }
+         viv_surf_release(&d->zb);
+     }
+-    h->valid = false;
++    h->valid = !invalidate;
++    h->dirty = false;
+     s->host_flushes++;
++}
++
++void viv3d_flush(VivGCState *s)
++{
++    viv_gl_writeback(s, true);
++}
++
++void viv3d_finish(VivGCState *s)
++{
++    viv_gl_writeback(s, false);
+ }
+ 
+ static void viv_gl_target(VivHostGL *h, VivDraw *d)
+@@ -630,41 +716,58 @@
+     g_autofree uint8_t *depth = NULL;
+ 
+     if (h->valid && h->target.rt.base == d->rt.base &&
+-        (!d->zs || (h->target.zs && h->target.zb.base == d->zb.base)) &&
+-        h->width == width && h->height >= height) {
+-        return;
++        (!d->zs || (h->target.zs && h->target.zb.base == d->zb.base &&
++                    h->target.z_bpp == d->z_bpp &&
++                    h->target.z_stride == d->z_stride &&
++                    h->target.z_layout == d->z_layout)) &&
++        h->target.rt_fmt == d->rt_fmt && h->target.rt_layout == d->rt_layout &&
++        h->width == width && h->height == height) {
++        if (h->dirty || (viv_gl_unchanged(&h->target.rt, h->color_shadow) &&
++            (!h->target.zs ||
++             viv_gl_unchanged(&h->target.zb, h->depth_shadow)))) {
++            return;
++        }
++        h->valid = false;
+     }
+     viv3d_flush(d->s);
+     color = g_malloc0(width * height * 4);
+     if (d->zs) {
+         depth = g_malloc0(width * height * d->z_bpp);
+     }
+-    for (unsigned y = 0; y < height; y++) {
+-        for (unsigned x = 0; x < width; x++) {
+-            unsigned i = y * width + x;
+-            float c[4] = {};
+-            uint8_t *p = viv_surf_ptr(&d->rt, viv_pixel_offset(d->rt_layout,
+-                                     d->rt_stride, d->rt_bpp, x, y));
+-            if (p) {
+-                viv_rt_read(d, p, c);
++    bool packed = d->rt_fmt == 5 || d->rt_fmt == 6;
++    if (packed) {
++        viv_gl_surface_rows(&d->rt, d->rt_layout, d->rt_stride, 4,
++                             width, height, color, false);
++        if (d->rt_fmt == 5) {
++            for (unsigned i = 0; i < width * height; i++) {
++                ((uint32_t *)color)[i] |= 0xff000000;
+             }
+-            for (unsigned j = 0; j < 4; j++) {
+-                color[i * 4 + j] = viv_q(c[j], 255);
+-            }
+-            if (d->zs) {
+-                p = viv_surf_ptr(&d->zb, viv_pixel_offset(d->z_layout,
+-                                 d->z_stride, d->z_bpp, x, y));
++        }
++    } else {
++        for (unsigned y = 0; y < height; y++) {
++            for (unsigned x = 0; x < width; x++) {
++                unsigned i = y * width + x;
++                float c[4] = {};
++                uint8_t *p = viv_surf_ptr(&d->rt, viv_pixel_offset(
++                    d->rt_layout, d->rt_stride, d->rt_bpp, x, y));
+                 if (p) {
+-                    memcpy(depth + i * d->z_bpp, p, d->z_bpp);
++                    viv_rt_read(d, p, c);
++                }
++                for (unsigned j = 0; j < 4; j++) {
++                    color[i * 4 + j] = viv_q(c[j], 255);
+                 }
+             }
+         }
++    }
++    if (d->zs) {
++        viv_gl_surface_rows(&d->zb, d->z_layout, d->z_stride, d->z_bpp,
++                             width, height, depth, false);
+     }
+     glBindFramebuffer(GL_FRAMEBUFFER, h->fbo);
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, h->color);
+     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+-                 GL_RGBA, GL_UNSIGNED_BYTE, color);
++                 packed ? GL_BGRA : GL_RGBA, GL_UNSIGNED_BYTE, color);
+     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                            GL_TEXTURE_2D, h->color, 0);
+     glBindTexture(GL_TEXTURE_2D, h->depth);
+@@ -967,7 +1070,7 @@
+     glDepthMask(d->zs && (d->z_cfg & PE_DEPTH_WRITE));
+     glDisable(GL_STENCIL_TEST);
+     glColorMask(d->rt_mask & 1, d->rt_mask & 2,
+-                 d->rt_mask & 4, d->rt_mask & 8);
++                 d->rt_mask & 4, (d->rt_mask & 8) && d->rt_fmt != 5);
+     uint32_t blend = d->st[ST_PE_ALPHA_CONFIG];
+     if (blend & 1) {
+         bool separate = blend & (1u << 16);
+@@ -986,10 +1089,15 @@
+         glDisable(GL_BLEND);
+     }
+     glDrawElements(mode[prim], n, GL_UNSIGNED_INT, NULL);
++    h->dirty = true;
+     d->s->host_draws++;
+     return true;
+ }
+ #else
++void viv3d_finish(VivGCState *s)
++{
++}
++
+ void viv3d_fini(VivGCState *s)
+ {
+ }
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -190,7 +190,7 @@
+     uint32_t id = value & 31;
+ 
+     if (value & STATE_EVENT_FROM_PE) {
+-        viv3d_flush(s);
++        viv3d_finish(s);
+     }
+     VIV_TRACE(s, "event %u", id);
+     s->intr_pending |= 1u << (id & 31);
+--- a/hw/display/vivante_gc_int.h
++++ b/hw/display/vivante_gc_int.h
+@@ -149,6 +149,7 @@
+ 
+ void viv_ts_resolve(VivGCState *s, uint32_t surf, uint32_t size, bool depth);
+ void viv3d_fini(VivGCState *s);
++void viv3d_finish(VivGCState *s);
+ void viv3d_flush(VivGCState *s);
+ void viv3d_draw(VivGCState *s, uint32_t prim, uint32_t start, uint32_t count,
+                 bool indexed, uint32_t index_offset);

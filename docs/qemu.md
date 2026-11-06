@@ -543,8 +543,10 @@ model of the i.MX6SX's GC400T GPU3D (`hw/display/vivante_gc.c`,
 
 On macOS, `host-gpu=on` uses an accelerated OpenGL 4 core context by default.
 The backend translates GC400 vertex/fragment instructions, keeps render targets
-on the host GPU between draws, and writes tiled guest surfaces at resolve or
-software fallback boundaries. Other hosts use the software pipeline. Use
+on the host GPU between draws, and writes tiled guest surfaces before pixel
+engine completion events, resolves, and software fallback. Synchronized targets
+remain cached until the guest changes their memory. Other hosts use the software
+pipeline. Use
 `-global vivante-gc.host-gpu=off` to select software rendering. QOM properties
 `host-draws`, `software-draws`, and `host-flushes` expose backend counters.
 
