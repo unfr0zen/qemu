@@ -1,0 +1,180 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: batch index and command reads
+
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -819,8 +819,23 @@
+     uint32_t first = UINT32_MAX, last = 0;
+     g_autofree uint32_t *indices = g_new(uint32_t, n);
+ 
++    if (indexed) {
++        unsigned format = d->st[ST_FE_INDEX_STREAM_CONTROL] & 3;
++        unsigned size = format == 0 ? 1 : format == 1 ? 2 : 4;
++        g_autofree uint8_t *data = g_malloc(n * size);
++        viv_dma(d->s, d->st[ST_FE_INDEX_STREAM_BASE_ADDR] + start * size,
++                 data, n * size, false);
++        for (unsigned i = 0; i < n; i++) {
++            indices[i] = (size == 1 ? data[i] : size == 2 ?
++                lduw_le_p(data + i * 2) : ldl_le_p(data + i * 4));
++            indices[i] += index_offset;
++        }
++    } else {
++        for (unsigned i = 0; i < n; i++) {
++            indices[i] = start + i;
++        }
++    }
+     for (unsigned i = 0; i < n; i++) {
+-        indices[i] = viv_index(d, indexed, start, i, index_offset);
+         first = MIN(first, indices[i]);
+         last = MAX(last, indices[i]);
+     }
+@@ -983,78 +998,6 @@
+ {
+ }
+ 
+-/* Upload vertex streams without expanding indexed vertices on the CPU. */
+-static bool viv_gl_vertices(VivHostGL *h, VivDraw *d, uint32_t start,
+-                             unsigned n, bool indexed, uint32_t index_offset)
+-{
+-    static const GLenum types[16] = {
+-        GL_BYTE, GL_UNSIGNED_BYTE, GL_SHORT, GL_UNSIGNED_SHORT,
+-        GL_INT, GL_UNSIGNED_INT, GL_INT_2_10_10_10_REV,
+-        GL_UNSIGNED_INT_2_10_10_10_REV, GL_FLOAT, GL_HALF_FLOAT,
+-    };
+-    unsigned stride[8] = {}, end[8] = {};
+-    uint32_t base[8] = {};
+-    uint32_t first = UINT32_MAX, last = 0;
+-    g_autofree uint32_t *indices = g_new(uint32_t, n);
+-
+-    for (unsigned i = 0; i < n; i++) {
+-        indices[i] = viv_index(d, indexed, start, i, index_offset);
+-        first = MIN(first, indices[i]);
+-        last = MAX(last, indices[i]);
+-    }
+-    if (last - first >= VIV_MAX_VERTICES) {
+-        return false;
+-    }
+-    for (unsigned i = 0; i < d->vs_inputs; i++) {
+-        uint32_t cfg = d->st[ST_FE_VERTEX_ELEMENT_CONFIG + i];
+-        unsigned stream = VE_STREAM(cfg) & 7;
+-        if (!types[VE_TYPE(cfg)]) {
+-            return false;
+-        }
+-        base[stream] = d->st[stream ?
+-            ST_FE_VERTEX_STREAMS_BASE_ADDR + stream :
+-            ST_FE_VERTEX_STREAM_BASE_ADDR];
+-        stride[stream] = d->st[stream ?
+-            ST_FE_VERTEX_STREAMS_CONTROL + stream :
+-            ST_FE_VERTEX_STREAM_CONTROL] & 255;
+-        end[stream] = MAX(end[stream], VE_END(cfg));
+-    }
+-    for (unsigned stream = 0; stream < 8; stream++) {
+-        if (!end[stream]) {
+-            continue;
+-        }
+-        unsigned size = (last - first) * stride[stream] + end[stream];
+-        g_autofree uint8_t *data = g_malloc(size);
+-        viv_dma(d->s, base[stream] + first * stride[stream], data, size, false);
+-        glBindBuffer(GL_ARRAY_BUFFER, h->streams[stream]);
+-        glBufferData(GL_ARRAY_BUFFER, size, data, GL_STREAM_DRAW);
+-    }
+-    for (unsigned i = 0; i < d->vs_inputs; i++) {
+-        uint32_t cfg = d->st[ST_FE_VERTEX_ELEMENT_CONFIG + i];
+-        unsigned stream = VE_STREAM(cfg) & 7;
+-        if (!stride[stream]) {
+-            VivVec values[VIV_TEMPS] = {};
+-            viv_fetch_vertex(d, first, values);
+-            glDisableVertexAttribArray(i);
+-            glVertexAttrib4fv(i, values[d->vs_in_reg[i] & 63].f);
+-            continue;
+-        }
+-        glBindBuffer(GL_ARRAY_BUFFER, h->streams[stream]);
+-        glEnableVertexAttribArray(i);
+-        glVertexAttribPointer(i, VE_NUM(cfg) ? VE_NUM(cfg) : 4,
+-                               types[VE_TYPE(cfg)], VE_NORMALIZE(cfg) != 0,
+-                               stride[stream],
+-                               (void *)(uintptr_t)VE_START(cfg));
+-    }
+-    for (unsigned i = 0; i < n; i++) {
+-        indices[i] -= first;
+-    }
+-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, h->indices);
+-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, n * sizeof(*indices), indices,
+-                  GL_STREAM_DRAW);
+-    return true;
+-}
+-
+ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+                            unsigned n, bool indexed, uint32_t index_offset)
+ {
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -204,8 +204,31 @@
+     return (hwaddr)s->regs[MC_MEMORY_BASE_FE / 4] + addr;
+ }
+ 
++static void viv_fetch_release(VivGCState *s)
++{
++    if (s->fe_map) {
++        address_space_unmap(&address_space_memory, s->fe_map,
++                            s->fe_map_len, false, 0);
++        s->fe_map = NULL;
++    }
++}
++
+ static uint32_t viv_fetch(VivGCState *s, uint32_t addr)
+ {
++    uint32_t page = addr & ~0xfffu;
++    unsigned offset = addr & 0xfff;
++
++    if (!s->fe_map || s->fe_map_page != page) {
++        viv_fetch_release(s);
++        s->fe_map_len = 0x1000;
++        s->fe_map_page = page;
++        s->fe_map = address_space_map(&address_space_memory,
++            viv_translate(s, page), &s->fe_map_len, false,
++            MEMTXATTRS_UNSPECIFIED);
++    }
++    if (s->fe_map && offset + 4 <= s->fe_map_len) {
++        return ldl_le_p(s->fe_map + offset);
++    }
+     return ldl_le_phys(&address_space_memory, viv_translate(s, addr));
+ }
+ 
+@@ -771,6 +794,8 @@
+ 
+         timer_mod(s->fe_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay);
+     }
++    /* Drivers may remap command pages while the front end waits. */
++    viv_fetch_release(s);
+ }
+ 
+ static void viv_fe_start(VivGCState *s)
+@@ -783,6 +808,7 @@
+ 
+ static void viv_soft_reset(VivGCState *s)
+ {
++    viv_fetch_release(s);
+     viv3d_flush(s);
+     timer_del(s->fe_timer);
+     s->fe_running = false;
+@@ -897,6 +923,7 @@
+ 
+ static void viv_unrealize(DeviceState *dev)
+ {
++    viv_fetch_release(VIVANTE_GC(dev));
+     viv3d_fini(VIVANTE_GC(dev));
+ }
+ 
+--- a/hw/display/vivante_gc_int.h
++++ b/hw/display/vivante_gc_int.h
+@@ -35,6 +35,9 @@
+ 
+     bool fe_running;
+     uint32_t fe_addr;           /* next command, GPU address */
++    uint32_t fe_map_page;
++    uint8_t *fe_map;
++    hwaddr fe_map_len;
+     uint32_t fe_ret;            /* CALL's return address */
+     uint64_t draws;
+     uint64_t unimp_seen;        /* LOG_UNIMP messages already given */
