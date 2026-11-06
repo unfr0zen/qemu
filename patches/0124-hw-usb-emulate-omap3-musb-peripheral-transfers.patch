@@ -1,0 +1,856 @@
+Subject: [PATCH] hw/usb: emulate OMAP3 MUSB peripheral transfers
+
+Model indexed endpoint registers, PIO FIFOs, interrupts, control status
+phases, stalls, full/high speed reset and cable/VBUS changes. Connect
+VBUS to the TPS65921 comparator and power interrupt. Expose the same
+virtual USB host protocol and cable properties as the Diamond3 UDC.
+
+--- a/hw/usb/omap3_musb.c
++++ b/hw/usb/omap3_musb.c
+@@ -1,88 +1,142 @@
+ /*
+- * OMAP3 HS USB OTG controller (Mentor MUSBMHDRC with TI's OTG wrapper),
+- * as a peripheral with nothing plugged in
+- *
+- * The MUSB core's registers read back what was written, except
+- * CONFIGDATA, which reports the OMAP3630's core: dynamic FIFOs, so the
+- * driver lays its endpoints out from the board's FIFO table (fifo_mode 4,
+- * 16 endpoints) as on the chip and a gadget gets as many as it binds.
+- * The wrapper's soft reset completes at once. With no host on the cable
+- * the gadget driver probes and then waits for a session that never
+- * comes, as on a unit off USB. (USB device mode is not modelled.)
+- *
+- * Copyright (c) 2026
+- *
++ * OMAP3 Mentor MUSB peripheral controller and TI OTG wrapper.
++ * PIO endpoint FIFOs connect to a line-based virtual USB host.
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+-
+ #include "qemu/osdep.h"
+ #include "hw/core/sysbus.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "chardev/char-fe.h"
+ #include "migration/vmstate.h"
+-#include "qemu/log.h"
++#include "qapi/error.h"
++#include "qemu/bswap.h"
++#include "qemu/cutils.h"
+ #include "qemu/module.h"
+-#include "qom/object.h"
++#include "qemu/timer.h"
+ 
+ #define TYPE_OMAP3_MUSB "omap3-musb"
+ OBJECT_DECLARE_SIMPLE_TYPE(Omap3MusbState, OMAP3_MUSB)
+ 
+-#define MUSB_CORE_SIZE      0x400
+-#define MUSB_INDEX          0x0e
+-#define MUSB_CONFIGDATA     0x1f        /* with INDEX 0; FIFOSIZE otherwise */
+-/* MPRXE | MPTXE | HBRXE | HBTXE | DYNFIFO | SOFTCONE */
+-#define OMAP3_CONFIGDATA    0xde
+-#define OTG_REVISION        0x400
+-#define OTG_SYSCONFIG       0x404
+-#define OTG_SYSSTATUS       0x408
+-#define OTG_INTERFSEL       0x40c
+-#define OTG_SIMENABLE       0x410
+-#define OTG_FORCESTDBY      0x414
+-#define OTG_BIGENDIAN       0x418
++#define EP_COUNT 16
++#define FIFO_SIZE 4096
++#define POWER 0x01
++#define INTRTX 0x02
++#define INTRRX 0x04
++#define INTRTXE 0x06
++#define INTRRXE 0x08
++#define INTRUSB 0x0a
++#define INTRUSBE 0x0b
++#define INDEX 0x0e
++#define DEVCTL 0x60
++#define TXCSR 2
++#define RXCSR 6
++#define RXCOUNT 8
++#define CSR0_RXREADY BIT(0)
++#define CSR0_TXREADY BIT(1)
++#define CSR0_SENTSTALL BIT(2)
++#define CSR0_DATAEND BIT(3)
++#define CSR0_SETUPEND BIT(4)
++#define CSR0_SENDSTALL BIT(5)
++#define CSR0_SVDRX BIT(6)
++#define CSR0_SVDSETUP BIT(7)
++#define CSR0_FLUSH BIT(8)
++#define TX_READY BIT(0)
++#define TX_NONEMPTY BIT(1)
++#define TX_FLUSH BIT(3)
++#define TX_STALL BIT(4)
++#define TX_SENTSTALL BIT(5)
++#define RX_READY BIT(0)
++#define RX_FLUSH BIT(4)
++#define RX_STALL BIT(5)
++#define RX_SENTSTALL BIT(6)
+ 
+ struct Omap3MusbState {
+     SysBusDevice parent_obj;
+-
+     MemoryRegion iomem;
+     qemu_irq irq;
+-    uint8_t core[MUSB_CORE_SIZE];
+-    uint32_t sysconfig;
+-    uint32_t interfsel;
+-    uint32_t simenable;
+-    uint32_t forcestdby;
++    qemu_irq vbus_out;
++    CharFrontend chr;
++    char *hostchar;
++    bool cable_connected;
++    bool vbus;
++    bool connected;
++    bool high_speed;
++    bool resetting;
++    bool control_in;
++    bool status_ready;
++    uint8_t core[0x400];
++    uint8_t ep[EP_COUNT][16];
++    uint8_t fifo_config[EP_COUNT][6];
++    uint8_t tx[EP_COUNT][FIFO_SIZE];
++    uint8_t rx[EP_COUNT][FIFO_SIZE];
++    unsigned tx_len[EP_COUNT], tx_pos[EP_COUNT];
++    unsigned rx_len[EP_COUNT], rx_pos[EP_COUNT];
++    char line[FIFO_SIZE * 2 + 128];
++    unsigned line_len;
++    bool discard_line;
++    QEMUTimer *reset_timer;
++    uint32_t sysconfig, interfsel, simenable, forcestdby;
+ };
+ 
+-static uint64_t musb_read(void *opaque, hwaddr addr, unsigned size)
+-{
+-    Omap3MusbState *s = opaque;
+-    uint64_t v = 0;
+-
+-    if (addr < MUSB_CORE_SIZE) {
+-        for (unsigned i = 0; i < size && addr + i < MUSB_CORE_SIZE; i++) {
+-            uint8_t byte = s->core[addr + i];
+-            if (addr + i == MUSB_CONFIGDATA && s->core[MUSB_INDEX] == 0) {
+-                byte = OMAP3_CONFIGDATA;
+-            }
+-            v |= (uint64_t)byte << (8 * i);
+-        }
+-        return v;
+-    }
+-    switch (addr) {
+-    case OTG_REVISION:
+-        return 0x33;
+-    case OTG_SYSCONFIG:
+-        return s->sysconfig;
+-    case OTG_SYSSTATUS:
+-        return 1;                       /* RESETDONE */
+-    case OTG_INTERFSEL:
+-        return s->interfsel;
+-    case OTG_SIMENABLE:
+-        return s->simenable;
+-    case OTG_FORCESTDBY:
+-        return s->forcestdby;
+-    case OTG_BIGENDIAN:
+-        return 0;
+-    }
+-    qemu_log_mask(LOG_UNIMP, "omap3-musb: read at 0x%" HWADDR_PRIx "\n", addr);
+-    return 0;
++static void musb_irq(Omap3MusbState *s)
++{
++    qemu_set_irq(
++        s->irq,
++        (lduw_le_p(s->core + INTRTX) & lduw_le_p(s->core + INTRTXE)) ||
++            (lduw_le_p(s->core + INTRRX) & lduw_le_p(s->core + INTRRXE)) ||
++            (s->core[INTRUSB] & s->core[INTRUSBE]));
++}
++
++static void musb_ep_irq(Omap3MusbState *s, unsigned ep, bool in)
++{
++    unsigned reg = in || !ep ? INTRTX : INTRRX;
++
++    stw_le_p(s->core + reg, lduw_le_p(s->core + reg) | BIT(ep));
++    musb_irq(s);
++}
++
++static void musb_send(Omap3MusbState *s, const char *message)
++{
++    if (qemu_chr_fe_backend_open(&s->chr)) {
++        qemu_chr_fe_write_all(&s->chr, (const uint8_t *)message,
++                              strlen(message));
++    }
++}
++
++static void musb_connect(Omap3MusbState *s)
++{
++    bool connected = s->vbus && (s->core[POWER] & BIT(6));
++
++    if (connected != s->connected) {
++        s->connected = connected;
++        musb_send(s, connected ? "CONNECT\n" : "DISCONNECT\n");
++    }
++}
++
++static void musb_vbus(Omap3MusbState *s, bool present)
++{
++    if (present != s->vbus) {
++        s->vbus = present;
++        qemu_set_irq(s->vbus_out, present);
++        if (!present) {
++            s->core[INTRUSB] |= BIT(5);
++            s->resetting = false;
++            timer_del(s->reset_timer);
++        }
++        musb_connect(s);
++        musb_irq(s);
++    }
++}
++
++static void musb_clear_endpoints(Omap3MusbState *s)
++{
++    memset(s->ep, 0, sizeof(s->ep));
++    memset(s->tx_len, 0, sizeof(s->tx_len));
++    memset(s->tx_pos, 0, sizeof(s->tx_pos));
++    memset(s->rx_len, 0, sizeof(s->rx_len));
++    memset(s->rx_pos, 0, sizeof(s->rx_pos));
++    s->status_ready = false;
+ }
+ 
+ static void musb_reset(DeviceState *dev)
+@@ -90,72 +144,492 @@
+     Omap3MusbState *s = OMAP3_MUSB(dev);
+ 
+     memset(s->core, 0, sizeof(s->core));
++    memset(s->fifo_config, 0, sizeof(s->fifo_config));
++    musb_clear_endpoints(s);
++    timer_del(s->reset_timer);
++    s->resetting = false;
++    s->line_len = 0;
++    s->discard_line = false;
+     s->sysconfig = 0;
+-    s->interfsel = 1;                   /* ULPI */
++    s->interfsel = 1;
+     s->simenable = 0;
+     s->forcestdby = 1;
+-}
+-
+-static void musb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++    musb_connect(s);
++    musb_irq(s);
++}
++
++static void musb_reset_done(void *opaque)
+ {
+     Omap3MusbState *s = opaque;
+ 
+-    if (addr < MUSB_CORE_SIZE) {
+-        for (unsigned i = 0; i < size && addr + i < MUSB_CORE_SIZE; i++) {
+-            s->core[addr + i] = val >> (8 * i);
++    s->resetting = false;
++    s->core[POWER] &= ~BIT(3);
++    musb_send(s, "RESETDONE\n");
++}
++
++/* Both the indexed and flat endpoint windows access the same registers. */
++static uint8_t *musb_ep_reg(Omap3MusbState *s, hwaddr addr, unsigned *ep,
++                            unsigned *reg)
++{
++    if (addr >= 0x10 && addr < 0x20) {
++        *ep = s->core[INDEX] & 15;
++        *reg = addr - 0x10;
++    } else if (addr >= 0x100 && addr < 0x200) {
++        *ep = (addr - 0x100) / 16;
++        *reg = addr & 15;
++    } else {
++        return NULL;
++    }
++    return &s->ep[*ep][*reg];
++}
++
++static uint8_t musb_read_byte(Omap3MusbState *s, hwaddr addr)
++{
++    unsigned ep, reg;
++    uint8_t *p = musb_ep_reg(s, addr, &ep, &reg);
++    uint8_t value;
++
++    if (p) {
++        if (!ep && reg == 15) {
++            return 0xde; /* dynamic FIFOs, soft connect, multi-packet */
++        }
++        if (reg == RXCOUNT || reg == RXCOUNT + 1) {
++            return s->rx_len[ep] >> (8 * (reg - RXCOUNT));
++        }
++        return *p;
++    }
++    if (addr >= 0x62 && addr <= 0x67) {
++        return s->fifo_config[s->core[INDEX] & 15][addr - 0x62];
++    }
++    switch (addr) {
++    case DEVCTL:
++        return (s->core[addr] & 1) | BIT(7) | (s->vbus ? 0x18 : 0);
++    case 0x6c:
++        return 0x90;
++    case 0x6d:
++        return 0x01;
++    case 0x78:
++        return 0xff;
++    case 0x79:
++        return 12;
++    }
++    value = s->core[addr];
++    if ((addr >= INTRTX && addr < INTRTX + 2) ||
++        (addr >= INTRRX && addr < INTRRX + 2) || addr == INTRUSB) {
++        s->core[addr] = 0;
++    }
++    return value;
++}
++
++static uint64_t musb_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Omap3MusbState *s = opaque;
++    uint64_t value = 0;
++
++    if (addr >= 0x20 && addr < 0x60) {
++        unsigned ep = (addr - 0x20) / 4;
++
++        for (unsigned i = 0; i < size; i++) {
++            if (s->rx_pos[ep] < s->rx_len[ep]) {
++                value |= (uint64_t)s->rx[ep][s->rx_pos[ep]++] << (8 * i);
++            }
++        }
++        return value;
++    }
++    if (addr < sizeof(s->core)) {
++        for (unsigned i = 0; i < size && addr + i < sizeof(s->core); i++) {
++            value |= (uint64_t)musb_read_byte(s, addr + i) << (8 * i);
++        }
++        musb_irq(s);
++        return value;
++    }
++    switch (addr) {
++    case 0x400:
++        return 0x33;
++    case 0x404:
++        return s->sysconfig;
++    case 0x408:
++        return 1;
++    case 0x40c:
++        return s->interfsel;
++    case 0x410:
++        return s->simenable;
++    case 0x414:
++        return s->forcestdby;
++    }
++    return 0;
++}
++
++static void musb_csr(Omap3MusbState *s, unsigned ep, unsigned reg,
++                     uint16_t value)
++{
++    uint16_t old = lduw_le_p(s->ep[ep] + reg);
++
++    if (!ep && reg == TXCSR) {
++        uint16_t csr = old & (CSR0_RXREADY | CSR0_TXREADY | CSR0_DATAEND |
++                              CSR0_SETUPEND | CSR0_SENTSTALL);
++
++        csr &= value | ~CSR0_SENTSTALL;
++        if (value & CSR0_SVDRX) {
++            csr &= ~CSR0_RXREADY;
++            s->rx_len[0] = s->rx_pos[0] = 0;
++        }
++        if (value & CSR0_SVDSETUP) {
++            csr &= ~CSR0_SETUPEND;
++        }
++        if (value & CSR0_FLUSH) {
++            csr &= ~(CSR0_TXREADY | CSR0_RXREADY);
++            s->tx_len[0] = s->tx_pos[0] = 0;
++            s->rx_len[0] = s->rx_pos[0] = 0;
++        }
++        csr |= value & (CSR0_TXREADY | CSR0_SENDSTALL | CSR0_DATAEND);
++        if (value & CSR0_DATAEND) {
++            s->status_ready = true;
++        }
++        stw_le_p(s->ep[0] + TXCSR, csr);
++    } else if (reg == TXCSR) {
++        const uint16_t wzc = BIT(7) | TX_SENTSTALL | BIT(2);
++
++        value = (value & ~wzc) | (old & value & wzc);
++        if (value & TX_FLUSH) {
++            s->tx_len[ep] = s->tx_pos[ep] = 0;
++            value &= ~TX_READY;
++        }
++        value &= ~(TX_FLUSH | BIT(6) | TX_NONEMPTY);
++        if (s->tx_len[ep]) {
++            value |= TX_NONEMPTY;
++        }
++        stw_le_p(s->ep[ep] + reg, value);
++    } else if (reg == RXCSR) {
++        const uint16_t wzc = RX_SENTSTALL | BIT(2) | RX_READY;
++
++        value = (value & ~wzc) | (old & value & wzc);
++        if (!(value & RX_READY) || (value & RX_FLUSH)) {
++            s->rx_len[ep] = s->rx_pos[ep] = 0;
++            value &= ~RX_READY;
++        }
++        stw_le_p(s->ep[ep] + reg, value & ~(RX_FLUSH | BIT(7)));
++    }
++}
++
++static void musb_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    Omap3MusbState *s = opaque;
++    unsigned ep, reg;
++    uint8_t *p;
++
++    if (addr >= 0x20 && addr < 0x60) {
++        ep = (addr - 0x20) / 4;
++        for (unsigned i = 0; i < size; i++) {
++            if (s->tx_len[ep] < FIFO_SIZE) {
++                s->tx[ep][s->tx_len[ep]++] = value >> (8 * i);
++            }
+         }
+         return;
+     }
++    p = musb_ep_reg(s, addr, &ep, &reg);
++    if (p && (reg == TXCSR || reg == RXCSR) && size <= 2) {
++        uint16_t csr = lduw_le_p(s->ep[ep] + reg);
++
++        musb_csr(s, ep, reg, size == 2 ? value : (csr & 0xff00) | value);
++        return;
++    }
++    if (addr < sizeof(s->core)) {
++        for (unsigned i = 0; i < size && addr + i < sizeof(s->core); i++) {
++            hwaddr at = addr + i;
++            uint8_t byte = value >> (8 * i);
++
++            p = musb_ep_reg(s, at, &ep, &reg);
++            if (p) {
++                *p = byte;
++            } else if (at >= 0x62 && at <= 0x67) {
++                s->fifo_config[s->core[INDEX] & 15][at - 0x62] = byte;
++            } else if (at != INTRUSB && !(at >= INTRTX && at < INTRRX + 2)) {
++                if (at == POWER) {
++                    byte = (byte & ~BIT(4)) | (s->core[POWER] & BIT(4));
++                }
++                s->core[at] = byte;
++            }
++        }
++        musb_connect(s);
++        musb_irq(s);
++        return;
++    }
+     switch (addr) {
+-    case OTG_SYSCONFIG:
+-        if (val & 2) {                  /* SOFTRESET */
++    case 0x404:
++        if (value & 2) {
+             musb_reset(DEVICE(s));
++        } else {
++            s->sysconfig = value;
++        }
++        break;
++    case 0x40c:
++        s->interfsel = value;
++        break;
++    case 0x410:
++        s->simenable = value;
++        break;
++    case 0x414:
++        s->forcestdby = value;
++        break;
++    }
++}
++
++static bool musb_unhex(const char *hex, uint8_t *data, unsigned *length)
++{
++    size_t len = strlen(hex);
++
++    if (len % 2 || len > FIFO_SIZE * 2) {
++        return false;
++    }
++    for (size_t i = 0; i < len / 2; i++) {
++        int a = g_ascii_xdigit_value(hex[2 * i]);
++        int b = g_ascii_xdigit_value(hex[2 * i + 1]);
++
++        if (a < 0 || b < 0) {
++            return false;
++        }
++        data[i] = a * 16 + b;
++    }
++    *length = len / 2;
++    return true;
++}
++
++static void musb_token(Omap3MusbState *s, unsigned ep, bool in, uint8_t *data,
++                       unsigned length)
++{
++    g_autoptr(GString) reply = g_string_new(NULL);
++    unsigned reg = in || !ep ? TXCSR : RXCSR;
++    uint16_t csr = lduw_le_p(s->ep[ep] + reg);
++    unsigned ready =
++        ep ? (in ? TX_READY : RX_READY) : (in ? CSR0_TXREADY : CSR0_RXREADY);
++    unsigned stall = ep ? (in ? TX_STALL : RX_STALL) : CSR0_SENDSTALL;
++    const char *direction = in ? "IN" : "OUT";
++
++    g_string_append_printf(reply, "TOKEN %u %s ", ep, direction);
++    if (!s->connected || s->resetting) {
++        g_string_append(reply, "NAK");
++    } else if (csr & stall) {
++        csr |= ep ? (in ? TX_SENTSTALL : RX_SENTSTALL) : CSR0_SENTSTALL;
++        stw_le_p(s->ep[ep] + reg, csr);
++        musb_ep_irq(s, ep, in);
++        g_string_append(reply, "STALL");
++    } else if (!ep && s->status_ready && !length && (in != s->control_in)) {
++        stw_le_p(s->ep[0] + TXCSR, 0);
++        s->status_ready = false;
++        s->tx_len[0] = s->tx_pos[0] = 0;
++        musb_ep_irq(s, 0, true);
++        g_string_append(reply, in ? "ACK " : "ACK 0");
++    } else if (in) {
++        if (!(csr & ready)) {
++            g_string_append(reply, "NAK");
++        } else {
++            unsigned maxp = ep ? lduw_le_p(s->ep[ep]) & 0x7ff : 64;
++            unsigned count = MIN(length, s->tx_len[ep] - s->tx_pos[ep]);
++
++            count = MIN(count, maxp ? maxp : 64);
++
++            g_string_append(reply, "ACK ");
++            for (unsigned i = 0; i < count; i++) {
++                g_string_append_printf(reply, "%02x",
++                                       s->tx[ep][s->tx_pos[ep]++]);
++            }
++            if (s->tx_pos[ep] == s->tx_len[ep]) {
++                s->tx_len[ep] = s->tx_pos[ep] = 0;
++                stw_le_p(s->ep[ep] + reg,
++                         csr & ~(ready | (ep ? TX_NONEMPTY : 0)));
++                musb_ep_irq(s, ep, true);
++            }
++        }
++    } else if (csr & ready) {
++        g_string_append(reply, "NAK");
++    } else {
++        unsigned maxp = ep ? lduw_le_p(s->ep[ep] + 4) & 0x7ff : 64;
++        unsigned count = MIN(length, maxp ? maxp : 64);
++
++        memcpy(s->rx[ep], data, count);
++        s->rx_len[ep] = count;
++        s->rx_pos[ep] = 0;
++        stw_le_p(s->ep[ep] + reg, csr | ready);
++        musb_ep_irq(s, ep, false);
++        g_string_append_printf(reply, "ACK %u", count);
++    }
++    g_string_append_c(reply, '\n');
++    musb_send(s, reply->str);
++}
++
++static void musb_command(Omap3MusbState *s, const char *line)
++{
++    g_auto(GStrv) args = g_strsplit(line, " ", 3);
++    unsigned argc = g_strv_length(args), ep, length;
++    uint8_t data[FIFO_SIZE];
++
++    if (argc == 1 && !strcmp(args[0], "RESET") && s->connected) {
++        musb_clear_endpoints(s);
++        s->core[0] = 0;
++        s->core[INTRTX] = s->core[INTRTX + 1] = 0;
++        s->core[INTRRX] = s->core[INTRRX + 1] = 0;
++        s->core[POWER] &= ~BIT(4);
++        s->core[POWER] |= BIT(3);
++        if (s->high_speed && (s->core[POWER] & BIT(5))) {
++            s->core[POWER] |= BIT(4);
++        }
++        s->resetting = true;
++        s->core[INTRUSB] |= BIT(2);
++        musb_irq(s);
++        timer_mod(s->reset_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * SCALE_MS);
++    } else if (argc == 2 && !strcmp(args[0], "SPEED") &&
++               (!strcmp(args[1], "hs") || !strcmp(args[1], "fs"))) {
++        s->high_speed = !strcmp(args[1], "hs");
++    } else if (argc == 2 && !strcmp(args[0], "SETUP") && s->connected &&
++               !s->resetting && strlen(args[1]) == 16 &&
++               musb_unhex(args[1], data, &length)) {
++        s->tx_len[0] = s->tx_pos[0] = 0;
++        memcpy(s->rx[0], data, 8);
++        s->rx_len[0] = 8;
++        s->rx_pos[0] = 0;
++        s->control_in = data[0] & 0x80;
++        s->status_ready = false;
++        uint16_t old = lduw_le_p(s->ep[0] + TXCSR);
++
++        stw_le_p(
++            s->ep[0] + TXCSR,
++            CSR0_RXREADY |
++                ((old & (CSR0_TXREADY | CSR0_DATAEND)) ? CSR0_SETUPEND : 0));
++        musb_ep_irq(s, 0, true);
++        musb_send(s, "SETUPACK\n");
++    } else if (argc == 3 && !qemu_strtoui(args[1], NULL, 10, &ep) &&
++               ep < EP_COUNT && !strcmp(args[0], "TOKENIN") &&
++               !qemu_strtoui(args[2], NULL, 10, &length) &&
++               length <= FIFO_SIZE) {
++        musb_token(s, ep, true, data, length);
++    } else if (argc == 3 && !qemu_strtoui(args[1], NULL, 10, &ep) &&
++               ep < EP_COUNT && !strcmp(args[0], "TOKENOUT") &&
++               musb_unhex(args[2], data, &length)) {
++        musb_token(s, ep, false, data, length);
++    } else {
++        musb_send(s, "ERROR\n");
++    }
++}
++
++static int musb_can_read(void *opaque)
++{
++    return 4096;
++}
++
++static void musb_receive(void *opaque, const uint8_t *buf, int size)
++{
++    Omap3MusbState *s = opaque;
++
++    for (int i = 0; i < size; i++) {
++        if (buf[i] == '\n') {
++            if (!s->discard_line) {
++                s->line[s->line_len] = 0;
++                musb_command(s, s->line);
++            }
++            s->line_len = 0;
++            s->discard_line = false;
++        } else if (!buf[i] || s->line_len == sizeof(s->line) - 1) {
++            s->discard_line = true;
++        } else if (!s->discard_line && buf[i] != '\r') {
++            s->line[s->line_len++] = buf[i];
++        }
++    }
++}
++
++static void musb_event(void *opaque, QEMUChrEvent event)
++{
++    Omap3MusbState *s = opaque;
++
++    if (event == CHR_EVENT_OPENED || event == CHR_EVENT_CLOSED) {
++        s->line_len = 0;
++        s->discard_line = false;
++        musb_vbus(s, event == CHR_EVENT_OPENED && s->cable_connected);
++    }
++}
++
++static bool musb_get_cable(Object *obj, Error **errp)
++{
++    return OMAP3_MUSB(obj)->cable_connected;
++}
++
++static void musb_set_cable(Object *obj, bool value, Error **errp)
++{
++    Omap3MusbState *s = OMAP3_MUSB(obj);
++
++    s->cable_connected = value;
++    musb_vbus(s, value && qemu_chr_fe_backend_open(&s->chr));
++}
++
++static bool musb_get_vbus(Object *obj, Error **errp)
++{
++    return OMAP3_MUSB(obj)->vbus;
++}
++
++static void musb_realize(DeviceState *dev, Error **errp)
++{
++    Omap3MusbState *s = OMAP3_MUSB(dev);
++
++    if (s->hostchar && *s->hostchar) {
++        Chardev *chr = qemu_chr_find(s->hostchar);
++
++        if (!chr) {
++            error_setg(errp, "omap3-musb: chardev '%s' not found", s->hostchar);
+             return;
+         }
+-        s->sysconfig = val;
+-        return;
+-    case OTG_INTERFSEL:
+-        s->interfsel = val;
+-        return;
+-    case OTG_SIMENABLE:
+-        s->simenable = val;
+-        return;
+-    case OTG_FORCESTDBY:
+-        s->forcestdby = val;
+-        return;
+-    }
+-    qemu_log_mask(LOG_UNIMP, "omap3-musb: write at 0x%" HWADDR_PRIx "\n", addr);
++        if (!qemu_chr_fe_init(&s->chr, chr, errp)) {
++            return;
++        }
++        qemu_chr_fe_set_handlers(&s->chr, musb_can_read, musb_receive,
++                                 musb_event, NULL, s, NULL, true);
++    }
++}
++
++static void musb_unrealize(DeviceState *dev)
++{
++    Omap3MusbState *s = OMAP3_MUSB(dev);
++
++    timer_del(s->reset_timer);
++    qemu_chr_fe_deinit(&s->chr, false);
+ }
+ 
+ static const MemoryRegionOps musb_ops = {
+     .read = musb_read,
+     .write = musb_write,
+     .endianness = DEVICE_LITTLE_ENDIAN,
+-    .valid.min_access_size = 1,
+-    .valid.max_access_size = 4,
++    .valid = {.min_access_size = 1, .max_access_size = 4},
+ };
+ 
+ static void musb_init(Object *obj)
+ {
+     Omap3MusbState *s = OMAP3_MUSB(obj);
+ 
+-    memory_region_init_io(&s->iomem, obj, &musb_ops, s, "omap3-musb", 0x1000);
++    s->high_speed = true;
++    s->cable_connected = true;
++    s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, musb_reset_done, s);
++    memory_region_init_io(&s->iomem, obj, &musb_ops, s, TYPE_OMAP3_MUSB,
++                          0x1000);
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+-}
++    qdev_init_gpio_out_named(DEVICE(obj), &s->vbus_out, "vbus", 1);
++    object_property_add_bool(obj, "cable-connected", musb_get_cable,
++                             musb_set_cable);
++    object_property_add_bool(obj, "vbus", musb_get_vbus, NULL);
++}
++
++static void musb_finalize(Object *obj)
++{
++    timer_free(OMAP3_MUSB(obj)->reset_timer);
++}
++
++static const Property musb_properties[] = {
++    DEFINE_PROP_STRING("hostchar", Omap3MusbState, hostchar),
++};
+ 
+ static const VMStateDescription musb_vmstate = {
+     .name = TYPE_OMAP3_MUSB,
+-    .version_id = 1,
+-    .minimum_version_id = 1,
+-    .fields = (const VMStateField[]) {
+-        VMSTATE_UINT8_ARRAY(core, Omap3MusbState, MUSB_CORE_SIZE),
+-        VMSTATE_UINT32(sysconfig, Omap3MusbState),
+-        VMSTATE_UINT32(interfsel, Omap3MusbState),
+-        VMSTATE_UINT32(simenable, Omap3MusbState),
+-        VMSTATE_UINT32(forcestdby, Omap3MusbState),
+-        VMSTATE_END_OF_LIST()
+-    },
++    .unmigratable = 1,
+ };
+ 
+ static void musb_class_init(ObjectClass *klass, const void *data)
+@@ -163,8 +637,11 @@
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+     device_class_set_legacy_reset(dc, musb_reset);
++    device_class_set_props(dc, musb_properties);
++    dc->realize = musb_realize;
++    dc->unrealize = musb_unrealize;
+     dc->vmsd = &musb_vmstate;
+-    dc->desc = "OMAP3 HS USB OTG (unplugged peripheral)";
++    dc->desc = "OMAP3 MUSB peripheral with virtual USB host";
+ }
+ 
+ static const TypeInfo musb_info = {
+@@ -172,6 +649,7 @@
+     .parent = TYPE_SYS_BUS_DEVICE,
+     .instance_size = sizeof(Omap3MusbState),
+     .instance_init = musb_init,
++    .instance_finalize = musb_finalize,
+     .class_init = musb_class_init,
+ };
+ 
+--- a/hw/misc/tps65921.c
++++ b/hw/misc/tps65921.c
+@@ -161,6 +161,21 @@
+     tps_update_irq(s);
+ }
+ 
++static void tps_set_vbus(void *opaque, int n, int level)
++{
++    Tps65921State *s = opaque;
++    uint8_t edr = s->regs[3][PWR_EDR1];
++
++    if (s->usb_vbus != !!level) {
++        s->usb_vbus = level;
++        /* USB_PRES is power IRQ 2, with edge controls at bits 4 and 5. */
++        if (edr & (level ? BIT(5) : BIT(4))) {
++            s->pwr_pending |= BIT(2);
++        }
++        tps_update_irq(s);
++    }
++}
++
+ static uint8_t tps_read(Tps65921State *s, int id, uint8_t reg)
+ {
+     uint8_t isr;
+@@ -177,7 +192,8 @@
+         return isr;
+     }
+     if (id == 3 && reg == PM_STS_HW_CONDITIONS) {
+-        return s->regs[3][reg] | (s->pwron ? STS_PWON : 0);
++        return s->regs[3][reg] | (s->pwron ? STS_PWON : 0) |
++               (s->usb_vbus ? BIT(7) : 0);
+     }
+     if (id == 0 && reg == USB_PHY_CLK_CTRL_STS) {
+         return USB_PHY_DPLL_CLK;
+@@ -328,6 +344,7 @@
+ 
+     qdev_init_gpio_out(DEVICE(obj), &s->irq, 1);
+     qdev_init_gpio_in(DEVICE(obj), tps_set_pwron, 1);
++    qdev_init_gpio_in_named(DEVICE(obj), tps_set_vbus, "usb-vbus", 1);
+     for (int i = 0; i < 16; i++) {
+         g_autofree char *name = g_strdup_printf("adcin%d-mv", i);
+ 
+@@ -341,7 +358,7 @@
+ 
+ static const VMStateDescription tps_vmstate = {
+     .name = TYPE_TPS65921,
+-    .version_id = 1,
++    .version_id = 2,
+     .minimum_version_id = 1,
+     .fields = (const VMStateField[]) {
+         VMSTATE_I2C_SLAVE(parent_obj, Tps65921State),
+@@ -349,6 +366,7 @@
+         VMSTATE_INT64(rtc_offset, Tps65921State),
+         VMSTATE_UINT32_ARRAY(adcin_mv, Tps65921State, 16),
+         VMSTATE_BOOL(pwron, Tps65921State),
++        VMSTATE_BOOL_V(usb_vbus, Tps65921State, 2),
+         VMSTATE_UINT8(pwr_pending, Tps65921State),
+         VMSTATE_END_OF_LIST()
+     },
+--- a/include/hw/misc/tps65921.h
++++ b/include/hw/misc/tps65921.h
+@@ -36,6 +36,7 @@
+     qemu_irq irq;               /* SYS_NIRQ, active high here */
+     int64_t rtc_offset;         /* guest RTC - host clock, seconds */
+     uint32_t adcin_mv[16];      /* MADC inputs (mV), QOM "adcinN-mv" */
++    bool usb_vbus;              /* external USB VBUS comparator */
+     bool pwron;                 /* the PWRON pin (button pressed) */
+     uint8_t pwr_pending;        /* power SIH events, before IMR1 */
+ };
+--- a/hw/arm/j49.c
++++ b/hw/arm/j49.c
+@@ -282,6 +282,15 @@
+     object_property_set_uint(OBJECT(pmic), "adcin0-mv", J49_BATTERY_MV / 3,
+                              &error_fatal);
+ 
++    qdev_connect_gpio_out_named(soc->musb, "vbus", 0,
++                                qdev_get_gpio_in_named(DEVICE(pmic),
++                                                       "usb-vbus", 0));
++    object_property_add_alias(OBJECT(machine), "usb-connected",
++                              OBJECT(soc->musb),
++                              "cable-connected");
++    object_property_add_alias(OBJECT(machine), "usb-vbus", OBJECT(soc->musb),
++                              "vbus");
++
+     /* Diamond drives its backlight with PWM; j49 has an I2C LM3530. */
+     if (!diamond) {
+         i2c_slave_create_simple(soc->i2c[2].bus, "lm3530", 0x36);

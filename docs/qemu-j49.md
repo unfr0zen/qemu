@@ -190,7 +190,7 @@ per patch, applied after the diamond3's (0001–0036):
 | 0066 | SDIO card: a voltage window (MMC2 is 1.8 V), and function 0's space past the card's own for the chip (the WL1271's ELP control) |
 | 0067–0069 | McSPI, master mode, paced as the shift register is, with its DMA requests |
 | 0070–0072 | System DMA controller (SDMA) |
-| 0073–0074 | HS USB OTG as an unplugged peripheral |
+| 0073–0074, 0124 | HS USB OTG peripheral and virtual USB host |
 | 0075–0078 | DSS (DISPC scanout, DSI) and the LM3530 backlight |
 | 0079–0080 | ADBS-A320 ring sensor |
 | 0081–0084 | WL1271 wifi chip |
@@ -215,6 +215,34 @@ v6 firmware, pass `-global 'wl1271.fw-version=Rev 6.3.10.0.133'`; the Buildroot
 runner supplies it. The model responds to the driver's firmware boot and
 command interface; it does not execute uploaded radio firmware.
 
+## USB peripheral
+
+The MUSB model accepts a virtual host chardev:
+
+```sh
+-global driver=omap3-musb,property=hostchar,value=usbhost \
+-chardev socket,id=usbhost,path=/tmp/j49-usb.sock,server=on,wait=off
+```
+
+The board exposes `usb-connected` (read/write cable switch) and `usb-vbus`
+(read-only comparator state) on `/machine`. The UI USB switch uses these
+properties. Socket connection supplies VBUS through the TPS65921's
+USB_PRES interrupt; its disconnect tears down the gadget session.
+
+The newline-delimited protocol is shared with Diamond3's virtual USB host:
+`SPEED hs|fs`, `RESET`, `SETUP HEX`, `TOKENIN EP MAX_BYTES`, and
+`TOKENOUT EP HEX`. Empty OUT packets have a trailing space and empty HEX.
+The model emits `CONNECT`, `DISCONNECT`, `RESETDONE`, `SETUPACK`, and
+`TOKEN EP IN|OUT ACK HEX|COUNT`, `NAK`, or `STALL`. IN data is packetized
+at the configured endpoint maximum packet size; the host assembles
+multi-packet transfers. Endpoint registers have indexed and flat windows,
+read-to-clear interrupt latches and write-zero-to-clear status bits.
+
+The sibling Buildroot `scripts/check-usb.py SOCKET --speed hs|fs --ui URL`
+checks ACM line coding/root shell, CDC interrupt notifications, endpoint
+halt/clear, ECM DHCP, a 1024-byte ICMP echo, reset/stall recovery and cable
+reconnection. This virtual host does not create a host OS USB interface.
+
 ## Debugging
 
 - The console is the first stop; the pre-boot keeps all but critical
@@ -231,7 +259,8 @@ command interface; it does not execute uploaded radio firmware.
 
 - Other Thread nodes, and the radio's bootloader, as on the diamond3.
 - The panel's SPI side: the Tianma panel's ID reads `00 00 00`.
-- USB: the MUSB port reads as unplugged.
+- USB host/OTG host operation and MUSB DMA are not modelled. Peripheral
+  PIO supports control, bulk and interrupt transfers at full/high speed.
 - The WL1271's PLT (calibration) mode: the calibrator's `autocalibrate`
   would produce an empty NVS, which the stock image avoids by keeping the
   factory's.
