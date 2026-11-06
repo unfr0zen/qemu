@@ -1,0 +1,41 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: apply sampler channel swizzles
+
+--- a/hw/display/vivante_3d.c
++++ b/hw/display/vivante_3d.c
+@@ -674,6 +674,17 @@
+     }
+ }
+ 
++static void viv_texture_swizzle(const VivSampler *sm, float color[4])
++{
++    float raw[4];
++
++    memcpy(raw, color, sizeof(raw));
++    for (unsigned c = 0; c < 4; c++) {
++        unsigned swizzle = (sm->cfg1 >> (8 + c * 4)) & 7;
++        color[c] = swizzle < 4 ? raw[swizzle] : swizzle == 5 ? 1.0f : 0.0f;
++    }
++}
++
+ /* A texel coordinate wrapped as the sampler says; -1 = the border. */
+ static int viv_wrap(unsigned mode, int i, int n)
+ {
+@@ -962,6 +973,7 @@
+         float t[4];
+ 
+         viv_sample(e->d, in->tex_id, src[l][0].f[0], src[l][0].f[1], lod, t);
++        viv_texture_swizzle(sm, t);
+         for (int c = 0; c < 4; c++) {
+             res[l].f[c] = t[in->tex_swz[c]];
+         }
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -768,6 +768,7 @@
+                 for (unsigned x = 0; x < lv->w; x++) {
+                     float c[4];
+                     viv_texel(d, sm, lv, x, y, c);
++                    viv_texture_swizzle(sm, c);
+                     for (unsigned j = 0; j < 4; j++) {
+                         pixels[(y * lv->w + x) * 4 + j] = viv_q(c[j], 255);
+                     }
