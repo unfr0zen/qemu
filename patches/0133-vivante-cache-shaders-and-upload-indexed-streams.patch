@@ -1,0 +1,414 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: cache shaders and upload indexed streams
+
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -7,19 +7,18 @@
+ #define GL_SILENCE_DEPRECATION
+ #include <OpenGL/OpenGL.h>
+ #include <OpenGL/gl3.h>
+-#include "qemu/xxhash.h"
+ #include "qemu/error-report.h"
+ 
+ typedef struct VivHostTexture {
+     GLuint name;
+-    uint64_t hash;
+-    uint32_t cfg[5];
++    uint32_t cfg[5], addr[VIV_LEVELS];
++    GByteArray *raw;
+ } VivHostTexture;
+ 
+ typedef struct VivHostGL {
+     CGLContextObj context;
+     GHashTable *programs;
+-    GLuint fbo, color, depth, vao, vertices, uniforms;
++    GLuint fbo, color, depth, vao, streams[8], indices, uniforms;
+     bool valid;
+     unsigned width, height;
+     VivDraw target;
+@@ -50,12 +49,14 @@
+         goto fail;
+     }
+     CGLSetCurrentContext(h->context);
+-    h->programs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
++    h->programs = g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
++                                      (GDestroyNotify)g_bytes_unref, NULL);
+     glGenFramebuffers(1, &h->fbo);
+     glGenTextures(1, &h->color);
+     glGenTextures(1, &h->depth);
+     glGenVertexArrays(1, &h->vao);
+-    glGenBuffers(1, &h->vertices);
++    glGenBuffers(8, h->streams);
++    glGenBuffers(1, &h->indices);
+     glGenBuffers(1, &h->uniforms);
+     glBindVertexArray(h->vao);
+     glPixelStorei(GL_PACK_ALIGNMENT, 1);
+@@ -87,11 +88,15 @@
+     g_hash_table_destroy(h->programs);
+     for (unsigned i = 0; i < ARRAY_SIZE(h->textures); i++) {
+         glDeleteTextures(1, &h->textures[i].name);
++        if (h->textures[i].raw) {
++            g_byte_array_unref(h->textures[i].raw);
++        }
+     }
+     glDeleteTextures(1, &h->color);
+     glDeleteTextures(1, &h->depth);
+     glDeleteFramebuffers(1, &h->fbo);
+-    glDeleteBuffers(1, &h->vertices);
++    glDeleteBuffers(8, h->streams);
++    glDeleteBuffers(1, &h->indices);
+     glDeleteBuffers(1, &h->uniforms);
+     glDeleteVertexArrays(1, &h->vao);
+     CGLSetCurrentContext(NULL);
+@@ -478,21 +483,47 @@
+     return shader;
+ }
+ 
++static GBytes *viv_gl_program_key(VivDraw *d)
++{
++    uint32_t header[] = {
++        d->vs.start, d->vs.end, d->vs.ubase,
++        d->ps.start, d->ps.end, d->ps.ubase,
++        d->vs_inputs, d->vs_outputs, d->ps_inputs, d->ps_out_reg,
++        PA_SHADE_MODEL(d->st[ST_PA_CONFIG]), d->st[ST_PE_ALPHA_OP],
++    };
++    GByteArray *key = g_byte_array_new();
++
++    g_byte_array_append(key, (uint8_t *)header, sizeof(header));
++    g_byte_array_append(key, d->vs_in_reg, sizeof(d->vs_in_reg));
++    g_byte_array_append(key, d->vs_out_reg, sizeof(d->vs_out_reg));
++    g_byte_array_append(key, (uint8_t *)&d->st[ST_PA_SHADER_ATTRIBUTES], 40);
++    g_byte_array_append(key,
++        (uint8_t *)&d->st[ST_VS_INST_MEM + d->vs.start * 4],
++        (d->vs.end - d->vs.start) * 16);
++    g_byte_array_append(key,
++        (uint8_t *)&d->st[ST_PS_INST_MEM + d->ps.start * 4],
++        (d->ps.end - d->ps.start) * 16);
++    return g_byte_array_free_to_bytes(key);
++}
++
+ static GLuint viv_gl_program(VivHostGL *h, VivDraw *d)
+ {
+-    g_autofree char *vs = viv_gl_shader(d, false);
+-    g_autofree char *ps = viv_gl_shader(d, true);
++    GBytes *key = viv_gl_program_key(d);
++    g_autofree char *vs = NULL;
++    g_autofree char *ps = NULL;
+     GLuint program, vertex, fragment;
+     GLint linked;
+-
++    gpointer cached;
++
++    if (g_hash_table_lookup_extended(h->programs, key, NULL, &cached)) {
++        g_bytes_unref(key);
++        return GPOINTER_TO_UINT(cached);
++    }
++    vs = viv_gl_shader(d, false);
++    ps = viv_gl_shader(d, true);
+     if (!vs || !ps) {
++        g_hash_table_insert(h->programs, key, NULL);
+         return 0;
+-    }
+-    char *key = g_strconcat(vs, ps, NULL);
+-    gpointer cached;
+-    if (g_hash_table_lookup_extended(h->programs, key, NULL, &cached)) {
+-        g_free(key);
+-        return GPOINTER_TO_UINT(cached);
+     }
+     vertex = viv_gl_compile(GL_VERTEX_SHADER, vs);
+     fragment = viv_gl_compile(GL_FRAGMENT_SHADER, ps);
+@@ -660,7 +691,6 @@
+                            GLuint program)
+ {
+     VivSampler *sm = &d->smp[unit];
+-    uint64_t hash = 0;
+     uint32_t cfg[] = {sm->cfg0, sm->cfg1, sm->lod_cfg, sm->w, sm->h};
+     unsigned maxlevel = 0;
+     VivHostTexture *texture = NULL;
+@@ -676,36 +706,59 @@
+            (sm->w >> maxlevel > 1 || sm->h >> maxlevel > 1)) {
+         maxlevel++;
+     }
++    uint32_t addresses[VIV_LEVELS] = {};
++    unsigned bytes = 0;
+     for (unsigned l = 0; l <= maxlevel; l++) {
+         VivLevel *lv = viv_level(d, sm, l);
+-        for (unsigned off = 0; off < lv->surf.size;) {
++        addresses[l] = lv->addr;
++        bytes += lv->surf.size;
++    }
++    for (unsigned i = 0; i < ARRAY_SIZE(h->textures); i++) {
++        if (h->textures[i].name &&
++            !memcmp(h->textures[i].cfg, cfg, sizeof(cfg)) &&
++            !memcmp(h->textures[i].addr, addresses, sizeof(addresses))) {
++            texture = &h->textures[i];
++            break;
++        }
++    }
++    bool equal = texture && texture->raw->len == bytes;
++    unsigned offset = 0;
++    for (unsigned l = 0; equal && l <= maxlevel; l++) {
++        VivLevel *lv = &sm->level[l];
++        for (unsigned off = 0; equal && off < lv->surf.size;) {
+             uint8_t *p = viv_surf_ptr(&lv->surf, off);
+             unsigned n = MIN(lv->surf.size - off,
+                              4096 - ((lv->surf.base + off) & 4095));
+-            if (p) {
+-                unsigned i = 0;
+-                for (; i + 8 <= n; i += 8) {
+-                    hash = XXH64_round(hash, ldq_le_p(p + i));
+-                }
+-                for (; i < n; i++) {
+-                    hash = XXH64_round(hash, p[i]);
+-                }
+-            }
++            equal = p && !memcmp(texture->raw->data + offset + off, p, n);
+             off += n;
+         }
+-    }
+-    for (unsigned i = 0; i < ARRAY_SIZE(h->textures); i++) {
+-        if (h->textures[i].name && h->textures[i].hash == hash &&
+-            !memcmp(h->textures[i].cfg, cfg, sizeof(cfg))) {
+-            texture = &h->textures[i];
+-            break;
+-        }
++        offset += lv->surf.size;
+     }
+     glActiveTexture(GL_TEXTURE0 + unit);
+-    if (!texture) {
+-        texture = &h->textures[h->next_texture++ % ARRAY_SIZE(h->textures)];
++    if (!equal) {
++        if (!texture) {
++            texture = &h->textures[h->next_texture++ % ARRAY_SIZE(h->textures)];
++        }
+         if (!texture->name) {
+             glGenTextures(1, &texture->name);
++            texture->raw = g_byte_array_new();
++        }
++        g_byte_array_set_size(texture->raw, bytes);
++        offset = 0;
++        for (unsigned l = 0; l <= maxlevel; l++) {
++            VivLevel *lv = &sm->level[l];
++            for (unsigned off = 0; off < lv->surf.size;) {
++                uint8_t *p = viv_surf_ptr(&lv->surf, off);
++                unsigned n = MIN(lv->surf.size - off,
++                                 4096 - ((lv->surf.base + off) & 4095));
++                if (p) {
++                    memcpy(texture->raw->data + offset + off, p, n);
++                } else {
++                    memset(texture->raw->data + offset + off, 0, n);
++                }
++                off += n;
++            }
++            offset += lv->surf.size;
+         }
+         glBindTexture(GL_TEXTURE_2D, texture->name);
+         for (unsigned l = 0; l <= maxlevel; l++) {
+@@ -743,7 +796,7 @@
+                          ((sm->lod_cfg >> 11) & 1023) / 32.0f);
+         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD,
+                          ((sm->lod_cfg >> 1) & 1023) / 32.0f);
+-        texture->hash = hash;
++        memcpy(texture->addr, addresses, sizeof(addresses));
+         memcpy(texture->cfg, cfg, sizeof(cfg));
+     }
+     glBindTexture(GL_TEXTURE_2D, texture->name);
+@@ -751,12 +804,83 @@
+     glUniform1i(glGetUniformLocation(program, name), unit);
+ }
+ 
++/* Upload vertex streams without expanding indexed vertices on the CPU. */
++static bool viv_gl_vertices(VivHostGL *h, VivDraw *d, uint32_t start,
++                             unsigned n, bool indexed, uint32_t index_offset)
++{
++    static const GLenum types[16] = {
++        GL_BYTE, GL_UNSIGNED_BYTE, GL_SHORT, GL_UNSIGNED_SHORT,
++        GL_INT, GL_UNSIGNED_INT, GL_INT_2_10_10_10_REV,
++        GL_UNSIGNED_INT_2_10_10_10_REV, GL_FLOAT, GL_HALF_FLOAT,
++    };
++    unsigned stride[8] = {}, end[8] = {};
++    uint32_t base[8] = {};
++    uint32_t first = UINT32_MAX, last = 0;
++    g_autofree uint32_t *indices = g_new(uint32_t, n);
++
++    for (unsigned i = 0; i < n; i++) {
++        indices[i] = viv_index(d, indexed, start, i, index_offset);
++        first = MIN(first, indices[i]);
++        last = MAX(last, indices[i]);
++    }
++    if (last - first >= VIV_MAX_VERTICES) {
++        return false;
++    }
++    for (unsigned i = 0; i < d->vs_inputs; i++) {
++        uint32_t cfg = d->st[ST_FE_VERTEX_ELEMENT_CONFIG + i];
++        unsigned stream = VE_STREAM(cfg) & 7;
++        if (!types[VE_TYPE(cfg)]) {
++            return false;
++        }
++        base[stream] = d->st[stream ?
++            ST_FE_VERTEX_STREAMS_BASE_ADDR + stream :
++            ST_FE_VERTEX_STREAM_BASE_ADDR];
++        stride[stream] = d->st[stream ?
++            ST_FE_VERTEX_STREAMS_CONTROL + stream :
++            ST_FE_VERTEX_STREAM_CONTROL] & 255;
++        end[stream] = MAX(end[stream], VE_END(cfg));
++    }
++    for (unsigned stream = 0; stream < 8; stream++) {
++        if (!end[stream]) {
++            continue;
++        }
++        unsigned size = (last - first) * stride[stream] + end[stream];
++        g_autofree uint8_t *data = g_malloc(size);
++        viv_dma(d->s, base[stream] + first * stride[stream], data, size, false);
++        glBindBuffer(GL_ARRAY_BUFFER, h->streams[stream]);
++        glBufferData(GL_ARRAY_BUFFER, size, data, GL_STREAM_DRAW);
++    }
++    for (unsigned i = 0; i < d->vs_inputs; i++) {
++        uint32_t cfg = d->st[ST_FE_VERTEX_ELEMENT_CONFIG + i];
++        unsigned stream = VE_STREAM(cfg) & 7;
++        if (!stride[stream]) {
++            VivVec values[VIV_TEMPS] = {};
++            viv_fetch_vertex(d, first, values);
++            glDisableVertexAttribArray(i);
++            glVertexAttrib4fv(i, values[d->vs_in_reg[i] & 63].f);
++            continue;
++        }
++        glBindBuffer(GL_ARRAY_BUFFER, h->streams[stream]);
++        glEnableVertexAttribArray(i);
++        glVertexAttribPointer(i, VE_NUM(cfg) ? VE_NUM(cfg) : 4,
++                               types[VE_TYPE(cfg)], VE_NORMALIZE(cfg) == 2,
++                               stride[stream],
++                               (void *)(uintptr_t)VE_START(cfg));
++    }
++    for (unsigned i = 0; i < n; i++) {
++        indices[i] -= first;
++    }
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, h->indices);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, n * sizeof(*indices), indices,
++                  GL_STREAM_DRAW);
++    return true;
++}
++
+ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+                            unsigned n, bool indexed, uint32_t index_offset)
+ {
+     VivHostGL *h = viv_host_init(d->s);
+     GLuint program;
+-    g_autofree VivVec *vertices = NULL;
+     static const GLenum mode[] = {
+         0, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_TRIANGLES,
+         GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_LINE_LOOP,
+@@ -804,23 +928,8 @@
+             viv_gl_texture(h, d, i, program);
+         }
+     }
+-    vertices = g_new0(VivVec, n * d->vs_inputs);
+-    for (unsigned i = 0; i < n; i++) {
+-        VivVec temps[VIV_TEMPS] = {};
+-        uint32_t idx = viv_index(d, indexed, start, i, index_offset);
+-        viv_fetch_vertex(d, idx, temps);
+-        for (unsigned j = 0; j < d->vs_inputs; j++) {
+-            vertices[i * d->vs_inputs + j] = temps[d->vs_in_reg[j] & 63];
+-        }
+-    }
+-    glBindBuffer(GL_ARRAY_BUFFER, h->vertices);
+-    glBufferData(GL_ARRAY_BUFFER, n * d->vs_inputs * sizeof(VivVec),
+-                  vertices, GL_STREAM_DRAW);
+-    for (unsigned i = 0; i < d->vs_inputs; i++) {
+-        glEnableVertexAttribArray(i);
+-        glVertexAttribPointer(i, 4, GL_FLOAT, false,
+-                               d->vs_inputs * sizeof(VivVec),
+-                               (void *)(uintptr_t)(i * sizeof(VivVec)));
++    if (!viv_gl_vertices(h, d, start, n, indexed, index_offset)) {
++        return false;
+     }
+     glBindFramebuffer(GL_FRAMEBUFFER, h->fbo);
+     glViewport(0, 0, h->width, h->height);
+@@ -860,7 +969,7 @@
+     } else {
+         glDisable(GL_BLEND);
+     }
+-    glDrawArrays(mode[prim], 0, n);
++    glDrawElements(mode[prim], n, GL_UNSIGNED_INT, NULL);
+     d->s->host_draws++;
+     return true;
+ }
+@@ -873,6 +982,78 @@
+ {
+ }
+ 
++/* Upload vertex streams without expanding indexed vertices on the CPU. */
++static bool viv_gl_vertices(VivHostGL *h, VivDraw *d, uint32_t start,
++                             unsigned n, bool indexed, uint32_t index_offset)
++{
++    static const GLenum types[16] = {
++        GL_BYTE, GL_UNSIGNED_BYTE, GL_SHORT, GL_UNSIGNED_SHORT,
++        GL_INT, GL_UNSIGNED_INT, GL_INT_2_10_10_10_REV,
++        GL_UNSIGNED_INT_2_10_10_10_REV, GL_FLOAT, GL_HALF_FLOAT,
++    };
++    unsigned stride[8] = {}, end[8] = {};
++    uint32_t base[8] = {};
++    uint32_t first = UINT32_MAX, last = 0;
++    g_autofree uint32_t *indices = g_new(uint32_t, n);
++
++    for (unsigned i = 0; i < n; i++) {
++        indices[i] = viv_index(d, indexed, start, i, index_offset);
++        first = MIN(first, indices[i]);
++        last = MAX(last, indices[i]);
++    }
++    if (last - first >= VIV_MAX_VERTICES) {
++        return false;
++    }
++    for (unsigned i = 0; i < d->vs_inputs; i++) {
++        uint32_t cfg = d->st[ST_FE_VERTEX_ELEMENT_CONFIG + i];
++        unsigned stream = VE_STREAM(cfg) & 7;
++        if (!types[VE_TYPE(cfg)]) {
++            return false;
++        }
++        base[stream] = d->st[stream ?
++            ST_FE_VERTEX_STREAMS_BASE_ADDR + stream :
++            ST_FE_VERTEX_STREAM_BASE_ADDR];
++        stride[stream] = d->st[stream ?
++            ST_FE_VERTEX_STREAMS_CONTROL + stream :
++            ST_FE_VERTEX_STREAM_CONTROL] & 255;
++        end[stream] = MAX(end[stream], VE_END(cfg));
++    }
++    for (unsigned stream = 0; stream < 8; stream++) {
++        if (!end[stream]) {
++            continue;
++        }
++        unsigned size = (last - first) * stride[stream] + end[stream];
++        g_autofree uint8_t *data = g_malloc(size);
++        viv_dma(d->s, base[stream] + first * stride[stream], data, size, false);
++        glBindBuffer(GL_ARRAY_BUFFER, h->streams[stream]);
++        glBufferData(GL_ARRAY_BUFFER, size, data, GL_STREAM_DRAW);
++    }
++    for (unsigned i = 0; i < d->vs_inputs; i++) {
++        uint32_t cfg = d->st[ST_FE_VERTEX_ELEMENT_CONFIG + i];
++        unsigned stream = VE_STREAM(cfg) & 7;
++        if (!stride[stream]) {
++            VivVec values[VIV_TEMPS] = {};
++            viv_fetch_vertex(d, first, values);
++            glDisableVertexAttribArray(i);
++            glVertexAttrib4fv(i, values[d->vs_in_reg[i] & 63].f);
++            continue;
++        }
++        glBindBuffer(GL_ARRAY_BUFFER, h->streams[stream]);
++        glEnableVertexAttribArray(i);
++        glVertexAttribPointer(i, VE_NUM(cfg) ? VE_NUM(cfg) : 4,
++                               types[VE_TYPE(cfg)], VE_NORMALIZE(cfg) == 2,
++                               stride[stream],
++                               (void *)(uintptr_t)VE_START(cfg));
++    }
++    for (unsigned i = 0; i < n; i++) {
++        indices[i] -= first;
++    }
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, h->indices);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, n * sizeof(*indices), indices,
++                  GL_STREAM_DRAW);
++    return true;
++}
++
+ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+                            unsigned n, bool indexed, uint32_t index_offset)
+ {
