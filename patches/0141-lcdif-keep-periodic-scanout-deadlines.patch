@@ -1,0 +1,71 @@
+From: Will
+Subject: [PATCH] hw/display: imx lcdif: keep periodic scanout deadlines
+
+--- a/hw/display/imx_lcdif.c
++++ b/hw/display/imx_lcdif.c
+@@ -113,8 +113,13 @@
+     }
+     s->regs[LCDC_CTRL1 / 4] |= CTRL1_CUR_FRAME_DONE_IRQ | CTRL1_VSYNC_EDGE_IRQ;
+     lcdif_update_irq(s);
+-    timer_mod(s->frame_timer,
+-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + LCDIF_FRAME_NS);
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->frame_deadline += LCDIF_FRAME_NS;
++    if (s->frame_deadline <= now) {
++        s->frame_deadline += ((now - s->frame_deadline) / LCDIF_FRAME_NS + 1) *
++                             LCDIF_FRAME_NS;
++    }
++    timer_mod(s->frame_timer, s->frame_deadline);
+ }
+ 
+ static void lcdif_invalidate(void *opaque)
+@@ -235,8 +240,9 @@
+     if (was_running != lcdif_running(s)) {
+         s->invalidate = true;
+         if (lcdif_running(s)) {
+-            timer_mod(s->frame_timer,
+-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + LCDIF_FRAME_NS);
++            s->frame_deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                                LCDIF_FRAME_NS;
++            timer_mod(s->frame_timer, s->frame_deadline);
+         } else {
+             timer_del(s->frame_timer);
+         }
+@@ -254,14 +260,26 @@
+     .valid.max_access_size = 4,
+ };
+ 
++static int lcdif_post_load(void *opaque, int version)
++{
++    ImxLcdifState *s = opaque;
++
++    if (version < 3 && timer_pending(s->frame_timer)) {
++        s->frame_deadline = timer_expire_time_ns(s->frame_timer);
++    }
++    return 0;
++}
++
+ static const VMStateDescription vmstate_imx_lcdif = {
+     .name = TYPE_IMX_LCDIF,
+-    .version_id = 2,
++    .version_id = 3,
+     .minimum_version_id = 2,
++    .post_load = lcdif_post_load,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT32_ARRAY(regs, ImxLcdifState, IMX_LCDIF_REG_SIZE / 4),
+         VMSTATE_BOOL(invalidate, ImxLcdifState),
+         VMSTATE_TIMER_PTR(frame_timer, ImxLcdifState),
++        VMSTATE_INT64_V(frame_deadline, ImxLcdifState, 3),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+--- a/include/hw/display/imx_lcdif.h
++++ b/include/hw/display/imx_lcdif.h
+@@ -24,6 +24,7 @@
+     qemu_irq irq;
+     QemuConsole *con;
+     QEMUTimer *frame_timer;         /* end of each scanned-out frame */
++    int64_t frame_deadline;
+ 
+     bool invalidate;
+ 
