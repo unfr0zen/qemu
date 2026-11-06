@@ -516,7 +516,7 @@ PY
 -global driver=j49.board,property=poweroff-exit,value=on"
         PINS="button=HU-BUTTON,poweroff=POWEROFF,wifi_enable=WIFI-ENABLE,beeper_en=BEEPER-EN"
     else
-        SERIAL_ARGS="-serial chardev:con -serial null -serial null -serial null -serial null -serial chardev:bp"
+        SERIAL_ARGS="-serial chardev:con -serial null -serial null -serial null -serial none -serial chardev:bp"
         BOARD_ARGS="-global driver=flintstone.board,property=chardev,value=boardui \
 -chardev socket,id=ncp,host=$bind,port=$ncp_port,server=on,wait=off,nodelay=on \
 -global driver=em35x-ncp,property=chardev,value=ncp \

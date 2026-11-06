@@ -646,3 +646,7 @@ and authentic HAB fuse contents are not modelled by this calibration shadow.
 The GC400 aliases its single-stream and numbered stream-zero registers,
 and the legacy VS/PS uniform windows map into unified uniform storage.
 Mainline Etnaviv can submit vertex and fragment shader draws through Mesa.
+
+UART5 has a native DA14580 boot-ROM/GTL transport model (patch 0129).
+The optional `ble-hci-test=on` machine property selects a synthetic HCI
+personality for BlueZ and a virtual GATT peer; see [BLE UART](qemu-da14580.md).

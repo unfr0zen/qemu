@@ -1,0 +1,849 @@
+From: Will
+Subject: [PATCH] hw/char: emulate diamond3 da14580 uart firmware transports
+
+--- a/chardev/meson.build
++++ b/chardev/meson.build
+@@ -33,7 +33,8 @@
+     'char-hmp-cmds.c',
+     'msmouse.c',
+     'wctablet.c',
+-    'testdev.c'))
++    'testdev.c',
++    'char-da14580.c'))
+ 
+ chardev_modules = {}
+ 
+--- a/hw/arm/flintstone.c
++++ b/hw/arm/flintstone.c
+@@ -18,6 +18,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
++#include "chardev/char-da14580.h"
+ #include "qapi/visitor.h"
+ #include "hw/adc/imx6_adc.h"
+ #include "hw/arm/flintstone_board.h"
+@@ -57,8 +58,19 @@
+     MachineState parent_obj;
+     char *usb0_hostchar;
+     char *boot_rom;
++    bool ble_hci_test;
+ };
+ 
++static bool flintstone_get_ble_hci_test(Object *obj, Error **errp)
++{
++    return FLINTSTONE_MACHINE(obj)->ble_hci_test;
++}
++
++static void flintstone_set_ble_hci_test(Object *obj, bool value, Error **errp)
++{
++    FLINTSTONE_MACHINE(obj)->ble_hci_test = value;
++}
++
+ static char *flintstone_get_usb0_hostchar(Object *obj, Error **errp)
+ {
+     return g_strdup(FLINTSTONE_MACHINE(obj)->usb0_hostchar);
+@@ -409,6 +421,7 @@
+     DeviceState *board;
+     DeviceState *gpio6, *gpio7, *adc1, *adc2;
+     BlockBackend *nand;
++    Chardev *ble = NULL;
+ 
+     if (machine->ram_size != FLINTSTONE_RAM_SIZE) {
+         error_report("flintstone: this board has %lu MiB of DDR3",
+@@ -417,6 +430,14 @@
+     }
+ 
+     soc = qdev_new(TYPE_FSL_IMX6SX);
++    if (!serial_hd(4)) {
++        ble = qemu_chardev_new("diamond3-ble", "chardev-da14580", NULL,
++                              NULL, &error_fatal);
++        object_property_set_bool(OBJECT(ble), "hci-test-firmware",
++                                 FLINTSTONE_MACHINE(machine)->ble_hci_test,
++                                 &error_fatal);
++        qdev_prop_set_chr(DEVICE(&FSL_IMX6SX(soc)->uart[4]), "chardev", ble);
++    }
+     if (FLINTSTONE_MACHINE(machine)->usb0_hostchar) {
+         qdev_prop_set_string(soc, "usb0-hostchar",
+                              FLINTSTONE_MACHINE(machine)->usb0_hostchar);
+@@ -437,6 +458,12 @@
+         qdev_prop_set_drive_err(gpmi, "drive", nand, &error_fatal);
+     }
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
++    if (ble) {
++        DeviceState *gpio5 = DEVICE(object_resolve_path_component(OBJECT(soc),
++                                                                  "gpio5"));
++        qdev_connect_gpio_out(gpio5, 16,
++                              qemu_allocate_irq(da14580_reset_gpio, ble, 0));
++    }
+     if (FLINTSTONE_MACHINE(machine)->boot_rom) {
+         if (machine->firmware) {
+             error_report("diamond3: boot-rom and -bios are mutually exclusive");
+@@ -550,6 +577,9 @@
+     object_class_property_add_str(oc, "boot-rom",
+                                   flintstone_get_boot_rom,
+                                   flintstone_set_boot_rom);
++    object_class_property_add_bool(oc, "ble-hci-test",
++                                   flintstone_get_ble_hci_test,
++                                   flintstone_set_ble_hci_test);
+     mc->desc = "Nest diamond3 (Display-3.4, i.MX6SX)";
+     mc->alias = "diamond3";
+     mc->init = flintstone_init;
+--- a/hw/arm/fsl-imx6sx.c
++++ b/hw/arm/fsl-imx6sx.c
+@@ -320,7 +320,9 @@
+         };
+ 
+         for (i = 0; i < FSL_IMX6SX_NUM_UARTS; i++) {
+-            qdev_prop_set_chr(DEVICE(&s->uart[i]), "chardev", serial_hd(i));
++            if (serial_hd(i)) {
++                qdev_prop_set_chr(DEVICE(&s->uart[i]), "chardev", serial_hd(i));
++            }
+             if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart[i]), errp)) {
+                 return;
+             }
+--- /dev/null
++++ b/chardev/char-da14580.c
+@@ -0,0 +1,732 @@
++/*
++ * Diamond3 DA14580 UART boot ROM and external-processor transport.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * GTL follows Renesas UM-B-143. The optional HCI test profile is a
++ * synthetic firmware personality; the stock DA14580 firmware uses GTL.
++ */
++#include "qemu/osdep.h"
++#include "chardev/char.h"
++#include "chardev/char-da14580.h"
++#include "hw/core/irq.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "qemu/bswap.h"
++#include "qemu/guest-random.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "system/reset.h"
++
++#define TYPE_DA14580 "chardev-da14580"
++OBJECT_DECLARE_SIMPLE_TYPE(DA14580State, DA14580)
++#define DA_PACKET_MAX 4096
++#define DA_QUEUE_MAX 16384
++
++enum { DA_SOH, DA_LEN_LO, DA_LEN_HI, DA_IMAGE, DA_ACK, DA_RUNNING };
++
++struct DA14580State {
++    Chardev parent;
++    QEMUTimer *timer;
++    uint8_t rx[DA_PACKET_MAX];
++    unsigned rx_used;
++    uint8_t tx[DA_QUEUE_MAX];
++    unsigned tx_used;
++    unsigned boot_state, image_len, image_left;
++    uint8_t checksum;
++    bool reset, hci, scanning, advertising, peer_present, connected;
++    bool active_scan;
++    uint8_t scan_operation, adv_operation;
++    uint16_t gtl_host;
++    int64_t next_report;
++};
++
++static const uint8_t da_address[6] = { 0x80, 0x45, 0x01, 0, 0, 2 };
++static const uint8_t peer_address[6] = { 1, 0, 0, 0, 0, 2 };
++static const uint8_t peer_name[] = "QEMU BLE test peer";
++
++static void da_schedule(DA14580State *s, int64_t delay)
++{
++    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + delay);
++}
++
++static void da_send(DA14580State *s, const uint8_t *buf, unsigned len)
++{
++    if (len <= sizeof(s->tx) - s->tx_used) {
++        memcpy(s->tx + s->tx_used, buf, len);
++        s->tx_used += len;
++        da_schedule(s, 1);
++    }
++}
++
++static void da_event(DA14580State *s, uint8_t event,
++                     const uint8_t *payload, unsigned len)
++{
++    uint8_t packet[258] = { 4, event, len };
++
++    assert(len <= 255);
++    memcpy(packet + 3, payload, len);
++    da_send(s, packet, len + 3);
++}
++
++static void da_complete(DA14580State *s, uint16_t opcode,
++                        const uint8_t *result, unsigned len)
++{
++    uint8_t payload[255] = { 1, opcode, opcode >> 8 };
++
++    assert(len <= 252);
++    memcpy(payload + 3, result, len);
++    da_event(s, 0x0e, payload, len + 3);
++}
++
++static void da_status(DA14580State *s, uint16_t opcode, uint8_t status)
++{
++    uint8_t payload[] = { status, 1, opcode, opcode >> 8 };
++
++    da_event(s, 0x0f, payload, sizeof(payload));
++}
++
++static void da_gtl(DA14580State *s, uint16_t id, uint16_t dst, uint16_t src,
++                   const uint8_t *payload, unsigned len)
++{
++    uint8_t packet[DA_PACKET_MAX] = { 5 };
++
++    assert(len <= sizeof(packet) - 9);
++    stw_le_p(packet + 1, id);
++    stw_le_p(packet + 3, dst);
++    stw_le_p(packet + 5, src);
++    stw_le_p(packet + 7, len);
++    if (len) {
++        memcpy(packet + 9, payload, len);
++    }
++    da_send(s, packet, len + 9);
++}
++
++static void da_gtl_complete(DA14580State *s, uint8_t operation, uint8_t status)
++{
++    uint8_t data[] = { operation, status };
++
++    da_gtl(s, 0x0d00, s->gtl_host, 0x000d, data, sizeof(data));
++}
++
++static void da_gtl_command(DA14580State *s)
++{
++    uint16_t id = lduw_le_p(s->rx + 1);
++    uint16_t dst = lduw_le_p(s->rx + 3);
++    unsigned len = lduw_le_p(s->rx + 7);
++    uint8_t operation = len ? s->rx[9] : 0;
++
++    s->gtl_host = lduw_le_p(s->rx + 5);
++    if (dst != 0x000d) {
++        /* Unknown tasks must not be reported as successfully executed. */
++        da_gtl(s, 0x0d1d, s->gtl_host, 0x000d, s->rx + 1, 4);
++        return;
++    }
++    if (!len) {
++        da_gtl_complete(s, 0, 0x40);
++        return;
++    }
++    switch (id) {
++    case 0x0d02: /* GAPM_RESET_CMD */
++        s->scanning = s->advertising = false;
++        da_gtl_complete(s, operation, 0);
++        break;
++    case 0x0d03: /* GAPM_CANCEL_CMD */
++        if (s->scanning) {
++            da_gtl_complete(s, s->scan_operation, 0x44);
++        }
++        if (s->advertising) {
++            da_gtl_complete(s, s->adv_operation, 0x44);
++        }
++        s->scanning = s->advertising = false;
++        break;
++    case 0x0d04: /* GAPM_SET_DEV_CONFIG_CMD */
++    case 0x0d05: /* GAPM_SET_CHANNEL_MAP_CMD */
++    case 0x0d0e: /* GAPM_UPDATE_ADVERTISE_DATA_CMD */
++        da_gtl_complete(s, operation, 0);
++        break;
++    case 0x0d06: /* GAPM_GET_DEV_INFO_CMD */
++        if (operation == 3) { /* GAPM_GET_DEV_BDADDR */
++            uint8_t addr[7] = { 0 };
++            memcpy(addr, da_address, 6);
++            da_gtl(s, 0x0d08, s->gtl_host, 0x000d, addr, sizeof(addr));
++            da_gtl_complete(s, operation, 0);
++        } else {
++            da_gtl_complete(s, operation, 0x42);
++        }
++        break;
++    case 0x0d0d: /* GAPM_START_ADVERTISE_CMD: complete on cancel */
++        s->advertising = true;
++        s->adv_operation = operation;
++        break;
++    case 0x0d0f: /* GAPM_START_SCAN_CMD: complete on cancel */
++        s->scanning = true;
++        s->scan_operation = operation;
++        break;
++    default:
++        da_gtl_complete(s, operation, 0x42);
++        break;
++    }
++}
++
++/* The test peer exposes GAP Device Name and Device Information Manufacturer. */
++static void da_acl_reply(DA14580State *s, const uint8_t *att, unsigned len)
++{
++    uint8_t packet[128] = { 2, 0x40, 0x20 };
++
++    stw_le_p(packet + 3, len + 4);
++    stw_le_p(packet + 5, len);
++    stw_le_p(packet + 7, 4);
++    memcpy(packet + 9, att, len);
++    da_send(s, packet, len + 9);
++}
++
++static void da_att(DA14580State *s, const uint8_t *p, unsigned len)
++{
++    uint8_t response[64] = { 1, len ? p[0] : 0, 0, 0, 6 };
++    unsigned n = 5;
++    uint16_t start = len >= 3 ? lduw_le_p(p + 1) : 0;
++    uint16_t end = len >= 5 ? lduw_le_p(p + 3) : 0;
++    uint16_t type = len >= 7 ? lduw_le_p(p + 5) : 0;
++
++    stw_le_p(response + 2, start);
++    if (!len) {
++        return;
++    }
++    switch (p[0]) {
++    case 2: /* Exchange MTU */
++        if (len == 3) {
++            response[0] = 3;
++            stw_le_p(response + 1, 23);
++            n = 3;
++        }
++        break;
++    case 0x10: /* Read By Group Type */
++        if (len == 7 && type == 0x2800) {
++            response[0] = 0x11;
++            response[1] = 6;
++            n = 2;
++            for (unsigned h = 1; h <= 6; h += 5) {
++                if (start <= h && end >= h) {
++                    stw_le_p(response + n, h);
++                    stw_le_p(response + n + 2, h + (h == 1 ? 4 : 2));
++                    stw_le_p(response + n + 4, h == 1 ? 0x1800 : 0x180a);
++                    n += 6;
++                }
++            }
++            if (n == 2) {
++                response[0] = 1;
++                response[1] = p[0];
++                stw_le_p(response + 2, start);
++                response[4] = 0x0a;
++                n = 5;
++            }
++        } else {
++            response[4] = type == 0x2801 ? 0x0a : 0x10;
++        }
++        break;
++    case 8: /* Read By Type: characteristic declarations */
++        if (len == 7 && type == 0x2803) {
++            response[0] = 9;
++            response[1] = 7;
++            n = 2;
++            static const uint16_t handles[] = { 2, 4, 7 };
++            static const uint16_t uuids[] = { 0x2a00, 0x2a01, 0x2a29 };
++            for (unsigned i = 0; i < ARRAY_SIZE(handles); i++) {
++                uint16_t h = handles[i];
++                if (start <= h && end >= h) {
++                    stw_le_p(response + n, h);
++                    response[n + 2] = 2; /* read */
++                    stw_le_p(response + n + 3, h + 1);
++                    stw_le_p(response + n + 5, uuids[i]);
++                    n += 7;
++                }
++            }
++            if (n == 2) {
++                response[0] = 1;
++                response[1] = p[0];
++                stw_le_p(response + 2, start);
++                response[4] = 0x0a;
++                n = 5;
++            }
++        } else if (len == 7 &&
++                   ((type == 0x2a00 && start <= 3 && end >= 3) ||
++                    (type == 0x2a01 && start <= 5 && end >= 5))) {
++            response[0] = 9;
++            response[1] = type == 0x2a00 ? sizeof(peer_name) + 1 : 4;
++            stw_le_p(response + 2, type == 0x2a00 ? 3 : 5);
++            if (type == 0x2a00) {
++                memcpy(response + 4, peer_name, sizeof(peer_name) - 1);
++            } else {
++                stw_le_p(response + 4, 0);
++            }
++            n = response[1] + 2;
++        } else {
++            response[4] = 0x0a;
++        }
++        break;
++    case 0x0a: /* Read */
++        if (len == 3 && (start == 3 || start == 8)) {
++            const uint8_t *value = start == 3 ? peer_name : (uint8_t *)"QEMU";
++            unsigned size = start == 3 ? sizeof(peer_name) - 1 : 4;
++            response[0] = 0x0b;
++            memcpy(response + 1, value, size);
++            n = size + 1;
++        } else if (len == 3 && start == 5) {
++            response[0] = 0x0b;
++            stw_le_p(response + 1, 0);
++            n = 3;
++        } else {
++            response[4] = 1; /* invalid handle */
++        }
++        break;
++    case 4: /* Find Information: no descriptors */
++        response[4] = 0x0a;
++        break;
++    default:
++        if (p[0] & 0x40) { /* ATT commands have no response */
++            return;
++        }
++        break;
++    }
++    da_acl_reply(s, response, n);
++}
++
++static void da_hci_command(DA14580State *s)
++{
++    uint16_t opcode = lduw_le_p(s->rx + 1);
++    unsigned len = s->rx[3], n = 1;
++    uint8_t *p = s->rx + 4;
++    uint8_t result[65] = { 0 };
++    int expected = -1;
++
++    switch (opcode) {
++    case 0x0c03: /* Reset */
++        expected = 0;
++        if (!len) {
++            s->scanning = s->advertising = s->connected = false;
++        }
++        break;
++    case 0x1001: /* Read Local Version */
++        expected = 0;
++        result[1] = 6; /* Bluetooth 4.0 */
++        stw_le_p(result + 2, 0x0580);
++        result[4] = 6;
++        stw_le_p(result + 5, 0xffff); /* synthetic firmware */
++        stw_le_p(result + 7, 1);
++        n = 9;
++        break;
++    case 0x1002: /* Read Local Supported Commands */
++        expected = 0;
++        result[1] = 0x20;  /* Disconnect */
++        result[6] = 0xc0;  /* Set Event Mask, Reset */
++        result[15] = 0xb8; /* local version, commands, features, buffer */
++        result[16] = 0x02; /* BD_ADDR */
++        result[26] = 0xf7; /* LE event mask, buffer, features, advertising */
++        result[27] = 0xdf; /* advertising data, scan, connection */
++        result[28] = 0xa4; /* connection update, remote features, Rand */
++        result[29] = 0x08; /* LE supported states */
++        n = 65;
++        break;
++    case 0x1003: /* Read Local Supported Features */
++        expected = 0;
++        result[5] = 0x60; /* LE, BR/EDR not supported */
++        n = 9;
++        break;
++    case 0x1005: /* Read Buffer Size */
++        expected = 0;
++        stw_le_p(result + 1, 27);
++        stw_le_p(result + 4, 8);
++        n = 8;
++        break;
++    case 0x1009: /* Read BD_ADDR */
++        expected = 0;
++        memcpy(result + 1, da_address, 6);
++        n = 7;
++        break;
++    case 0x0c01: /* Set Event Mask */
++    case 0x2001: /* LE Set Event Mask */
++        expected = 8;
++        break;
++    case 0x2002: /* LE Read Buffer Size */
++        expected = 0;
++        stw_le_p(result + 1, 27);
++        result[3] = 8;
++        n = 4;
++        break;
++    case 0x2003: /* LE Read Local Supported Features */
++        expected = 0;
++        n = 9;
++        break;
++    case 0x2005: /* LE Set Random Address */
++        expected = 6;
++        break;
++    case 0x2006: /* LE Set Advertising Parameters */
++        expected = 15;
++        break;
++    case 0x2007: /* LE Read Advertising Channel TX Power */
++        expected = 0;
++        n = 2;
++        break;
++    case 0x2008: /* LE Set Advertising Data */
++    case 0x2009: /* LE Set Scan Response Data */
++        expected = 32;
++        if (len && p[0] > 31) {
++            result[0] = 0x12;
++        }
++        break;
++    case 0x200a: /* LE Set Advertising Enable */
++        expected = 1;
++        if (len == 1 && p[0] <= 1) {
++            s->advertising = p[0];
++        } else {
++            result[0] = 0x12;
++        }
++        break;
++    case 0x200b: /* LE Set Scan Parameters */
++        expected = 7;
++        if (len == 7) {
++            s->active_scan = p[0] == 1;
++        }
++        break;
++    case 0x200c: /* LE Set Scan Enable */
++        expected = 2;
++        if (len == 2 && p[0] <= 1 && p[1] <= 1) {
++            s->scanning = p[0];
++            s->next_report = 0;
++        } else {
++            result[0] = 0x12;
++        }
++        break;
++    case 0x200d: /* LE Create Connection */
++        if (len != 25) {
++            da_status(s, opcode, 0x12);
++        } else if (!s->peer_present || memcmp(p + 6, peer_address, 6)) {
++            da_status(s, opcode, 0x0c);
++        } else {
++            uint8_t event[19] = { 1, 0, 0x40, 0, 0, 0 };
++            memcpy(event + 6, peer_address, 6);
++            stw_le_p(event + 12, 24);
++            stw_le_p(event + 16, 200);
++            s->connected = true;
++            s->scanning = false;
++            da_status(s, opcode, 0);
++            da_event(s, 0x3e, event, sizeof(event));
++        }
++        return;
++    case 0x0406: /* Disconnect */
++        if (len != 3 || lduw_le_p(p) != 0x40 || !s->connected) {
++            da_status(s, opcode, len == 3 ? 2 : 0x12);
++        } else {
++            uint8_t event[] = { 0, 0x40, 0, p[2] };
++            s->connected = false;
++            da_status(s, opcode, 0);
++            da_event(s, 5, event, sizeof(event));
++        }
++        return;
++    case 0x041d: /* Read Remote Version Information */
++        if (len != 2 || !s->connected || lduw_le_p(p) != 0x40) {
++            da_status(s, opcode, len == 2 ? 2 : 0x12);
++        } else {
++            uint8_t event[] = { 0, 0x40, 0, 6, 0xff, 0xff, 1, 0 };
++            da_status(s, opcode, 0);
++            da_event(s, 0x0c, event, sizeof(event));
++        }
++        return;
++    case 0x2016: /* LE Read Remote Features */
++        if (len != 2 || !s->connected || lduw_le_p(p) != 0x40) {
++            da_status(s, opcode, len == 2 ? 2 : 0x12);
++        } else {
++            uint8_t event[12] = { 4, 0, 0x40, 0 };
++            da_status(s, opcode, 0);
++            da_event(s, 0x3e, event, sizeof(event));
++        }
++        return;
++    case 0x2013: /* LE Connection Update */
++        if (len != 14 || !s->connected || lduw_le_p(p) != 0x40) {
++            da_status(s, opcode, len == 14 ? 2 : 0x12);
++        } else {
++            uint8_t event[10] = { 3, 0, 0x40, 0 };
++            memcpy(event + 4, p + 2, 2);
++            memcpy(event + 6, p + 6, 4);
++            da_status(s, opcode, 0);
++            da_event(s, 0x3e, event, sizeof(event));
++        }
++        return;
++    case 0x201c: /* LE Read Supported States */
++        expected = 0;
++        result[1] = 0xff; /* advertising, scanning, initiating, central */
++        n = 9;
++        break;
++    case 0x200f: /* LE Read Filter Accept List Size */
++        expected = 0;
++        n = 2; /* zero entries supported */
++        break;
++    case 0x2010: /* LE Clear Filter Accept List */
++        expected = 0;
++        break;
++    case 0x2018: /* LE Rand */
++        expected = 0;
++        qemu_guest_getrandom_nofail(result + 1, 8);
++        n = 9;
++        break;
++    case 0x1405: /* Read RSSI */
++        expected = 2;
++        stw_le_p(result + 1, 0x40);
++        result[3] = (uint8_t)-45;
++        result[0] = s->connected && len == 2 && lduw_le_p(p) == 0x40 ? 0 : 2;
++        n = 4;
++        break;
++    default:
++        result[0] = 1; /* Unknown HCI Command */
++        break;
++    }
++    if (expected >= 0 && len != expected) {
++        result[0] = 0x12; /* Invalid HCI Command Parameters */
++        n = 1;
++    }
++    da_complete(s, opcode, result, n);
++}
++
++static void da_running_byte(DA14580State *s, uint8_t byte)
++{
++    unsigned header, total;
++
++    if (!s->rx_used && byte != (s->hci ? 1 : 5) &&
++        !(s->hci && byte == 2)) {
++        return;
++    }
++    s->rx[s->rx_used++] = byte;
++    header = !s->hci ? 9 : s->rx[0] == 2 ? 5 : 4;
++    if (s->rx_used < header) {
++        return;
++    }
++    total = header + (!s->hci ? lduw_le_p(s->rx + 7) :
++                     s->rx[0] == 2 ? lduw_le_p(s->rx + 3) : s->rx[3]);
++    if (total > sizeof(s->rx)) {
++        s->rx_used = 0;
++    } else if (s->rx_used == total) {
++        if (!s->hci) {
++            da_gtl_command(s);
++        } else if (s->rx[0] == 1) {
++            da_hci_command(s);
++        } else if (s->connected && total >= 9 &&
++                   (lduw_le_p(s->rx + 1) & 0xfff) == 0x40) {
++            uint8_t done[] = { 1, 0x40, 0, 1, 0 };
++            /* A full ATT SDU fits the advertised 27-byte ACL buffer. */
++            if (lduw_le_p(s->rx + 7) == 4 &&
++                lduw_le_p(s->rx + 5) == total - 9) {
++                da_att(s, s->rx + 9, total - 9);
++            }
++            da_event(s, 0x13, done, sizeof(done));
++        }
++        s->rx_used = 0;
++    }
++}
++
++static int da_write(Chardev *chr, const uint8_t *buf, int len)
++{
++    DA14580State *s = DA14580(chr);
++
++    for (int i = 0; i < len; i++) {
++        uint8_t byte = buf[i];
++        if (s->reset) {
++            continue;
++        }
++        switch (s->boot_state) {
++        case DA_SOH:
++            if (byte == 1) {
++                s->tx_used = 0;
++                s->boot_state = DA_LEN_LO;
++            }
++            break;
++        case DA_LEN_LO:
++            s->image_len = byte;
++            s->boot_state = DA_LEN_HI;
++            break;
++        case DA_LEN_HI: {
++            uint8_t ack = 6;
++            s->image_len |= byte << 8;
++            s->image_left = s->image_len;
++            s->checksum = 0;
++            s->boot_state = s->image_len ? DA_IMAGE : DA_SOH;
++            if (!s->image_len) {
++                ack = 0x15;
++            }
++            da_send(s, &ack, 1);
++            break;
++        }
++        case DA_IMAGE:
++            s->checksum ^= byte;
++            if (!--s->image_left) {
++                s->boot_state = DA_ACK;
++                da_send(s, &s->checksum, 1);
++            }
++            break;
++        case DA_ACK:
++            s->boot_state = byte == 6 ? DA_RUNNING : DA_SOH;
++            if (byte == 6 && !s->hci) {
++                da_gtl(s, 0x0d01, 0x0010, 0x000d, NULL, 0);
++            } else if (byte != 6) {
++                da_schedule(s, 1);
++            }
++            break;
++        case DA_RUNNING:
++            da_running_byte(s, byte);
++            break;
++        }
++    }
++    return len;
++}
++
++static void da_tick(void *opaque)
++{
++    DA14580State *s = opaque;
++    Chardev *chr = CHARDEV(s);
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    int n;
++
++    if (s->reset) {
++        return;
++    }
++    if (s->boot_state == DA_SOH && !s->tx_used) {
++        s->tx[s->tx_used++] = 2; /* UART boot STX */
++    }
++    if (s->hci && s->scanning && s->peer_present && now >= s->next_report) {
++        uint8_t report[64] = { 2, 1, 0, 0 };
++        unsigned size = sizeof(peer_name) - 1;
++        memcpy(report + 4, peer_address, 6);
++        report[10] = size + 5;
++        report[11] = 2;
++        report[12] = 1;
++        report[13] = 6;
++        report[14] = size + 1;
++        report[15] = 9;
++        memcpy(report + 16, peer_name, size);
++        report[16 + size] = (uint8_t)-45;
++        s->next_report = now + 1000;
++        da_event(s, 0x3e, report, 17 + size);
++        if (s->active_scan) {
++            report[2] = 4; /* SCAN_RSP completes active-scan observations. */
++            da_event(s, 0x3e, report, 17 + size);
++        }
++    }
++    n = MIN(s->tx_used, qemu_chr_be_can_write(chr));
++    if (n > 0) {
++        /* Remove before dispatch: the frontend can recursively accept input. */
++        uint8_t packet[DA_QUEUE_MAX];
++        memcpy(packet, s->tx, n);
++        memmove(s->tx, s->tx + n, s->tx_used - n);
++        s->tx_used -= n;
++        qemu_chr_be_write(chr, packet, n);
++    }
++    if (s->tx_used || s->boot_state == DA_SOH || s->scanning) {
++        da_schedule(s, s->tx_used ? 1 : 100);
++    }
++}
++
++void da14580_reset_gpio(void *opaque, int line, int level)
++{
++    DA14580State *s = DA14580(opaque);
++
++    if (s->reset == !!level) {
++        return;
++    }
++    s->reset = !!level;
++    s->rx_used = s->tx_used = 0;
++    s->scanning = s->advertising = s->connected = false;
++    s->boot_state = s->hci ? DA_RUNNING : DA_SOH;
++    if (s->reset) {
++        timer_del(s->timer);
++    } else {
++        da_schedule(s, 1);
++    }
++}
++
++static void da_system_reset(void *opaque)
++{
++    da14580_reset_gpio(opaque, 0, 1);
++    da14580_reset_gpio(opaque, 0, 0);
++}
++
++static void da_accept(Chardev *chr)
++{
++    da_schedule(DA14580(chr), 1);
++}
++
++static void da_set_hci(Object *obj, bool value, Error **errp)
++{
++    DA14580State *s = DA14580(obj);
++
++    s->hci = value;
++    da_system_reset(s);
++}
++
++static bool da_get_hci(Object *obj, Error **errp)
++{
++    return DA14580(obj)->hci;
++}
++
++static void da_set_peer(Object *obj, bool value, Error **errp)
++{
++    DA14580State *s = DA14580(obj);
++
++    s->peer_present = value;
++    s->next_report = 0;
++    da_schedule(s, 1);
++}
++
++static bool da_get_peer(Object *obj, Error **errp)
++{
++    return DA14580(obj)->peer_present;
++}
++
++static void da_init(Object *obj)
++{
++    DA14580State *s = DA14580(obj);
++
++    s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, da_tick, s);
++    object_property_add_bool(obj, "hci-test-firmware", da_get_hci, da_set_hci);
++    object_property_add_bool(obj, "peer-present", da_get_peer, da_set_peer);
++    qemu_register_reset(da_system_reset, s);
++    da_schedule(s, 1);
++}
++
++static void da_finalize(Object *obj)
++{
++    DA14580State *s = DA14580(obj);
++
++    qemu_unregister_reset(da_system_reset, s);
++    timer_free(s->timer);
++}
++
++static bool da_open(Chardev *chr, ChardevBackend *backend, Error **errp)
++{
++    qemu_chr_be_event(chr, CHR_EVENT_OPENED);
++    return true;
++}
++
++static void da_class_init(ObjectClass *oc, const void *data)
++{
++    ChardevClass *cc = CHARDEV_CLASS(oc);
++
++    cc->internal = true;
++    cc->chr_open = da_open;
++    cc->chr_write = da_write;
++    cc->chr_accept_input = da_accept;
++    cc->chr_update_read_handler = da_accept;
++}
++
++static const TypeInfo da_type = {
++    .name = TYPE_DA14580,
++    .parent = TYPE_CHARDEV,
++    .instance_size = sizeof(DA14580State),
++    .instance_init = da_init,
++    .instance_finalize = da_finalize,
++    .class_init = da_class_init,
++};
++
++static void da_register(void)
++{
++    type_register_static(&da_type);
++}
++type_init(da_register)
+--- /dev/null
++++ b/include/chardev/char-da14580.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef CHAR_DA14580_H
++#define CHAR_DA14580_H
++
++void da14580_reset_gpio(void *opaque, int line, int level);
++
++#endif
