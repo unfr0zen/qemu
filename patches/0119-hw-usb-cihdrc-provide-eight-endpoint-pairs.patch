@@ -1,0 +1,28 @@
+From: Will <will@localhost>
+Subject: [PATCH] hw/usb: cihdrc: provide eight endpoint pairs
+
+Expose enough endpoints for a composite ACM and ECM gadget. Expand the
+endpoint register mask together with the descriptor state arrays.
+
+--- a/include/hw/usb/cihdrc-udc.h
++++ b/include/hw/usb/cihdrc-udc.h
+@@ -9,7 +9,7 @@
+ #define TYPE_CIHDRC_UDC "cihdrc-udc"
+ OBJECT_DECLARE_SIMPLE_TYPE(CIHDRCUDCState, CIHDRC_UDC)
+ 
+-#define CIHDRC_EP_COUNT 4
++#define CIHDRC_EP_COUNT 8
+ #define CIHDRC_MAX_DATA 65536
+ 
+ struct CIHDRCUDCState {
+--- a/hw/usb/cihdrc-udc.c
++++ b/hw/usb/cihdrc-udc.c
+@@ -40,7 +40,7 @@
+ #define STS_PCI         BIT(2)
+ #define STS_URI         BIT(6)
+ #define STS_MASK        0x147
+-#define EP_MASK         0x000f000f
++#define EP_MASK         0x00ff00ff
+ #define PORT_W1C        (BIT(1) | BIT(3) | BIT(5))
+ #define PORT_RESET      BIT(8)
+ #define PORT_HSP        BIT(9)
