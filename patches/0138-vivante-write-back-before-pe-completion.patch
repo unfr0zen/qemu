@@ -1,0 +1,38 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: write back surfaces before pe completion
+
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -108,6 +108,7 @@
+ #define STATE_PS_UNIFORMS       0x1c00
+ #define STATE_SH_UNIFORMS       0xc000
+ #define STATE_EVENT             0x0e01
++#define STATE_EVENT_FROM_PE     (1u << 6)
+ 
+ /* Resolve engine (RS) states */
+ #define RS_KICKER               0x0580
+@@ -184,8 +185,13 @@
+     qemu_set_irq(s->irq, !!(s->intr_pending & s->regs[AQ_INTR_ENABLE / 4]));
+ }
+ 
+-static void viv_event(VivGCState *s, uint32_t id)
+-{
++static void viv_event(VivGCState *s, uint32_t value)
++{
++    uint32_t id = value & 31;
++
++    if (value & STATE_EVENT_FROM_PE) {
++        viv3d_flush(s);
++    }
+     VIV_TRACE(s, "event %u", id);
+     s->intr_pending |= 1u << (id & 31);
+     viv_update_irq(s);
+@@ -670,7 +676,7 @@
+         s->states[STATE_SH_UNIFORMS + ((base * 4 + offset) & 0xfff)] = val;
+     }
+     if (reg == STATE_EVENT) {
+-        viv_event(s, val & 0x1f);
++        viv_event(s, val);
+     } else if (reg == RS_KICKER) {
+         viv_rs_kick(s);
+     }
