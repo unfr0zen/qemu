@@ -1,0 +1,35 @@
+From: Will
+Subject: [PATCH] ui: batch ppm screenshot writes
+
+--- a/ui/ui-qmp-cmds.c
++++ b/ui/ui-qmp-cmds.c
+@@ -296,6 +296,8 @@
+     g_autoptr(Object) ioc = OBJECT(qio_channel_file_new_fd(fd));
+     g_autofree char *header = NULL;
+     g_autoptr(pixman_image_t) linebuf = NULL;
++    size_t row_bytes = (size_t)width * 3;
++    g_autofree uint8_t *pixels = g_malloc_n(row_bytes, height);
+     int y;
+ 
+     trace_ppm_save(fd, image);
+@@ -309,14 +311,12 @@
+     linebuf = qemu_pixman_linebuf_create(PIXMAN_BE_r8g8b8, width);
+     for (y = 0; y < height; y++) {
+         qemu_pixman_linebuf_fill(linebuf, image, width, 0, y);
+-        if (qio_channel_write_all(QIO_CHANNEL(ioc),
+-                                  (char *)pixman_image_get_data(linebuf),
+-                                  pixman_image_get_stride(linebuf), errp) < 0) {
+-            return false;
+-        }
+-    }
+-
+-    return true;
++        memcpy(pixels + y * row_bytes, pixman_image_get_data(linebuf),
++               row_bytes);
++    }
++
++    return qio_channel_write_all(QIO_CHANNEL(ioc), (char *)pixels,
++                                 row_bytes * height, errp) == 0;
+ }
+ 
+ /* Safety: coroutine-only, concurrent-coroutine safe, main thread only */
