@@ -409,7 +409,7 @@
     flushKeys();
   }
   term.onData((d) => {
-    if (/^\x1b\[8;\d+;\d+t$/.test(d) &&
+    if (/^\x1b\[(?:\??\d+(?:;\d+)*[Rnt]|[?>=][\d;]*c)$/.test(d) &&
         (replaying || !document.hasFocus())) return;
     keys += d; flushKeys();
   });

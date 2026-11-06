@@ -642,3 +642,7 @@ synthetic, read-only OCOTP calibration word. Its
 `die-temperature-millicelsius` property defaults to 45000. Mainline Linux
 can read the result through thermal and hwmon. Thermal alarm interrupts
 and authentic HAB fuse contents are not modelled by this calibration shadow.
+
+The GC400 aliases its single-stream and numbered stream-zero registers,
+and the legacy VS/PS uniform windows map into unified uniform storage.
+Mainline Etnaviv can submit vertex and fragment shader draws through Mesa.

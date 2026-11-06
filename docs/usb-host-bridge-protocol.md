@@ -104,3 +104,8 @@ It prints JSON observations and leaves the cable plugged in.
 
 Unprimed endpoints return NAK without closing the bridge. The host
 serializes control transfers on EP0.
+
+ChipIdea `TOKENIN` and `TOKENOUT` commands transfer at most one endpoint
+maximum packet. A short IN packet terminates its transfer descriptor even
+when completion interrupts are suppressed, keeping queued Ethernet frames
+separate. Hosts allow attachment debounce and reset recovery before SETUP.

@@ -1,0 +1,55 @@
+Subject: [PATCH] hw/display: alias gc400 uniform and vertex windows
+
+diff --git a/hw/display/vivante_gc.c b/hw/display/vivante_gc.c
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -98,6 +98,15 @@
+ #define CMD_CHIP_SELECT         0x0d
+ #define CMD_WAIT_FENCE          0x0f
+ 
++#define STATE_VERTEX_BASE       0x0193
++#define STATE_VERTEX_CONTROL    0x0194
++#define STATE_VERTEX0_BASE      0x01a0
++#define STATE_VERTEX0_CONTROL   0x01a8
++#define STATE_VS_UNIFORM_BASE   0x0219
++#define STATE_PS_UNIFORM_BASE   0x0409
++#define STATE_VS_UNIFORMS       0x1400
++#define STATE_PS_UNIFORMS       0x1c00
++#define STATE_SH_UNIFORMS       0xc000
+ #define STATE_EVENT             0x0e01
+ 
+ /* Resolve engine (RS) states */
+@@ -617,6 +626,24 @@
+         }
+     }
+     s->states[reg] = val;
++    /* Both register windows address vertex stream zero. */
++    if (reg == STATE_VERTEX_BASE || reg == STATE_VERTEX0_BASE) {
++        s->states[reg == STATE_VERTEX_BASE ? STATE_VERTEX0_BASE :
++                                           STATE_VERTEX_BASE] = val;
++    } else if (reg == STATE_VERTEX_CONTROL || reg == STATE_VERTEX0_CONTROL) {
++        s->states[reg == STATE_VERTEX_CONTROL ? STATE_VERTEX0_CONTROL :
++                                              STATE_VERTEX_CONTROL] = val;
++    }
++    /* Legacy stage windows alias their base in unified uniform storage. */
++    if ((reg >= STATE_VS_UNIFORMS && reg < STATE_VS_UNIFORMS + 0x400) ||
++        (reg >= STATE_PS_UNIFORMS && reg < STATE_PS_UNIFORMS + 0x400)) {
++        bool ps = reg >= STATE_PS_UNIFORMS;
++        uint32_t base = s->states[ps ? STATE_PS_UNIFORM_BASE :
++                                     STATE_VS_UNIFORM_BASE] & 0x3ff;
++        uint32_t offset = reg - (ps ? STATE_PS_UNIFORMS : STATE_VS_UNIFORMS);
++
++        s->states[STATE_SH_UNIFORMS + ((base * 4 + offset) & 0xfff)] = val;
++    }
+     if (reg == STATE_EVENT) {
+         viv_event(s, val & 0x1f);
+     } else if (reg == RS_KICKER) {
+@@ -839,6 +866,8 @@
+     viv_soft_reset(s);
+     memset(s->regs, 0, sizeof(s->regs));
+     memset(s->states, 0, VIV_NUM_STATES * sizeof(uint32_t));
++    /* Keep legacy pixel uniforms separate from the vertex window. */
++    s->states[STATE_PS_UNIFORM_BASE] = 256;
+     for (size_t i = 0; i < ARRAY_SIZE(viv_identity); i++) {
+         s->regs[viv_identity[i].off / 4] = viv_identity[i].val;
+     }
