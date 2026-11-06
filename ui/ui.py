@@ -796,6 +796,8 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
             frames, frame = screen.subscribe()
             chunks, chunk = log.subscribe_raw() if log else (None, "")
             try:
+                self.wfile.write(f"event: console-backlog\ndata: {json.dumps(chunk)}\n\n".encode())
+                chunk = ""
                 state = board.snapshot()
                 heartbeat = time.monotonic()
                 while True:

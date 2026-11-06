@@ -390,6 +390,7 @@
   /* ---------- console: the guest's serial, as a terminal ---------- */
   const term = new Terminal({
     fontSize: 12, fontFamily: "ui-monospace, Menlo, monospace", scrollback: 5000,
+    windowOptions: { getWinSizeChars: true },
     cursorBlink: true, theme: { background: "#1d1e20", foreground: "#d7d4cc" },
   });
   const fit = new FitAddon.FitAddon();
@@ -398,7 +399,7 @@
   fit.fit();
   new ResizeObserver(() => fit.fit()).observe($("term"));
   // Keystrokes go out in order, batched while a request is in flight.
-  let keys = "", sending = false;
+  let keys = "", sending = false, replaying = false;
   async function flushKeys() {
     if (sending || !keys) return;
     sending = true;
@@ -407,10 +408,20 @@
     sending = false;
     flushKeys();
   }
-  term.onData((d) => { keys += d; flushKeys(); });
+  term.onData((d) => {
+    if (/^\x1b\[8;\d+;\d+t$/.test(d) &&
+        (replaying || !document.hasFocus())) return;
+    keys += d; flushKeys();
+  });
   function openLogs(es) {
     let got = false;
     es.addEventListener("open", () => { got = false; $("logState").textContent = "live"; });
+    es.addEventListener("console-backlog", (e) => {
+      got = true;
+      term.reset();
+      replaying = true;
+      term.write(JSON.parse(e.data), () => { replaying = false; });
+    });
     es.addEventListener("console", (e) => {
       if (!got) { got = true; term.reset(); }     // the backlog comes first
       term.write(JSON.parse(e.data));
