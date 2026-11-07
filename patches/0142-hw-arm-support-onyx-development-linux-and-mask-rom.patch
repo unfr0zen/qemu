@@ -1,0 +1,394 @@
+From 1c3713bb0c96f3adfc7217908cdbecf872c38441 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:47:36 -0500
+Subject: [PATCH] hw/arm: support onyx development linux and mask rom boot
+
+---
+ hw/arm/Kconfig              |   7 ++
+ hw/arm/fsl-imx6ul.c         |  44 +++++++++----
+ hw/arm/meson.build          |   4 +-
+ hw/arm/onyx.c               | 128 ++++++++++++++++++++++++++++++++++--
+ include/hw/arm/fsl-imx6ul.h |  10 +++
+ 5 files changed, 174 insertions(+), 19 deletions(-)
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 29375a7..9b763e6 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -198,11 +198,15 @@ config SABRELITE
+     select FSL_IMX6
+     select SSI_M25P80
+ 
++config NEST_BOARD
++    bool
++
+ config FLINTSTONE
+     bool
+     default y
+     depends on TCG && ARM
+     select FSL_IMX6SX
++    select NEST_BOARD
+     select BCM43341
+     select LM3695
+     select EM35X_NCP
+@@ -212,6 +216,8 @@ config ONYX
+     default y
+     depends on TCG && ARM
+     select FSL_IMX6UL
++    select NEST_BOARD
++    select LM3695
+ 
+ config J49
+     bool
+@@ -676,6 +682,7 @@ config ARM_SMMUV3
+ 
+ config FSL_IMX6UL
+     bool
++    select IMX_LCDIF
+     default y
+     depends on TCG && ARM
+     imply I2C_DEVICES
+diff --git a/hw/arm/fsl-imx6ul.c b/hw/arm/fsl-imx6ul.c
+index 8d56d16..f426ec1 100644
+--- a/hw/arm/fsl-imx6ul.c
++++ b/hw/arm/fsl-imx6ul.c
+@@ -49,9 +49,13 @@ static void fsl_imx6ul_init(Object *obj)
+      */
+     object_initialize_child(obj, "ccm", &s->ccm, TYPE_IMX6UL_CCM);
+     object_initialize_child(obj, "iomuxc", &s->iomuxc, TYPE_IMX6UL_IOMUXC);
++    object_initialize_child(obj, "sdma", &s->sdma, TYPE_IMX6_SDMA);
+     object_initialize_child(obj, "mmdc", &s->mmdc, TYPE_IMX6_MMDC);
+     object_initialize_child(obj, "gpmi", &s->gpmi, TYPE_IMX_GPMI_NAND);
+ 
++    object_initialize_child(obj, "usbmisc", &s->usbmisc, TYPE_IMX_USBMISC);
++    object_initialize_child(obj, "lcdif", &s->lcdif, TYPE_IMX_LCDIF);
++
+     /*
+      * SRC
+      */
+@@ -228,8 +232,9 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+     /*
+      * USBMISC
+      */
+-    create_unimplemented_device("a7mpcore-usbmisc", FSL_IMX6UL_USBO2_USBMISC_ADDR,
+-                                FSL_IMX6UL_USBO2_USBMISC_SIZE);
++    sysbus_realize(SYS_BUS_DEVICE(&s->usbmisc), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->usbmisc), 0,
++                    FSL_IMX6UL_USBO2_USBMISC_ADDR);
+ 
+     /*
+      * GPTs
+@@ -522,10 +527,21 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+             FSL_IMX6UL_USB2_IRQ,
+         };
+ 
+-        sysbus_realize(SYS_BUS_DEVICE(&s->usb[i]), &error_abort);
+-        sysbus_mmio_map(SYS_BUS_DEVICE(&s->usb[i]), 0,
+-                        FSL_IMX6UL_USB02_USBn_ADDR[i]);
+-        sysbus_connect_irq(SYS_BUS_DEVICE(&s->usb[i]), 0,
++        if (i == 0 && s->usb0_peripheral) {
++            object_unparent(OBJECT(&s->usb[0]));
++            object_initialize_child(OBJECT(s), "usb0-udc", &s->usb0_udc,
++                                    TYPE_CIHDRC_UDC);
++        }
++        SysBusDevice *usb = i == 0 && s->usb0_peripheral ?
++                            SYS_BUS_DEVICE(&s->usb0_udc) :
++                            SYS_BUS_DEVICE(&s->usb[i]);
++
++        if (i == 0 && s->usb0_peripheral && s->usb0_hostchar) {
++            qdev_prop_set_string(DEVICE(usb), "hostchar", s->usb0_hostchar);
++        }
++        sysbus_realize(usb, &error_abort);
++        sysbus_mmio_map(usb, 0, FSL_IMX6UL_USB02_USBn_ADDR[i]);
++        sysbus_connect_irq(usb, 0,
+                            qdev_get_gpio_in(gic, FSL_IMX6UL_USBn_IRQ[i]));
+     }
+ 
+@@ -587,8 +603,10 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+     /*
+      * SDMA
+      */
+-    create_unimplemented_device("sdma", FSL_IMX6UL_SDMA_ADDR,
+-                                FSL_IMX6UL_SDMA_SIZE);
++    sysbus_realize(SYS_BUS_DEVICE(&s->sdma), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdma), 0, FSL_IMX6UL_SDMA_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdma), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6UL_SDMA_IRQ));
+ 
+     /*
+      * SAIs (Audio SSI (Synchronous Serial Interface))
+@@ -670,8 +688,10 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+     /*
+      * LCD
+      */
+-    create_unimplemented_device("lcdif", FSL_IMX6UL_LCDIF_ADDR,
+-                                FSL_IMX6UL_LCDIF_SIZE);
++    sysbus_realize(SYS_BUS_DEVICE(&s->lcdif), &error_abort);
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->lcdif), 0, FSL_IMX6UL_LCDIF_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->lcdif), 0,
++                       qdev_get_gpio_in(gic, FSL_IMX6UL_LCDIF_IRQ));
+ 
+     /*
+      * CSU
+@@ -696,7 +716,7 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+     /*
+      * CAAM memory
+      */
+-    memory_region_init_rom(&s->caam, OBJECT(dev), "imx6ul.caam",
++    memory_region_init_ram(&s->caam, OBJECT(dev), "imx6ul.caam",
+                            FSL_IMX6UL_CAAM_MEM_SIZE, &error_abort);
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6UL_CAAM_MEM_ADDR,
+                                 &s->caam);
+@@ -721,6 +741,8 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+ }
+ 
+ static const Property fsl_imx6ul_properties[] = {
++    DEFINE_PROP_BOOL("usb0-peripheral", FslIMX6ULState, usb0_peripheral, false),
++    DEFINE_PROP_STRING("usb0-hostchar", FslIMX6ULState, usb0_hostchar),
+     DEFINE_PROP_UINT32("fec1-phy-num", FslIMX6ULState, phy_num[0], 0),
+     DEFINE_PROP_UINT32("fec2-phy-num", FslIMX6ULState, phy_num[1], 1),
+     DEFINE_PROP_BOOL("fec1-phy-connected", FslIMX6ULState, phy_connected[0],
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index 32ab35c..a9ebc58 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -42,8 +42,8 @@ arm_common_ss.add(when: 'CONFIG_FSL_IMX6', if_true: files('fsl-imx6.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6SX', if_true: files('fsl-imx6sx.c'))
+ arm_common_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3630.c'))
+ arm_common_ss.add(when: 'CONFIG_J49', if_true: files('j49.c', 'j49_board.c'))
+-arm_common_ss.add(when: 'CONFIG_FLINTSTONE', if_true: files('flintstone.c',
+-                                                            'flintstone_board.c'))
++arm_common_ss.add(when: 'CONFIG_FLINTSTONE', if_true: files('flintstone.c'))
++arm_common_ss.add(when: 'CONFIG_NEST_BOARD', if_true: files('flintstone_board.c'))
+ arm_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files(
+   'aspeed.c',
+   'aspeed_soc_common.c',
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+index 554311b..96b5f14 100644
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -9,6 +9,10 @@
+ #include "qemu/error-report.h"
+ #include "qemu/units.h"
+ #include "hw/arm/fsl-imx6ul.h"
++#include "hw/core/loader.h"
++#include "hw/i2c/i2c.h"
++#include "hw/arm/flintstone_board.h"
++#include "hw/core/irq.h"
+ #include "hw/arm/machines-qom.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/qdev-properties.h"
+@@ -17,6 +21,15 @@
+ #include "system/reset.h"
+ #include "system/qtest.h"
+ 
++#define TYPE_ONYX_MACHINE MACHINE_TYPE_NAME("onyx")
++OBJECT_DECLARE_SIMPLE_TYPE(OnyxMachineState, ONYX_MACHINE)
++
++struct OnyxMachineState {
++    MachineState parent_obj;
++    bool secure_boot;
++    char *boot_rom;
++};
++
+ #define ONYX_RAM_SIZE (128 * MiB)
+ #define ONYX_FW_NAND_OFF 0x100000
+ #define ONYX_FW_IVT_OFF  0x400
+@@ -92,15 +105,21 @@ static void onyx_boot(void *opaque)
+ 
+ static void onyx_reset(MachineState *machine, ResetType type)
+ {
++    FslIMX6ULState *soc = FSL_IMX6UL(
++        object_resolve_path_component(OBJECT(machine), "soc"));
++
+     qemu_devices_reset(type);
+-    if (!qtest_enabled()) {
++    soc->ccm.analog[USB_ANALOG_DIGPROG] = 0x00640002;
++    /* The active-low front button is released at reset. */
++    qemu_set_irq(qdev_get_gpio_in(DEVICE(&soc->gpio[1]), 8), 1);
++    if (!qtest_enabled() && !ONYX_MACHINE(machine)->boot_rom) {
+         onyx_boot(machine);
+     }
+ }
+ 
+ static void onyx_init(MachineState *machine)
+ {
+-    DeviceState *soc;
++    DeviceState *soc, *board;
+     BlockBackend *nand = blk_by_name("nand");
+     uint8_t *fuses;
+ 
+@@ -110,27 +129,109 @@ static void onyx_init(MachineState *machine)
+     }
+     soc = qdev_new(TYPE_FSL_IMX6UL);
+     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
++    qdev_prop_set_bit(soc, "usb0-peripheral", true);
+     if (nand) {
+         qdev_prop_set_drive_err(DEVICE(&FSL_IMX6UL(soc)->gpmi), "drive", nand,
+                                 &error_fatal);
+     }
+     qdev_realize_and_unref(soc, NULL, &error_fatal);
++    board = qdev_new(TYPE_FLINTSTONE_BOARD);
++    object_property_add_child(OBJECT(machine), "board", OBJECT(board));
++    qdev_realize_and_unref(board, NULL, &error_fatal);
++    qdev_connect_gpio_out(board, 0,
++                          qemu_irq_invert(qdev_get_gpio_in(
++                              DEVICE(&FSL_IMX6UL(soc)->gpio[1]), 8)));
++    qdev_connect_gpio_out_named(board, FLINTSTONE_BOARD_DETECT, 0,
++                                qdev_get_gpio_in(
++                                    DEVICE(&FSL_IMX6UL(soc)->gpio[3]), 28));
++    qdev_connect_gpio_out(DEVICE(&FSL_IMX6UL(soc)->gpio[1]), 16,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_WIFI_RESET));
++    qdev_connect_gpio_out(DEVICE(&FSL_IMX6UL(soc)->gpio[1]), 21,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_HALL_ENABLE));
++    qdev_connect_gpio_out(DEVICE(&FSL_IMX6UL(soc)->gpio[1]), 4,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_VBATT_ENABLE));
++    qdev_connect_gpio_out(DEVICE(&FSL_IMX6UL(soc)->gpio[1]), 6,
++                          qdev_get_gpio_in(board,
++                                           FLINTSTONE_BOARD_IN_BEEPER_ENABLE));
++    i2c_slave_create_simple(FSL_IMX6UL(soc)->i2c[1].bus, "lm3695", 0x63);
++    object_property_add_alias(OBJECT(machine), "usb-vbus",
++                              OBJECT(&FSL_IMX6UL(soc)->usb0_udc), "vbus");
++    object_property_add_alias(OBJECT(machine), "usb-connected",
++                              OBJECT(&FSL_IMX6UL(soc)->usb0_udc),
++                              "cable-connected");
+     /* Synthetic identity, closed security configuration and thermal trim. */
+     fuses = memory_region_get_ram_ptr(&FSL_IMX6UL(soc)->ocotp);
+     stl_le_p(fuses + 0x410, 0x00000001);
+     stl_le_p(fuses + 0x420, 0x51454d55);
+-    stl_le_p(fuses + 0x460, 0x00000002);
++    stl_le_p(fuses + 0x460, ONYX_MACHINE(machine)->secure_boot ? 2 : 0);
+     stl_le_p(fuses + 0x4e0, 1500U << 20);
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6UL_MMDC_ADDR,
+                                 machine->ram);
+-    if (!qtest_enabled() && !machine->firmware && !nand) {
++    if (ONYX_MACHINE(machine)->boot_rom) {
++        if (machine->firmware ||
++            get_image_size(ONYX_MACHINE(machine)->boot_rom, &error_fatal) !=
++            FSL_IMX6UL_ROM_SIZE) {
++            error_report("onyx: boot-rom requires a 98304-byte dump "
++                         "and no -bios");
++            exit(1);
++        }
++        if (rom_add_file_fixed(ONYX_MACHINE(machine)->boot_rom, 0, -1) < 0) {
++            error_report("onyx: cannot load boot-rom");
++            exit(1);
++        }
++    }
++    if (!qtest_enabled() && !machine->firmware && !nand &&
++        !ONYX_MACHINE(machine)->boot_rom) {
+         error_report("onyx: supply NAND with -drive if=none,id=nand,file=FILE");
+         exit(1);
+     }
+ }
+ 
+-static void onyx_machine_init(MachineClass *mc)
++static void onyx_instance_init(Object *obj)
++{
++    OnyxMachineState *s = ONYX_MACHINE(obj);
++
++    s->secure_boot = true;
++}
++
++static bool onyx_get_secure_boot(Object *obj, Error **errp)
++{
++    return ONYX_MACHINE(obj)->secure_boot;
++}
++
++static void onyx_set_secure_boot(Object *obj, bool value, Error **errp)
+ {
++    ONYX_MACHINE(obj)->secure_boot = value;
++}
++
++static char *onyx_get_boot_rom(Object *obj, Error **errp)
++{
++    return g_strdup(ONYX_MACHINE(obj)->boot_rom);
++}
++
++static void onyx_set_boot_rom(Object *obj, const char *value, Error **errp)
++{
++    g_free(ONYX_MACHINE(obj)->boot_rom);
++    ONYX_MACHINE(obj)->boot_rom = g_strdup(value);
++}
++
++static void onyx_finalize(Object *obj)
++{
++    g_free(ONYX_MACHINE(obj)->boot_rom);
++}
++
++static void onyx_machine_init(ObjectClass *klass, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(klass);
++    ObjectClass *oc = OBJECT_CLASS(mc);
++
++    object_class_property_add_bool(oc, "secure-boot", onyx_get_secure_boot,
++                                   onyx_set_secure_boot);
++    object_class_property_add_str(oc, "boot-rom", onyx_get_boot_rom,
++                                  onyx_set_boot_rom);
+     mc->desc = "Nest Thermostat E (Onyx, i.MX6UL)";
+     mc->init = onyx_init;
+     mc->reset = onyx_reset;
+@@ -140,4 +241,19 @@ static void onyx_machine_init(MachineClass *mc)
+     mc->default_ram_id = "onyx.ram";
+ }
+ 
+-DEFINE_MACHINE_ARM("onyx", onyx_machine_init)
++static const TypeInfo onyx_machine_type = {
++    .name = TYPE_ONYX_MACHINE,
++    .parent = TYPE_MACHINE,
++    .interfaces = arm_machine_interfaces,
++    .instance_size = sizeof(OnyxMachineState),
++    .instance_init = onyx_instance_init,
++    .instance_finalize = onyx_finalize,
++    .class_init = onyx_machine_init,
++};
++
++static void onyx_register_types(void)
++{
++    type_register_static(&onyx_machine_type);
++}
++
++type_init(onyx_register_types)
+diff --git a/include/hw/arm/fsl-imx6ul.h b/include/hw/arm/fsl-imx6ul.h
+index e5f8228..61944ab 100644
+--- a/include/hw/arm/fsl-imx6ul.h
++++ b/include/hw/arm/fsl-imx6ul.h
+@@ -19,8 +19,12 @@
+ 
+ #include "hw/cpu/a15mpcore.h"
+ #include "hw/misc/imx6ul_ccm.h"
++#include "hw/display/imx_lcdif.h"
++#include "hw/usb/cihdrc-udc.h"
++#include "hw/usb/imx-usbmisc.h"
+ #include "hw/misc/imx6ul_iomuxc.h"
+ #include "hw/misc/imx6_mmdc.h"
++#include "hw/misc/imx6_sdma.h"
+ #include "hw/misc/imx_gpmi_nand.h"
+ #include "hw/misc/imx6_src.h"
+ #include "hw/misc/imx7_snvs.h"
+@@ -78,6 +82,7 @@ struct FslIMX6ULState {
+     IMX6ULCCMState     ccm;
+     IMX6ULIOMUXCState  iomuxc;
+     Imx6MmdcState      mmdc;
++    Imx6SdmaState      sdma;
+     ImxGpmiNandState  gpmi;
+     IMX6SRCState       src;
+     IMX7SNVSState      snvs;
+@@ -90,6 +95,11 @@ struct FslIMX6ULState {
+     IMX2WdtState       wdt[FSL_IMX6UL_NUM_WDTS];
+     IMXUSBPHYState     usbphy[FSL_IMX6UL_NUM_USB_PHYS];
+     ChipideaState      usb[FSL_IMX6UL_NUM_USBS];
++    ImxLcdifState      lcdif;
++    CIHDRCUDCState     usb0_udc;
++    IMXUSBMiscState    usbmisc;
++    bool              usb0_peripheral;
++    char              *usb0_hostchar;
+     MemoryRegion       rom;
+     MemoryRegion       ocotp;
+     MemoryRegion       caam;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -38,10 +38,25 @@ def stop(process):
 
 def launch(args):
     extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
-    command = [args.qemu, "-M", "onyx", "-m", "128M",
+    machine = "onyx" + (",secure-boot=off" if args.open_security else "")
+    if args.boot_rom:
+        machine += ",boot-rom=" + str(Path(args.boot_rom).resolve())
+    command = [args.qemu, "-M", machine, "-m", "128M",
                "-drive", f"if=none,id=nand,format=raw,file={args.nand.replace(',', ',,')},"
                f"snapshot={args.snapshot}", "-nic", "none", "-parallel", "none",
                "-watchdog-action", "none"]
+    usb_socket = REPO / ".qemu" / f"onyx-sdp-{os.getpid()}.sock"
+    if args.sdp_image:
+        if not args.boot_rom:
+            raise ValueError("--sdp-image requires --boot-rom")
+    usb_socket.parent.mkdir(exist_ok=True)
+    usb_socket.unlink(missing_ok=True)
+    command += ["-chardev", f"socket,id=onyxusb,path={usb_socket},server=on,wait=off",
+                "-global", "fsl-imx6ul.usb0-hostchar=onyxusb"]
+    sdp_command = [sys.executable, str(REPO / "boards/onyx/sdp.py"),
+                   "--socket", str(usb_socket), "--image", args.sdp_image or ""]
+    if args.sdp_fit:
+        sdp_command += ["--fit", args.sdp_fit]
     icount = os.environ.get("QEMU_ICOUNT", "off")
     if icount != "off":
         command += ["-icount", icount]
@@ -53,7 +68,20 @@ def launch(args):
         if args.docker:
             docker += ["-it"] if sys.stdin.isatty() else ["-i"]
             command = docker + shlex.split(os.environ.get("QEMU_DOCKER_ARGS", "")) + [args.docker] + command
-        os.execvp(command[0], command)
+        if not args.sdp_image:
+            os.execvp(command[0], command)
+        children = []
+        try:
+            qemu = subprocess.Popen(command)
+            children.append(qemu)
+            sdp = subprocess.Popen(sdp_command)
+            children.append(sdp)
+            result = sdp.wait()
+            return result if result else qemu.wait()
+        finally:
+            for child in reversed(children):
+                stop(child)
+            usb_socket.unlink(missing_ok=True)
 
     runtime = REPO / ".qemu"
     runtime.mkdir(parents=True, exist_ok=True)
@@ -65,13 +93,17 @@ def launch(args):
         command += ["-display", "none", "-monitor", "none",
                     "-qmp", f"tcp:{bind}:{qmp},server=on,wait=off",
                     "-chardev", f"socket,id=con,host={bind},port={console},"
-                    "server=on,wait=on,nodelay=on", "-serial", "chardev:con", *extra]
+                    "server=on,wait=on,nodelay=on", "-serial", "chardev:con",
+                    "-chardev", f"socket,id=boardui,path={directory}/board.sock,server=on,wait=off",
+                    "-global", "driver=flintstone.board,property=chardev,value=boardui",
+                    *extra]
         if args.docker:
             for port in (qmp, console):
                 docker += ["-p", f"127.0.0.1:{port}:{port}"]
             command = docker + shlex.split(os.environ.get("QEMU_DOCKER_ARGS", "")) + [args.docker] + command
         ui_command = [sys.executable, str(REPO / "ui/ui.py"),
-                      "--board", str(Path(directory) / "unmodelled-board.sock"),
+                      "--board", str(Path(directory) / "board.sock"),
+                      "--pins", "button=HU-BUTTON,wifi_reset=WIFI-RESET,hall_enable=HALL-ENABLE",
                       "--qmp", f"tcp:127.0.0.1:{qmp}",
                       "--console", f"tcp:127.0.0.1:{console}", "--echo-console",
                       "--screen-file", str(Path(directory) / "screen.ppm"),
@@ -92,10 +124,18 @@ def launch(args):
             children.append(ui)
             qemu = subprocess.Popen(command, stdin=subprocess.DEVNULL)
             children.append(qemu)
+            sdp = None
+            if args.sdp_image:
+                sdp = subprocess.Popen(sdp_command)
+                children.append(sdp)
             print(f"onyx UI: http://127.0.0.1:{http}", file=sys.stderr)
-            print("  Serial/QMP only; display, ring, backplate, radio and USB are not modelled.",
+            print(f"  USB host socket: {usb_socket}",
+                  file=sys.stderr)
+            print("  LCDIF/serial/QMP; ring, backplate and radio are not modelled.",
                   file=sys.stderr)
             while qemu.poll() is None:
+                if sdp and sdp.poll() not in (None, 0):
+                    return sdp.returncode
                 if ui.poll() is not None:
                     return ui.returncode or 1
                 time.sleep(0.1)
@@ -105,6 +145,7 @@ def launch(args):
         finally:
             for child in reversed(children):
                 stop(child)
+            usb_socket.unlink(missing_ok=True)
             if args.docker:
                 subprocess.run(["docker", "rm", "-f", container],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -118,6 +159,11 @@ def main():
     parser.add_argument("--snapshot", choices=("on", "off"), default="off")
     parser.add_argument("--ui", action="store_true")
     parser.add_argument("--ui-port", type=int, default=8075)
+    parser.add_argument("--open-security", action="store_true",
+                        help="emulate open SEC_CONFIG fuses for unsigned development images")
+    parser.add_argument("--sdp-fit", help="FIT to load for the factory USB boot path")
+    parser.add_argument("--sdp-image", help="upload an SDP loader through the mask ROM")
+    parser.add_argument("--boot-rom", help="execute a complete 96 KiB mask ROM dump")
     parser.add_argument("--docker", metavar="IMAGE")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()

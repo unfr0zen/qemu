@@ -2,7 +2,7 @@
 
 Guidance for coding agents working in this repository.
 
-QEMU machines that boot the stock firmware of Nest Learning Thermostats from a user-supplied NAND image: `-M diamond3` (i.MX6SoloX), `-M j49` (TI AM3703), and early U-Boot bring-up for `-M onyx` (Nest Thermostat E, i.MX6UL). The user-supplied Diamond3 mask ROM is tracked at `roms/diamond3/bootrom.bin`. NAND images, signed U-Boot and other firmware remain external and must not be added.
+QEMU machines that boot the stock firmware of Nest Learning Thermostats from a user-supplied NAND image: `-M diamond3` (i.MX6SoloX), `-M j49` (TI AM3703), and development Linux support for `-M onyx` (Nest Thermostat E, i.MX6UL). The user-supplied Diamond3 mask ROM is tracked at `roms/diamond3/bootrom.bin`. NAND images, signed U-Boot and other firmware remain external and must not be added.
 
 ## Commands
 
@@ -44,7 +44,7 @@ shellcheck --severity=warning $(git ls-files '*.sh')
 - diamond3: i.MX6SX SoC container + `diamond3` machine, GPMI NAND/BCH, a boot-ROM stub that loads U-Boot from NAND (applies the IVT's DCD), LCDIF, Vivante GC400T GPU (software 3D pipeline), BCM43341 SDIO Wi-Fi, vf610 ADC magwheel, PWM piezo, EM357 Thread radio SPI.
 - j49: OMAP3 peripherals (INTC, GP timers, PRCM, GPMC+BCH4 NAND, TPS65921, UART, I2C, GPIO, WDT, MMCHS, McSPI, SDMA, DSS) + `j49` machine, WL1271 Wi-Fi, ADBS-A320 ring sensor.
 
-- onyx: existing i.MX6UL SoC with MMDC and GPMI/BCH, fixed-offset NAND U-Boot ROM loader, synthetic shadow fuses/thermal sample, and IOMUXC UART1 DCE routing. Locked firmware disconnects UART after the token check; display and thermostat peripherals are not modelled.
+- onyx: i.MX6UL with MMDC, GPMI/BCH, LCDIF, LM3695, GPIO button, peripheral USB and SDMA initialization. Closed fuses are the default; `secure-boot=off` selects open development fuses. An optional mask ROM can load the public SDP U-Boot over USB. Ring, backplate and radio are not modelled.
 
 **Host side (Python, standard library only)** — QEMU exposes chardevs and QMP over sockets; these processes are the "rest of the hardware":
 
@@ -61,7 +61,7 @@ shellcheck --severity=warning $(git ls-files '*.sh')
 
 ## Docs
 
-- `docs/qemu-onyx.md` — Nest Thermostat E (`onyx`) U-Boot UART bring-up; no full firmware boot support.
+- `docs/qemu-onyx.md` — Nest Thermostat E (`onyx`) NAND/Linux development boot and mask-ROM USB SDP.
 - `docs/qemu.md`, `docs/qemu-j49.md` — usage, NAND state, network, pre-boot, hardware model, debugging (`-d unimp`, gdb, symbol recovery), not-yet-modelled list.
 - `docs/spec-flintstone.md`, `docs/spec-j49.md` — board memory maps and peripherals.
 - `docs/nand-image.md` — image formats (diamond3: 512 MiB logical, data pages only; j49: raw 2048+64 OOB pages) and partition layout.
