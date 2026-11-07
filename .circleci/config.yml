@@ -139,6 +139,21 @@ jobs:
 
 workflows:
   ci:
+    when:
+      not:
+        matches: { pattern: "^pull/[0-9]+$", value: << pipeline.git.branch >> }
     jobs:
       - patches
       - scripts
+  # A pull request from a fork (its branch is pull/N) waits for a member's
+  # approval before anything runs.
+  ci-fork:
+    when:
+      matches: { pattern: "^pull/[0-9]+$", value: << pipeline.git.branch >> }
+    jobs:
+      - hold:
+          type: approval
+      - patches:
+          requires: [hold]
+      - scripts:
+          requires: [hold]
