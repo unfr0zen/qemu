@@ -1,4 +1,5 @@
 """Onyx launcher selection and process lifetime without firmware or NAND dumps."""
+import argparse
 import importlib.util
 import json
 import os
@@ -59,7 +60,9 @@ class OnyxLaunchTests(unittest.TestCase):
         self.assertEqual(args[args.index('-parallel') + 1], 'none')
         self.assertEqual(args[-2:], ['-d', 'guest_errors'])
         self.assertNotIn('-bios', args)
-        self.assertNotIn('-global', args)
+        self.assertIn('fsl-imx6ul.usb0-hostchar=onyxusb', args)
+        devices = [args[index + 1] for index, arg in enumerate(args) if arg == '-chardev']
+        self.assertTrue(any(device.startswith('socket,id=onyxusb,') for device in devices))
 
     def test_machine_alias_and_seed(self):
         self.nand.unlink()
@@ -111,13 +114,18 @@ class OnyxLaunchTests(unittest.TestCase):
             args = json.loads(self.capture.read_text())
             self.assertIn('-qmp', args)
             self.assertIn('chardev:con', args)
-            self.assertIn('server=on,wait=on,nodelay=on', args[args.index('-chardev') + 1])
+            devices = [args[index + 1] for index, arg in enumerate(args) if arg == '-chardev']
+            console = next(device for device in devices if device.startswith('socket,id=con,'))
+            self.assertIn('server=on,wait=on,nodelay=on', console)
+            board = next(device for device in devices if device.startswith('socket,id=boardui,'))
+            self.assertIn('server=on,wait=off', board)
+            self.assertIn('driver=flintstone.board,property=chardev,value=boardui', args)
             self.assertNotIn('-nographic', args)
             ui_args = json.loads((self.repo / 'ui-args.json').read_text())
             self.assertEqual(ui_args[ui_args.index('--port') + 1], '18075')
             self.assertIn('--echo-console', ui_args)
             self.assertNotIn('--backplate', ui_args)
-            self.assertTrue(ui_args[ui_args.index('--board') + 1].endswith('unmodelled-board.sock'))
+            self.assertTrue(ui_args[ui_args.index('--board') + 1].endswith('/board.sock'))
             process.send_signal(signal.SIGTERM)
             self.assertEqual(process.wait(timeout=10), 128 + signal.SIGTERM)
             for path in (ui_pid, Path(str(self.capture) + '.pid')):
@@ -148,8 +156,10 @@ class OnyxLaunchTests(unittest.TestCase):
             os.kill(int(pid.read_text()), 0)
 
     def test_docker_console_command(self):
-        args = mock.Mock(qemu='/qemu', nand='/nand', snapshot='off', extra=['--', '-S'],
-                         ui=False, docker='test-image')
+        args = argparse.Namespace(qemu='/qemu', nand='/nand', snapshot='off',
+                                  extra=['--', '-S'], ui=False, docker='test-image',
+                                  open_security=False, boot_rom=None, sdp_image=None,
+                                  sdp_fit=None)
         with mock.patch.object(launcher.os, 'execvp') as execute:
             # exec never returns in production.
             execute.side_effect = SystemExit
