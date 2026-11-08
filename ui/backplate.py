@@ -62,6 +62,11 @@ Wiring and the handshake (the front unit's side, nlclient disassembly):
        firmware sees nothing to update; after a firmware update we report
        what was flashed.
   0x85 -> 0x17 BP status (u16).
+  0x89 SAFETY_TEMP (the safety temperatures and the circuits they run,
+       sent once a circuit such as AUX/W2 is the safety one) -> 0x35
+       safety temp data, 24 B: u32 status, current, heat time, cool time,
+       reason, then u16 OC and power events; all zero, nothing tripped.
+       Until it comes nlclient retries 0x89 and switches nothing.
   0xc0 (u32 power-steal mask), 0x8f (our wires echoed), 0x83 (tick), 0xb1:
        no reply. "Attached" itself comes from a detect GPIO.
 After the handshake the front wants a frame at least every 5 s; the live
@@ -145,6 +150,7 @@ MSG_ACK_SWITCH = 0x06
 MSG_PINS = 0x09
 MSG_ALS = 0x0a
 MSG_UPDATE_ACK = 0x11
+MSG_SAFETY_TEMP_DATA = 0x35
 MSG_TEMP_BUF = 0x22
 MSG_ALS_BUF = 0x29
 MSG_TEMP_COMP = 0xc3
@@ -159,6 +165,7 @@ MSG_END_BUF = 0x2f
 
 # front -> back firmware update requests
 MSG_SWITCH = 0x82
+MSG_SAFETY_TEMP = 0x89
 MSG_FLUSH = 0xa2
 MSG_UPDATE_BEGIN = 0x91
 MSG_UPDATE_RECORD = 0x92
@@ -641,6 +648,8 @@ class Backplate:
             if (circuit in self.circuits) != bool(state):
                 self.switch(circuit, state)
             self.send(MSG_ACK_SWITCH, payload)
+        elif mtype == MSG_SAFETY_TEMP:
+            self.send(MSG_SAFETY_TEMP_DATA, bytes(24))
         elif mtype == MSG_FLUSH:
             self.flush()
         elif mtype == MSG_TEMP_COMP and len(payload) == 2:
