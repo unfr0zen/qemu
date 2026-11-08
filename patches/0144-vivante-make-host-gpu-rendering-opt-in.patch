@@ -1,0 +1,14 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: make host gpu rendering opt-in
+
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -935,7 +935,7 @@
+ 
+ static const Property viv_props[] = {
+     DEFINE_PROP_BOOL("trace", VivGCState, trace, false),
+-    DEFINE_PROP_BOOL("host-gpu", VivGCState, host_gpu, true),
++    DEFINE_PROP_BOOL("host-gpu", VivGCState, host_gpu, false),
+ };
+ 
+ static void viv_class_init(ObjectClass *oc, const void *data)

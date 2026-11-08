@@ -41,6 +41,7 @@ in the same image.
 | `--cloud` | Let the unit reach the internet; by default it gets DHCP (10.0.2.x) and nothing past the virtual router |
 | `--no-provision` | Skip the pre-boot: boot the NAND exactly as it is |
 | `--sleep` | The display's stock 20 s timeout; by default the pre-boot keeps the screen on (below) |
+| `--host-gpu` | Experimental (diamond3, macOS): draw the GC400's 3D work on the host GPU; the default is the software pipeline ([Display and GPU](#display-and-gpu)) |
 | `--nand FILE` | The NAND image to start from: seeds the working copy when there is none yet (or with `NAND_FRESH=1`), and is the source for `NAND_SNAPSHOT`, `NAND_RW` and `--stock-image`. Ignored, with a note, once a working copy exists |
 | `--mqtt HOST[:PORT]` | Relay `10.0.2.100:1883` in the guest to an MQTT broker, and nothing else (for nestlocal, imx6-stuff's `ha/`) |
 | `--nic-extra OPTS` | More `-nic user` options, e.g. a `guestfwd=` |
@@ -541,14 +542,16 @@ model of the i.MX6SX's GC400T GPU3D (`hw/display/vivante_gc.c`,
   shader ISA, clipping, rasterisation (split across host threads), texturing
   and the pixel engine (blending, depth/stencil, alpha test).
 
-On macOS, `host-gpu=on` uses an accelerated OpenGL 4 core context by default.
-The backend translates GC400 vertex/fragment instructions, keeps render targets
-on the host GPU between draws, and writes tiled guest surfaces before pixel
-engine completion events, resolves, and software fallback. Synchronized targets
-remain cached until the guest changes their memory. Other hosts use the software
-pipeline. Use
-`-global vivante-gc.host-gpu=off` to select software rendering. QOM properties
-`host-draws`, `software-draws`, and `host-flushes` expose backend counters.
+The software pipeline is the default. `run.sh --host-gpu` (or
+`-global vivante-gc.host-gpu=on`) selects an experimental macOS backend on an
+accelerated OpenGL 4 core context: it translates GC400 vertex/fragment
+instructions, keeps render targets on the host GPU between draws, and writes
+tiled guest surfaces before pixel engine completion events, resolves, and
+software fallback. Synchronized targets remain cached until the guest changes
+their memory. It does not yet render every firmware correctly (6.5-14 text is
+drawn as solid boxes). Other hosts always use the software pipeline. QOM
+properties `host-draws`, `software-draws`, and `host-flushes` expose backend
+counters.
 
 The web page displays the frames captured by QMP screendumps. `-global
 vivante-gc.trace=on -D FILE` logs every register access, command and

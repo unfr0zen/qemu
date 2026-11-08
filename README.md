@@ -91,6 +91,7 @@ a prepared Onyx NAND image; no `-bios` or separate firmware files are required.
 | `--mqtt HOST[:PORT]` | guest reaches a broker at `10.0.2.100:1883` |
 | `--no-provision` | boot the NAND unmodified |
 | `--sleep` | keep the stock 20 s screen timeout |
+| `--host-gpu` | experimental macOS host GPU rendering (default: software) |
 | `--hostname NAME` | NAME in the console prompt instead of the serial number (diamond3) |
 | `--nlclient FILE` | isolated NAND, install FILE as nlclient after boot |
 | `--root0` / `--root1` | select the boot slot |

@@ -33,6 +33,8 @@
 #   ./run.sh --ui --fs ro        # live files through QEMU's debugger (diamond3)
 #   ./run.sh --ui --fs rw        # also allow atomic writes through the kernel
 #   ./run.sh --ui --gdb          # MCP ARM debugging (shares --fs when enabled)
+#   ./run.sh --host-gpu          # experimental: draw GPU work with the macOS
+#                                   #   host GPU (default: software renderer)
 #   ./run.sh --stock-image FILE  # write FILE: the image as a unit that
 #                                   #   was never set up, then exit
 #   ./run.sh -d guest_log ...    # extra QEMU args pass through
@@ -90,6 +92,7 @@ nic_extra=""
 ssh_port=""
 fs_mode=""
 gdb=0
+host_gpu=0
 machine_option=""
 root=""
 nand_arg=""
@@ -119,6 +122,7 @@ while [ $# -gt 0 ]; do
         --ssh) ssh_port="$2"; shift 2 ;;
         --fs) case "${2:-}" in ro|rw) fs_mode=$2 ;; *) echo "ERROR: --fs needs ro or rw" >&2; exit 1 ;; esac; shift 2 ;;
         --gdb) gdb=1; shift ;;
+        --host-gpu) host_gpu=1; shift ;;
         *) break ;;
     esac
 done
@@ -602,6 +606,8 @@ if [ "$usb" = 1 ]; then
         echo "USB/IP export: 127.0.0.1:$usbip_port (attach from a Linux host)" >&2
     fi
 fi
+
+[ "$host_gpu" = 1 ] && set -- -global vivante-gc.host-gpu=on "$@"
 
 # With --ui on a terminal the terminal is ui.py's; QEMU keeps off it.
 [ "$keyboard" = 1 ] && exec < /dev/null
