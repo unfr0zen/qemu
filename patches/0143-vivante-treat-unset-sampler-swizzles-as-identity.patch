@@ -1,0 +1,26 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: treat unset sampler swizzles as identity
+
+--- a/hw/display/vivante_3d.c
++++ b/hw/display/vivante_3d.c
+@@ -674,10 +674,20 @@
+     }
+ }
+ 
++/*
++ * TE_SAMPLER_CONFIG1 swizzle fields (bits 8..23). The stock GC400 driver
++ * leaves them all zero, which would read as RRRR: an A8 glyph atlas would
++ * sample with zero alpha. Etnaviv writes them with identity as 0x3210, and
++ * a GC400 without HALTI0 has no texture swizzle, so an all-zero field is
++ * treated as the identity.
++ */
+ static void viv_texture_swizzle(const VivSampler *sm, float color[4])
+ {
+     float raw[4];
+ 
++    if (!(sm->cfg1 & 0x00ffff00)) {
++        return;
++    }
+     memcpy(raw, color, sizeof(raw));
+     for (unsigned c = 0; c < 4; c++) {
+         unsigned swizzle = (sm->cfg1 >> (8 + c * 4)) & 7;
