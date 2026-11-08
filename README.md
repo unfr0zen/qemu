@@ -1,4 +1,8 @@
 # unfr0zen qemu
+[![Build](https://dl.circleci.com/status-badge/img/gh/unfr0zen/qemu/tree/main.svg?style=shield)](https://dl.circleci.com/status-badge/redirect/gh/unfr0zen/qemu/tree/main)
+[![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/4YC7Yj3Tx)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow.svg)](https://buymeacoffee.com/willtm)
 
 QEMU machines that boot the stock firmware of Nest Learning Thermostats from their NAND image.
 
