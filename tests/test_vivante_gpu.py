@@ -12,8 +12,10 @@ import unittest
 
 
 @unittest.skipUnless(os.environ.get("QEMU_SYSTEM_ARM"), "set QEMU_SYSTEM_ARM")
-class VivanteTests(unittest.TestCase):
+class VivanteRenderer:
     host_gpu = False
+    request_host_gpu = False
+    render_node = None
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix="vivante-qtest-")
@@ -22,14 +24,19 @@ class VivanteTests(unittest.TestCase):
         qmp_path = Path(directory.name) / "qmp"
         self.log = tempfile.TemporaryFile()
         self.addCleanup(self.log.close)
+        gpu_args = []
+        node = self.render_node or os.environ.get("VIVANTE_RENDER_NODE")
+        if node:
+            gpu_args = ["-global", f"vivante-gc.host-render-node={node}"]
+        enable_host = self.host_gpu or self.request_host_gpu
         self.proc = subprocess.Popen([
             os.environ["QEMU_SYSTEM_ARM"], "-M", "diamond3", "-accel", "qtest",
             "-display", "none", "-nodefaults", "-global",
-            f"vivante-gc.host-gpu={'on' if self.host_gpu else 'off'}",
+            f"vivante-gc.host-gpu={'on' if enable_host else 'off'}",
             "-qtest", f"unix:{path},server=on,wait=off",
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-qtest-log", "/dev/null",
-        ], stdout=self.log, stderr=self.log)
+        ] + gpu_args, stdout=self.log, stderr=self.log)
         self.addCleanup(self.stop)
         deadline = time.monotonic() + 5
         while not path.exists() or not qmp_path.exists():
@@ -149,6 +156,9 @@ class VivanteTests(unittest.TestCase):
             log = self.log.read().decode()
             self.assertIn("vivante-gc: host GPU", log)
             self.assertNotIn("texture unloadable", log)
+            expected = os.environ.get("VIVANTE_EXPECT_RENDERER")
+            if expected:
+                self.assertIn(expected, log)
 
     def pixel(self, x, y):
         address = 0x80000000 + self.states[0x50c] + self.offset(x, y, 256, 4)
@@ -159,6 +169,8 @@ class VivanteTests(unittest.TestCase):
             self.assertEqual(self.pixel(8, y), 0)
             self.assertEqual(self.pixel(56, y), 0xffffffff)
 
+
+class VivanteTests(VivanteRenderer, unittest.TestCase):
     def test_a8_and_final_vertex_texcoord(self):
         self.draw()
         self.check_quad()
@@ -277,9 +289,25 @@ class VivanteTests(unittest.TestCase):
         self.wide_atlas(65535)
 
 
-@unittest.skipUnless(sys.platform == "darwin", "requires macOS OpenGL")
+@unittest.skipUnless(sys.platform == "darwin" or
+                     os.environ.get("VIVANTE_HOST_TESTS") == "1",
+                     "requires macOS or VIVANTE_HOST_TESTS=1 with EGL hardware")
 class VivanteHostTests(VivanteTests):
     host_gpu = True
+
+
+@unittest.skipUnless(sys.platform == "linux", "requires Linux EGL")
+class VivanteEGLFallbackTests(VivanteRenderer, unittest.TestCase):
+    request_host_gpu = True
+    render_node = "/dev/null"
+
+    def test_unavailable_render_node(self):
+        self.draw()
+        self.check_quad()
+        self.assertEqual(self.qmp("qom-get", path=self.gpu,
+                                  property="host-draws"), 0)
+        self.log.seek(0)
+        self.assertIn("using software", self.log.read().decode())
 
 
 if __name__ == "__main__":

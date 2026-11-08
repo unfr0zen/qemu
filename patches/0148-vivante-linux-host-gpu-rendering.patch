@@ -1,0 +1,406 @@
+From 84e40cf43a0cff3c817019826344b85f73cec669 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 13:52:23 -0500
+Subject: [PATCH] hw/display: vivante: support Linux host GPUs through EGL
+
+---
+ hw/display/meson.build           |   2 +
+ hw/display/vivante_gc.c          |   1 +
+ hw/display/vivante_gc_int.h      |   1 +
+ hw/display/vivante_host_gl.inc.c | 222 +++++++++++++++++++++++++++----
+ 4 files changed, 200 insertions(+), 26 deletions(-)
+
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index c8aab14..074a4be 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -19,6 +19,8 @@ system_ss.add(when: 'CONFIG_VIVANTE_GC', if_true: files('vivante_gc.c', 'vivante
+ if host_os == 'darwin'
+   system_ss.add(when: 'CONFIG_VIVANTE_GC',
+                 if_true: dependency('appleframeworks', modules: ['OpenGL']))
++elif host_os == 'linux' and opengl.found()
++  system_ss.add(when: 'CONFIG_VIVANTE_GC', if_true: opengl)
+ endif
+ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
+ system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
+diff --git a/hw/display/vivante_gc.c b/hw/display/vivante_gc.c
+index c5b7714..844113a 100644
+--- a/hw/display/vivante_gc.c
++++ b/hw/display/vivante_gc.c
+@@ -936,6 +936,7 @@ static void viv_unrealize(DeviceState *dev)
+ static const Property viv_props[] = {
+     DEFINE_PROP_BOOL("trace", VivGCState, trace, false),
+     DEFINE_PROP_BOOL("host-gpu", VivGCState, host_gpu, false),
++    DEFINE_PROP_STRING("host-render-node", VivGCState, host_render_node),
+ };
+ 
+ static void viv_class_init(ObjectClass *oc, const void *data)
+diff --git a/hw/display/vivante_gc_int.h b/hw/display/vivante_gc_int.h
+index ae0eee0..6a01afb 100644
+--- a/hw/display/vivante_gc_int.h
++++ b/hw/display/vivante_gc_int.h
+@@ -26,6 +26,7 @@ struct VivGCState {
+     QEMUTimer *fe_timer;
+     bool trace;
+     bool host_gpu;
++    char *host_render_node;
+     void *host_gl;
+     uint64_t host_draws, host_flushes, software_draws;
+ 
+diff --git a/hw/display/vivante_host_gl.inc.c b/hw/display/vivante_host_gl.inc.c
+index e9cf186..db9b98e 100644
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -1,13 +1,22 @@
+ /*
+- * GC400 shader translation and offscreen rendering on a macOS host GPU.
++ * GC400 shader translation and offscreen rendering on a host GPU.
+  * Guest surfaces remain authoritative at resolve and CPU fallback boundaries.
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
++#include "qemu/error-report.h"
++
++#if defined(CONFIG_DARWIN) || (defined(CONFIG_LINUX) && defined(CONFIG_OPENGL))
+ #ifdef CONFIG_DARWIN
+ #define GL_SILENCE_DEPRECATION
+ #include <OpenGL/OpenGL.h>
+ #include <OpenGL/gl3.h>
+-#include "qemu/error-report.h"
++#else
++#include <epoxy/gl.h>
++#include <epoxy/egl.h>
++#ifndef EGL_DRM_RENDER_NODE_FILE_EXT
++#define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
++#endif
++#endif
+ 
+ typedef struct VivHostTexture {
+     GLuint name;
+@@ -16,7 +25,13 @@ typedef struct VivHostTexture {
+ } VivHostTexture;
+ 
+ typedef struct VivHostGL {
++#ifdef CONFIG_DARWIN
+     CGLContextObj context;
++#else
++    EGLDisplay display;
++    EGLContext context;
++    EGLSurface surface;
++#endif
+     GHashTable *programs;
+     GLuint fbo, color, depth, vao, streams[8], indices, uniforms;
+     bool valid, dirty;
+@@ -28,29 +43,171 @@ typedef struct VivHostGL {
+     unsigned next_texture;
+ } VivHostGL;
+ 
+-static VivHostGL *viv_host_init(VivGCState *s)
++static bool viv_host_context_current(VivHostGL *h)
+ {
+-    VivHostGL *h = s->host_gl;
++#ifdef CONFIG_DARWIN
++    return CGLSetCurrentContext(h->context) == kCGLNoError;
++#else
++    return eglMakeCurrent(h->display, h->surface, h->surface, h->context);
++#endif
++}
++
++/* MMIO and reset callbacks can run on different host threads. */
++static void viv_host_context_release(VivHostGL *h)
++{
++#ifdef CONFIG_DARWIN
++    CGLSetCurrentContext(NULL);
++#else
++    eglMakeCurrent(h->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++#endif
++}
++
++static void viv_host_context_destroy(VivHostGL *h)
++{
++#ifdef CONFIG_DARWIN
++    if (h->context) {
++        CGLSetCurrentContext(NULL);
++        CGLDestroyContext(h->context);
++    }
++#else
++    if (h->display != EGL_NO_DISPLAY) {
++        viv_host_context_release(h);
++        if (h->context != EGL_NO_CONTEXT) {
++            eglDestroyContext(h->display, h->context);
++        }
++        if (h->surface != EGL_NO_SURFACE) {
++            eglDestroySurface(h->display, h->surface);
++        }
++        eglTerminate(h->display);
++    }
++    h->display = EGL_NO_DISPLAY;
++    h->context = EGL_NO_CONTEXT;
++    h->surface = EGL_NO_SURFACE;
++#endif
++}
++
++static bool viv_host_context_create(VivHostGL *h, VivGCState *s)
++{
++#ifdef CONFIG_DARWIN
+     CGLPixelFormatObj format;
+     GLint count;
+     CGLPixelFormatAttribute attrs[] = {
+         kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
+         kCGLPFAAccelerated, (CGLPixelFormatAttribute)0,
+     };
++    CGLError result;
++
++    if (CGLChoosePixelFormat(attrs, &format, &count) != kCGLNoError) {
++        return false;
++    }
++    result = CGLCreateContext(format, NULL, &h->context);
++    CGLDestroyPixelFormat(format);
++    return result == kCGLNoError && viv_host_context_current(h);
++#else
++    const EGLint config_attrs[] = {
++        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
++        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
++        EGL_NONE,
++    };
++    const EGLint context_attrs[] = {
++        EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
++        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
++        EGL_NONE,
++    };
++    const EGLint surface_attrs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
++    g_autofree EGLDeviceEXT *devices = NULL;
++    EGLint count;
++    struct stat requested;
++
++    h->display = EGL_NO_DISPLAY;
++    h->context = EGL_NO_CONTEXT;
++    h->surface = EGL_NO_SURFACE;
++    if (s->host_render_node &&
++        (stat(s->host_render_node, &requested) < 0 ||
++         !S_ISCHR(requested.st_mode))) {
++        return false;
++    }
++    if (!epoxy_has_egl_extension(EGL_NO_DISPLAY,
++                                 "EGL_EXT_device_enumeration") ||
++        !epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_device_query") ||
++        !epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_platform_base") ||
++        !epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_platform_device") ||
++        !eglQueryDevicesEXT(0, NULL, &count) || !count) {
++        return false;
++    }
++    devices = g_new(EGLDeviceEXT, count);
++    if (!eglQueryDevicesEXT(count, devices, &count)) {
++        return false;
++    }
++    for (unsigned i = 0; i < count; i++) {
++        const char *ext = eglQueryDeviceStringEXT(devices[i], EGL_EXTENSIONS);
++        EGLConfig config;
++        EGLint configs;
++
++        if (!ext ||
++            epoxy_extension_in_string(ext, "EGL_MESA_device_software")) {
++            continue;
++        }
++        if (s->host_render_node) {
++            const char *node;
++            struct stat candidate;
++
++            if (!epoxy_extension_in_string(ext,
++                                          "EGL_EXT_device_drm_render_node")) {
++                continue;
++            }
++            node = eglQueryDeviceStringEXT(devices[i],
++                                           EGL_DRM_RENDER_NODE_FILE_EXT);
++            if (!node || stat(node, &candidate) < 0 ||
++                candidate.st_rdev != requested.st_rdev) {
++                continue;
++            }
++        }
++        h->display = eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT,
++                                              devices[i], NULL);
++        if (h->display == EGL_NO_DISPLAY) {
++            continue;
++        }
++        if (!eglInitialize(h->display, NULL, NULL) ||
++            (epoxy_egl_version(h->display) < 15 &&
++             !epoxy_has_egl_extension(h->display, "EGL_KHR_create_context")) ||
++            !eglBindAPI(EGL_OPENGL_API) ||
++            !eglChooseConfig(h->display, config_attrs, &config, 1, &configs) ||
++            !configs) {
++            viv_host_context_destroy(h);
++            continue;
++        }
++        h->surface = eglCreatePbufferSurface(h->display, config, surface_attrs);
++        h->context = eglCreateContext(h->display, config, EGL_NO_CONTEXT,
++                                      context_attrs);
++        if (h->surface != EGL_NO_SURFACE && h->context != EGL_NO_CONTEXT &&
++            viv_host_context_current(h)) {
++            return true;
++        }
++        viv_host_context_destroy(h);
++    }
++    return false;
++#endif
++}
++
++static VivHostGL *viv_host_init(VivGCState *s)
++{
++    VivHostGL *h = s->host_gl;
+ 
+     if (h || !s->host_gpu) {
+         return h;
+     }
+     h = g_new0(VivHostGL, 1);
+-    if (CGLChoosePixelFormat(attrs, &format, &count) != kCGLNoError) {
+-        goto fail;
++    if (!viv_host_context_create(h, s)) {
++        viv_host_context_destroy(h);
++        warn_report("vivante-gc: host OpenGL context unavailable%s%s; "
++                    "using software", s->host_render_node ? " for " : "",
++                    s->host_render_node ?: "");
++        s->host_gpu = false;
++        g_free(h);
++        return NULL;
+     }
+-    CGLError result = CGLCreateContext(format, NULL, &h->context);
+-    CGLDestroyPixelFormat(format);
+-    if (result != kCGLNoError) {
+-        goto fail;
+-    }
+-    CGLSetCurrentContext(h->context);
+     h->programs = g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
+                                       (GDestroyNotify)g_bytes_unref, NULL);
+     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &h->max_texture_size);
+@@ -66,12 +223,8 @@ static VivHostGL *viv_host_init(VivGCState *s)
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+     info_report("vivante-gc: host GPU %s", glGetString(GL_RENDERER));
+     s->host_gl = h;
++    viv_host_context_release(h);
+     return h;
+-fail:
+-    warn_report("vivante-gc: accelerated CGL context unavailable");
+-    s->host_gpu = false;
+-    g_free(h);
+-    return NULL;
+ }
+ 
+ void viv3d_fini(VivGCState *s)
+@@ -83,7 +236,7 @@ void viv3d_fini(VivGCState *s)
+     if (!h) {
+         return;
+     }
+-    CGLSetCurrentContext(h->context);
++    viv_host_context_current(h);
+     g_hash_table_iter_init(&iter, h->programs);
+     while (g_hash_table_iter_next(&iter, NULL, &value)) {
+         glDeleteProgram(GPOINTER_TO_UINT(value));
+@@ -102,8 +255,7 @@ void viv3d_fini(VivGCState *s)
+     glDeleteBuffers(1, &h->indices);
+     glDeleteBuffers(1, &h->uniforms);
+     glDeleteVertexArrays(1, &h->vao);
+-    CGLSetCurrentContext(NULL);
+-    CGLDestroyContext(h->context);
++    viv_host_context_destroy(h);
+     g_free(h->color_shadow);
+     g_free(h->depth_shadow);
+     g_free(h);
+@@ -648,7 +800,7 @@ static void viv_gl_writeback(VivGCState *s, bool invalidate)
+         }
+         return;
+     }
+-    CGLSetCurrentContext(h->context);
++    viv_host_context_current(h);
+     d = &h->target;
+     packed = d->rt_fmt == 5 || d->rt_fmt == 6;
+     pixels = h->width * h->height;
+@@ -703,11 +855,17 @@ static void viv_gl_writeback(VivGCState *s, bool invalidate)
+ void viv3d_flush(VivGCState *s)
+ {
+     viv_gl_writeback(s, true);
++    if (s->host_gl) {
++        viv_host_context_release(s->host_gl);
++    }
+ }
+ 
+ void viv3d_finish(VivGCState *s)
+ {
+     viv_gl_writeback(s, false);
++    if (s->host_gl) {
++        viv_host_context_release(s->host_gl);
++    }
+ }
+ 
+ static void viv_gl_target(VivHostGL *h, VivDraw *d)
+@@ -732,6 +890,7 @@ static void viv_gl_target(VivHostGL *h, VivDraw *d)
+         h->valid = false;
+     }
+     viv3d_flush(d->s);
++    viv_host_context_current(h);
+     color = g_malloc0(width * height * 4);
+     if (d->zs) {
+         depth = g_malloc0(width * height * d->z_bpp);
+@@ -1095,6 +1254,7 @@ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+ {
+     VivHostGL *h = viv_host_init(d->s);
+     GLuint program;
++    bool drawn = false;
+     static const GLenum mode[] = {
+         0, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_TRIANGLES,
+         GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_LINE_LOOP,
+@@ -1117,10 +1277,12 @@ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+     if (!h || prim < 1 || prim >= ARRAY_SIZE(mode) || !d->vs_inputs) {
+         return false;
+     }
+-    CGLSetCurrentContext(h->context);
++    if (!viv_host_context_current(h)) {
++        return false;
++    }
+     program = viv_gl_program(h, d);
+     if (!program) {
+-        return false;
++        goto release;
+     }
+     viv_gl_target(h, d);
+     glUseProgram(program);
+@@ -1139,11 +1301,11 @@ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+     viv_samplers_prepare(d);
+     for (unsigned i = 0; i < VIV_SAMPLERS; i++) {
+         if (d->smp[i].used && !viv_gl_texture(h, d, i, program)) {
+-            return false;
++            goto release;
+         }
+     }
+     if (!viv_gl_vertices(h, d, start, n, indexed, index_offset)) {
+-        return false;
++        goto release;
+     }
+     glBindFramebuffer(GL_FRAMEBUFFER, h->fbo);
+     glViewport(0, 0, h->width, h->height);
+@@ -1186,7 +1348,10 @@ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+     glDrawElements(mode[prim], n, GL_UNSIGNED_INT, NULL);
+     h->dirty = true;
+     d->s->host_draws++;
+-    return true;
++    drawn = true;
++release:
++    viv_host_context_release(h);
++    return drawn;
+ }
+ #else
+ void viv3d_finish(VivGCState *s)
+@@ -1204,6 +1369,11 @@ void viv3d_flush(VivGCState *s)
+ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+                            unsigned n, bool indexed, uint32_t index_offset)
+ {
++    if (d->s->host_gpu) {
++        warn_report("vivante-gc: host OpenGL backend unavailable; "
++                    "using software");
++        d->s->host_gpu = false;
++    }
+     return false;
+ }
+ #endif
+-- 
+2.56.0
+

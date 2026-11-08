@@ -33,8 +33,9 @@
 #   ./run.sh --ui --fs ro        # live files through QEMU's debugger (diamond3)
 #   ./run.sh --ui --fs rw        # also allow atomic writes through the kernel
 #   ./run.sh --ui --gdb          # MCP ARM debugging (shares --fs when enabled)
-#   ./run.sh --host-gpu          # experimental: draw GPU work with the macOS
-#                                   #   host GPU (default: software renderer)
+#   ./run.sh --host-gpu          # request host GPU rendering (automatic on native
+#                                   #   Linux/macOS; falls back to software)
+#   ./run.sh --no-host-gpu       # force the software renderer
 #   ./run.sh --stock-image FILE  # write FILE: the image as a unit that
 #                                   #   was never set up, then exit
 #   ./run.sh -d guest_log ...    # extra QEMU args pass through
@@ -92,7 +93,7 @@ nic_extra=""
 ssh_port=""
 fs_mode=""
 gdb=0
-host_gpu=0
+host_gpu=auto
 machine_option=""
 root=""
 nand_arg=""
@@ -123,6 +124,7 @@ while [ $# -gt 0 ]; do
         --fs) case "${2:-}" in ro|rw) fs_mode=$2 ;; *) echo "ERROR: --fs needs ro or rw" >&2; exit 1 ;; esac; shift 2 ;;
         --gdb) gdb=1; shift ;;
         --host-gpu) host_gpu=1; shift ;;
+        --no-host-gpu) host_gpu=0; shift ;;
         *) break ;;
     esac
 done
@@ -607,6 +609,12 @@ if [ "$usb" = 1 ]; then
     fi
 fi
 
+if [ "$host_gpu" = auto ]; then
+    host_gpu=0
+    if [ "$machine" = diamond3 ] && [ "$use_docker" = 0 ]; then
+        case "$(uname -s)" in Linux|Darwin) host_gpu=1 ;; esac
+    fi
+fi
 [ "$host_gpu" = 1 ] && set -- -global vivante-gc.host-gpu=on "$@"
 
 # With --ui on a terminal the terminal is ui.py's; QEMU keeps off it.

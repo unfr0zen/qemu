@@ -49,6 +49,47 @@ class OnyxLaunchTests(unittest.TestCase):
         return subprocess.run(["sh", str(self.repo / "run.sh"), *args],
                               env=self.env | env, capture_output=True, text=True, timeout=10)
 
+    def test_host_gpu_selection(self):
+        (self.repo / 'qemu-src/build-docker').symlink_to('build')
+        tools = self.repo / 'bin'
+        tools.mkdir()
+        uname = tools / 'uname'
+        uname.write_text('#!/bin/sh\nprintf "%s\\n" "$HOST_OS"\n')
+        uname.chmod(0o755)
+        docker = tools / 'docker'
+        docker.write_text('#!/bin/sh\nif [ "$1" = run ]; then\n'
+                          '    exec "$FAKE_QEMU" "$@"\nfi\n')
+        docker.chmod(0o755)
+        (self.repo / 'docker').mkdir()
+        (self.repo / 'docker/Dockerfile').write_text('FROM scratch\n')
+        env = {'PATH': str(tools) + os.pathsep + self.env['PATH'],
+               'NAND_STATE': str(self.nand), 'FAKE_QEMU': str(self.qemu)}
+        cases = [
+            ('Linux', 'diamond3', (), False, True),
+            ('Darwin', 'diamond3', (), False, True),
+            ('FreeBSD', 'diamond3', (), False, False),
+            ('Linux', 'diamond3', ('--no-host-gpu',), False, False),
+            ('Darwin', 'diamond3', ('--no-host-gpu',), False, False),
+            ('FreeBSD', 'diamond3', ('--host-gpu',), False, True),
+            ('Linux', 'diamond3', ('--host-gpu', '--no-host-gpu'), False, False),
+            ('Linux', 'diamond3', ('--no-host-gpu', '--host-gpu'), False, True),
+            ('Linux', 'j49', (), False, False),
+            ('Linux', 'diamond3', (), True, False),
+            ('Darwin', 'diamond3', (), True, False),
+            ('Linux', 'diamond3', ('--host-gpu',), True, True),
+        ]
+        for host, machine, options, container, enabled in cases:
+            with self.subTest(host=host, machine=machine, options=options,
+                              docker=container):
+                result = self.run_sh('--machine', machine, '--no-provision',
+                                     '--no-usb', *options, **env, HOST_OS=host,
+                                     QEMU_FORCE_DOCKER='1' if container else '0')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.capture.read_text())
+                self.assertEqual('vivante-gc.host-gpu=on' in args, enabled)
+                self.assertNotIn('--host-gpu', args)
+                self.assertNotIn('--no-host-gpu', args)
+
     def test_default_nand_and_qemu_options(self):
         result = self.run_sh("--onyx", "-d", "guest_errors")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -60,6 +101,7 @@ class OnyxLaunchTests(unittest.TestCase):
         self.assertEqual(args[args.index('-parallel') + 1], 'none')
         self.assertEqual(args[-2:], ['-d', 'guest_errors'])
         self.assertNotIn('-bios', args)
+        self.assertNotIn('vivante-gc.host-gpu=on', args)
         self.assertIn('fsl-imx6ul.usb0-hostchar=onyxusb', args)
         devices = [args[index + 1] for index, arg in enumerate(args) if arg == '-chardev']
         self.assertTrue(any(device.startswith('socket,id=onyxusb,') for device in devices))

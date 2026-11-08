@@ -47,6 +47,8 @@ brew install meson ninja pkg-config glib pixman libslirp
 # Debian/Ubuntu
 sudo apt install git build-essential flex bison pkg-config libglib2.0-dev \
     libpixman-1-dev zlib1g-dev libslirp-dev python3 pipx
+# Optional Linux host GPU backend
+sudo apt install libepoxy-dev libegl1-mesa-dev
 pipx install 'meson>=1.5' && pipx install ninja
 ```
 
@@ -91,7 +93,8 @@ a prepared Onyx NAND image; no `-bios` or separate firmware files are required.
 | `--mqtt HOST[:PORT]` | guest reaches a broker at `10.0.2.100:1883` |
 | `--no-provision` | boot the NAND unmodified |
 | `--sleep` | keep the stock 20 s screen timeout |
-| `--host-gpu` | experimental macOS host GPU rendering (default: software) |
+| `--host-gpu` | request experimental host GPU rendering (automatic for native diamond3 on Linux/macOS; software fallback) |
+| `--no-host-gpu` | force software rendering |
 | `--hostname NAME` | NAME in the console prompt instead of the serial number (diamond3) |
 | `--nlclient FILE` | isolated NAND, install FILE as nlclient after boot |
 | `--root0` / `--root1` | select the boot slot |

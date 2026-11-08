@@ -41,7 +41,8 @@ in the same image.
 | `--cloud` | Let the unit reach the internet; by default it gets DHCP (10.0.2.x) and nothing past the virtual router |
 | `--no-provision` | Skip the pre-boot: boot the NAND exactly as it is |
 | `--sleep` | The display's stock 20 s timeout; by default the pre-boot keeps the screen on (below) |
-| `--host-gpu` | Experimental (diamond3, macOS): draw the GC400's 3D work on the host GPU; the default is the software pipeline ([Display and GPU](#display-and-gpu)) |
+| `--host-gpu` | Request experimental GC400 host GPU rendering; automatic for native diamond3 on Linux/macOS, with software fallback ([Display and GPU](#display-and-gpu)) |
+| `--no-host-gpu` | Force the software renderer |
 | `--nand FILE` | The NAND image to start from: seeds the working copy when there is none yet (or with `NAND_FRESH=1`), and is the source for `NAND_SNAPSHOT`, `NAND_RW` and `--stock-image`. Ignored, with a note, once a working copy exists |
 | `--mqtt HOST[:PORT]` | Relay `10.0.2.100:1883` in the guest to an MQTT broker, and nothing else (for nestlocal, imx6-stuff's `ha/`) |
 | `--nic-extra OPTS` | More `-nic user` options, e.g. a `guestfwd=` |
@@ -542,18 +543,52 @@ model of the i.MX6SX's GC400T GPU3D (`hw/display/vivante_gc.c`,
   shader ISA, clipping, rasterisation (split across host threads), texturing
   and the pixel engine (blending, depth/stencil, alpha test).
 
-The software pipeline is the default. `run.sh --host-gpu` (or
-`-global vivante-gc.host-gpu=on`) selects an experimental macOS backend on an
-accelerated OpenGL 4 core context: it translates GC400 vertex/fragment
+`run.sh` automatically requests the experimental OpenGL backend for native
+diamond3 builds on Linux and macOS. The renderer checks device and context
+compatibility when first used and falls back to software if unavailable.
+`--no-host-gpu` forces software; `--host-gpu` explicitly requests acceleration.
+Docker runs and other machines retain their defaults. Running QEMU directly
+uses software unless `-global vivante-gc.host-gpu=on` is supplied.
+macOS uses an accelerated CGL context; Linux uses EGL device enumeration and
+libepoxy with an offscreen OpenGL 3.3 core context. The shared renderer translates GC400 vertex/fragment
 instructions, keeps render targets on the host GPU between draws, and writes
 tiled guest surfaces before pixel engine completion events, resolves, and
 software fallback. Synchronized targets remain cached until the guest changes
 their memory. Textures use the host's reported size limit, including large
 A8 glyph atlases. A8 textures use single-channel host storage and upload only
 changed tile rows. Unsupported textures or shader instructions fall back to
-software. Other hosts always use the software pipeline. QOM
-properties `host-draws`, `software-draws`, and `host-flushes` expose backend
-counters.
+software. Linux supports Intel, AMD, and NVIDIA through their installed EGL
+drivers, without a display server. Install `libepoxy-dev libegl1-mesa-dev`
+on Debian/Ubuntu before configuring QEMU; builds without libepoxy retain
+the software pipeline. Other hosts use software. QOM properties `host-draws`,
+`software-draws`, and `host-flushes` expose backend counters.
+
+Linux automatically selects the first usable hardware EGL device. To choose
+one GPU on a multi-GPU host, pass its render node (including `/dev/dri/by-path/`
+symlinks) as a QEMU property:
+
+```sh
+./run.sh --host-gpu -global vivante-gc.host-render-node=/dev/dri/renderD129
+```
+
+The startup message `vivante-gc: host GPU ...` identifies the selected renderer.
+If the selected device or context is unavailable, QEMU reports `using software`.
+The host retains ownership of the GPU; this translates Vivante commands rather
+than assigning a PCI device to the guest. Use a native Linux build for hardware
+access; the Docker launcher does not expose host GPU devices.
+
+Run the pixel and draw-counter regressions against a chosen Linux GPU with:
+
+```sh
+QEMU_SYSTEM_ARM="$PWD/qemu-src/build/qemu-system-arm" \
+  VIVANTE_HOST_TESTS=1 VIVANTE_RENDER_NODE=/dev/dri/renderD129 \
+  VIVANTE_EXPECT_RENDERER=Intel \
+  python3 -m unittest discover -s tests -p test_vivante_gpu.py
+```
+
+`VIVANTE_EXPECT_RENDERER` checks a substring of the driver-reported renderer;
+omit it for automatic device selection. Linux host tests require explicit opt-in
+because headless CI may lack GPU devices. macOS runs host tests automatically.
 
 The web page displays the frames captured by QMP screendumps. `-global
 vivante-gc.trace=on -D FILE` logs every register access, command and
