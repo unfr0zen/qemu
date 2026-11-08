@@ -1,0 +1,23 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: upload complete host vertex attributes
+
+Size each attribute from its offset, component count and type. VE_END is
+relative to consecutive runs and cannot size the vertex stream upload.
+
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -961,7 +961,13 @@
+         stride[stream] = d->st[stream ?
+             ST_FE_VERTEX_STREAMS_CONTROL + stream :
+             ST_FE_VERTEX_STREAM_CONTROL] & 255;
+-        end[stream] = MAX(end[stream], VE_END(cfg));
++        /* END is relative to a consecutive run, not the stream base. */
++        unsigned type = VE_TYPE(cfg);
++        unsigned components = VE_NUM(cfg) ? VE_NUM(cfg) : 4;
++        unsigned bytes = type == 6 || type == 7 ? 4 :
++                         components * (type < 2 ? 1 :
++                                       type < 4 || type == 9 ? 2 : 4);
++        end[stream] = MAX(end[stream], VE_START(cfg) + bytes);
+     }
+     for (unsigned stream = 0; stream < 8; stream++) {
+         if (!end[stream]) {

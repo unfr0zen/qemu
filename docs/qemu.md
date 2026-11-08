@@ -548,8 +548,10 @@ accelerated OpenGL 4 core context: it translates GC400 vertex/fragment
 instructions, keeps render targets on the host GPU between draws, and writes
 tiled guest surfaces before pixel engine completion events, resolves, and
 software fallback. Synchronized targets remain cached until the guest changes
-their memory. It does not yet render every firmware correctly (6.5-14 text is
-drawn as solid boxes). Other hosts always use the software pipeline. QOM
+their memory. Textures use the host's reported size limit, including large
+A8 glyph atlases. A8 textures use single-channel host storage and upload only
+changed tile rows. Unsupported textures or shader instructions fall back to
+software. Other hosts always use the software pipeline. QOM
 properties `host-draws`, `software-draws`, and `host-flushes` expose backend
 counters.
 

@@ -1,0 +1,65 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: honor host texture limits
+
+Validate samplers against GL_MAX_TEXTURE_SIZE, including 8192-pixel A8
+atlases. Reject the host draw when a texture cannot be uploaded so the
+software pipeline can render it.
+
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -22,6 +22,7 @@
+     bool valid, dirty;
+     uint8_t *color_shadow, *depth_shadow;
+     unsigned width, height;
++    GLint max_texture_size;
+     VivDraw target;
+     VivHostTexture textures[256];
+     unsigned next_texture;
+@@ -52,6 +53,7 @@
+     CGLSetCurrentContext(h->context);
+     h->programs = g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
+                                       (GDestroyNotify)g_bytes_unref, NULL);
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &h->max_texture_size);
+     glGenFramebuffers(1, &h->fbo);
+     glGenTextures(1, &h->color);
+     glGenTextures(1, &h->depth);
+@@ -790,7 +792,7 @@
+     h->valid = true;
+ }
+ 
+-static void viv_gl_texture(VivHostGL *h, VivDraw *d, unsigned unit,
++static bool viv_gl_texture(VivHostGL *h, VivDraw *d, unsigned unit,
+                            GLuint program)
+ {
+     VivSampler *sm = &d->smp[unit];
+@@ -802,8 +804,9 @@
+         GL_REPEAT, GL_MIRRORED_REPEAT, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_BORDER,
+     };
+ 
+-    if (!sm->w || !sm->h || sm->w > 4096 || sm->h > 4096) {
+-        return;
++    if (!sm->w || !sm->h || sm->w > h->max_texture_size ||
++        sm->h > h->max_texture_size) {
++        return false;
+     }
+     while (maxlevel + 1 < VIV_LEVELS && sm->level[maxlevel + 1].addr &&
+            (sm->w >> maxlevel > 1 || sm->h >> maxlevel > 1)) {
+@@ -906,6 +909,7 @@
+     glBindTexture(GL_TEXTURE_2D, texture->name);
+     snprintf(name, sizeof(name), "tex%u", unit);
+     glUniform1i(glGetUniformLocation(program, name), unit);
++    return true;
+ }
+ 
+ /* Upload vertex streams without expanding indexed vertices on the CPU. */
+@@ -1043,8 +1047,8 @@
+                  2 * d->vp_offset[2] - 1, 0);
+     viv_samplers_prepare(d);
+     for (unsigned i = 0; i < VIV_SAMPLERS; i++) {
+-        if (d->smp[i].used) {
+-            viv_gl_texture(h, d, i, program);
++        if (d->smp[i].used && !viv_gl_texture(h, d, i, program)) {
++            return false;
+         }
+     }
+     if (!viv_gl_vertices(h, d, start, n, indexed, index_offset)) {

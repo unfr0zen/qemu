@@ -1,0 +1,167 @@
+From: Will
+Subject: [PATCH] hw/display: vivante: update A8 atlases by tile row
+
+Keep A8 textures in single-channel storage and upload changed tile rows.
+Preserve sampler swizzles and restore RGBA swizzles on cache replacement.
+
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -792,6 +792,79 @@
+     h->valid = true;
+ }
+ 
++/* Keep A8 atlases compact and upload only changed tile rows. */
++static void viv_gl_alpha_texture(VivHostTexture *texture, VivSampler *sm,
++                                 unsigned maxlevel, bool reuse)
++{
++    static const GLint channels[] = {
++        GL_ZERO, GL_ZERO, GL_ZERO, GL_RED, GL_ZERO, GL_ONE, GL_ZERO, GL_ZERO,
++    };
++    GLint swizzle[4];
++    unsigned offset = 0;
++
++    for (unsigned c = 0; c < 4; c++) {
++        unsigned component = sm->cfg1 & 0x00ffff00 ?
++                             (sm->cfg1 >> (8 + c * 4)) & 7 : c;
++        swizzle[c] = channels[component];
++    }
++    glBindTexture(GL_TEXTURE_2D, texture->name);
++    glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
++    for (unsigned l = 0; l <= maxlevel; l++) {
++        VivLevel *lv = &sm->level[l];
++        unsigned rows = reuse ? VIV_ROWS(sm->layout) :
++                               MAX(256u, VIV_ROWS(sm->layout));
++        g_autofree uint8_t *pixels = g_malloc(lv->w * rows);
++
++        if (!reuse) {
++            glTexImage2D(GL_TEXTURE_2D, l, GL_R8, lv->w, lv->h, 0,
++                         GL_RED, GL_UNSIGNED_BYTE, NULL);
++        }
++        for (unsigned y = 0; y < lv->h; y += rows) {
++            unsigned height = MIN(rows, lv->h - y);
++            unsigned first = y * lv->stride;
++            unsigned end = MIN((y + rows) * lv->stride, lv->surf.size);
++            bool changed = !reuse;
++
++            for (unsigned off = first; off < end;) {
++                unsigned n = MIN(end - off,
++                                 4096 - ((lv->surf.base + off) & 4095));
++                uint8_t *src = viv_surf_ptr(&lv->surf, off);
++                uint8_t *dst = texture->raw->data + offset + off;
++
++                if (!reuse || !src || memcmp(dst, src, n)) {
++                    changed = true;
++                    if (src) {
++                        memcpy(dst, src, n);
++                    } else {
++                        memset(dst, 0, n);
++                    }
++                }
++                off += n;
++            }
++            if (!changed) {
++                continue;
++            }
++            for (unsigned row = 0; row < height; row++) {
++                for (unsigned x = 0; x < lv->w; x += 4) {
++                    unsigned off = viv_pixel_offset(sm->layout, lv->stride,
++                                                    1, x, y + row);
++                    unsigned n = MIN(4u, lv->w - x);
++                    uint8_t *dst = pixels + row * lv->w + x;
++
++                    memset(dst, 0, n);
++                    if (off < lv->surf.size) {
++                        memcpy(dst, texture->raw->data + offset + off,
++                               MIN(n, lv->surf.size - off));
++                    }
++                }
++            }
++            glTexSubImage2D(GL_TEXTURE_2D, l, 0, y, lv->w, height,
++                            GL_RED, GL_UNSIGNED_BYTE, pixels);
++        }
++        offset += lv->surf.size;
++    }
++}
++
+ static bool viv_gl_texture(VivHostGL *h, VivDraw *d, unsigned unit,
+                            GLuint program)
+ {
+@@ -849,39 +922,51 @@
+             glGenTextures(1, &texture->name);
+             texture->raw = g_byte_array_new();
+         }
++        bool reuse = texture->raw->len == bytes &&
++                     !memcmp(texture->cfg, cfg, sizeof(cfg)) &&
++                     !memcmp(texture->addr, addresses, sizeof(addresses));
+         g_byte_array_set_size(texture->raw, bytes);
+-        offset = 0;
+-        for (unsigned l = 0; l <= maxlevel; l++) {
+-            VivLevel *lv = &sm->level[l];
+-            for (unsigned off = 0; off < lv->surf.size;) {
+-                uint8_t *p = viv_surf_ptr(&lv->surf, off);
+-                unsigned n = MIN(lv->surf.size - off,
+-                                 4096 - ((lv->surf.base + off) & 4095));
+-                if (p) {
+-                    memcpy(texture->raw->data + offset + off, p, n);
+-                } else {
+-                    memset(texture->raw->data + offset + off, 0, n);
++        if (sm->fmt == 1) {
++            viv_gl_alpha_texture(texture, sm, maxlevel, reuse);
++        } else {
++            static const GLint identity[] = {
++                GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA,
++            };
++            glBindTexture(GL_TEXTURE_2D, texture->name);
++            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, identity);
++            offset = 0;
++            for (unsigned l = 0; l <= maxlevel; l++) {
++                VivLevel *lv = &sm->level[l];
++                for (unsigned off = 0; off < lv->surf.size;) {
++                    uint8_t *p = viv_surf_ptr(&lv->surf, off);
++                    unsigned n = MIN(lv->surf.size - off,
++                                     4096 - ((lv->surf.base + off) & 4095));
++                    if (p) {
++                        memcpy(texture->raw->data + offset + off, p, n);
++                    } else {
++                        memset(texture->raw->data + offset + off, 0, n);
++                    }
++                    off += n;
+                 }
+-                off += n;
++                offset += lv->surf.size;
+             }
+-            offset += lv->surf.size;
+-        }
+-        glBindTexture(GL_TEXTURE_2D, texture->name);
+-        for (unsigned l = 0; l <= maxlevel; l++) {
+-            VivLevel *lv = &sm->level[l];
+-            g_autofree uint8_t *pixels = g_malloc(lv->w * lv->h * 4);
+-            for (unsigned y = 0; y < lv->h; y++) {
+-                for (unsigned x = 0; x < lv->w; x++) {
+-                    float c[4];
+-                    viv_texel(d, sm, lv, x, y, c);
+-                    viv_texture_swizzle(sm, c);
+-                    for (unsigned j = 0; j < 4; j++) {
+-                        pixels[(y * lv->w + x) * 4 + j] = viv_q(c[j], 255);
++            glBindTexture(GL_TEXTURE_2D, texture->name);
++            for (unsigned l = 0; l <= maxlevel; l++) {
++                VivLevel *lv = &sm->level[l];
++                g_autofree uint8_t *pixels = g_malloc(lv->w * lv->h * 4);
++                for (unsigned y = 0; y < lv->h; y++) {
++                    for (unsigned x = 0; x < lv->w; x++) {
++                        float c[4];
++                        viv_texel(d, sm, lv, x, y, c);
++                        viv_texture_swizzle(sm, c);
++                        for (unsigned j = 0; j < 4; j++) {
++                            pixels[(y * lv->w + x) * 4 + j] = viv_q(c[j], 255);
++                        }
+                     }
+                 }
++                glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, lv->w, lv->h, 0,
++                             GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+             }
+-            glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, lv->w, lv->h, 0,
+-                         GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+         }
+         unsigned min = (sm->cfg0 >> 7) & 3, mip = (sm->cfg0 >> 9) & 3;
+         GLint filter = min == 2 ? GL_LINEAR : GL_NEAREST;
