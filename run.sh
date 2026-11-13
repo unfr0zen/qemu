@@ -159,7 +159,6 @@ if [ "$machine" = onyx ]; then
 fi
 omap=0
 if [ "$machine" = j49 ] || [ "$machine" = diamond ]; then omap=1; fi
-if [ "$machine" = diamond ]; then provision=0; fi
 
 usb_attach=""
 if [ "$omap" = 1 ] && [ "$usb" = auto ]; then
@@ -399,10 +398,10 @@ fi
 # nothing is kept on the host, so any checkout and any NAND boot the same.
 PROVISION_QEMU="$MACHINE_ARGS -nographic -nic none"
 run_provision() {
-    [ "$machine" = j49 ] && set -- --j49 "$NAND" "$@"
-    [ "$machine" != j49 ] && [ -n "$root" ] && set -- --root "$root" "$@"
+    [ "$omap" = 1 ] && set -- --j49 "$NAND" "$@"
+    [ "$omap" != 1 ] && [ -n "$root" ] && set -- --root "$root" "$@"
     [ "$sleep" = 1 ] && set -- --sleep "$@"
-    [ "$machine" != j49 ] && [ -n "$hostname" ] && set -- --hostname "$hostname" "$@"
+    [ "$omap" != 1 ] && [ -n "$hostname" ] && set -- --hostname "$hostname" "$@"
     if [ "$use_docker" = 1 ]; then
         python3 "$script_path/scripts/provision.py" "$@" -- \
             docker run --rm -i --init -v "$repo_root:$repo_root" \
@@ -424,7 +423,7 @@ elif [ -n "$root" ] && [ "$provision" = 0 ] && [ -z "$stock_image" ]; then
     echo "ERROR: --root$root needs the pre-boot on diamond3 (drop --no-provision)" >&2
     exit 1
 fi
-if [ "$machine" = j49 ] && { [ "$provision" = 1 ] || [ -n "$stock_image" ]; }; then
+if [ "$omap" = 1 ] && { [ "$provision" = 1 ] || [ -n "$stock_image" ]; }; then
     # The release U-Boot silences the console (its built-in silent=1 blanks
     # the first console= it passes); the unit's own environment, edited as
     # fw_setenv would, adds a second one. The firmware is unchanged.

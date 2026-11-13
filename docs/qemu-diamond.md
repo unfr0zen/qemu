@@ -22,8 +22,14 @@ helper is used as a provisional UART3 peer.
 The machine targets a production Diamond-1.9/1.10 board. Earlier revisions
 include a 320×480 panel and other board wiring. The Diamond radio protocol,
 backplate identity, PWM backlight behavior, and complete stock boot remain
-unverified without a `diamond` NAND dump. Provisioning is disabled; the
-working NAND copy is not changed by a pre-boot. `--stock-image` is unavailable.
+unverified. `--stock-image` is unavailable.
+
+The environment and partition layout match the j49's, and so does the
+release U-Boot that blanks the first `console=`. The pre-boot is the j49's
+([the pre-boot](qemu-j49.md#the-pre-boot)): `addmodel` appends
+`console=ttyO0,115200`, a one-boot `init=/bin/sh` sets root's password to
+`nest` and puts a getty on `ttyO0`, so the console shows the kernel log and
+a `login:`. `--no-provision` boots the image unchanged, with a silent console.
 
 The Nest-Matter firmware bundle contains separate x-loader,
 U-Boot, kernel, and JFFS2 rootfs binaries. The x-loader binaries begin with
