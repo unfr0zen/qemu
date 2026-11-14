@@ -49,7 +49,7 @@ shellcheck --severity=warning $(git ls-files '*.sh')
 **Host side (Python, standard library only)** — QEMU exposes chardevs and QMP over sockets; these processes are the "rest of the hardware":
 
 - `run.sh` — picks the built binary (`qemu-src/build` or `build-docker`), keeps the NAND working copy in `.qemu/`, runs the pre-boot, then launches QEMU plus the helpers below.
-- `scripts/provision.py` — the pre-boot: a short boot with `init=/bin/sh` from U-Boot that uses the guest's own kernel to set the root password, quiet printk, keep the display on, save Wi-Fi, fix resolv.conf, mark OOB setup done and save backplate wiring. Writes go through the kernel so UBIFS/JFFS2 journals stay consistent; never edit the filesystem images from the host. `--no-provision` skips it.
+- `scripts/provision.py` — the pre-boot: a short boot with `init=/bin/sh` from U-Boot that uses the guest's own kernel to set the root password, allow root over ssh, quiet printk, keep the display on, save Wi-Fi, fix resolv.conf, mark OOB setup done and save backplate wiring. Writes go through the kernel so UBIFS/JFFS2 journals stay consistent; never edit the filesystem images from the host. `--no-provision` skips it.
 - `ui/ui.py` — `--ui` web server (`ui/index.html`): screen via QMP screendump streamed over SSE, button/firmware lines via the `flintstone.board` chardev, wheel via a QMP machine property, serial console shared with the terminal. Its HTTP API is the only path to the unit for other tools.
 - `ui/backplate.py` — fake backplate MCU on the sensor UART (framed protocol reverse-engineered from nlclient: temp, PIR, ALS, wiring).
 - `ui/em35x.py` — the EM35x ConnectIP NCP application behind the `em35x-ncp` device's chardev (framing lives in QEMU, the app here).

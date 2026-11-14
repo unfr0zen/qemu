@@ -262,6 +262,22 @@ def root_login(con, replace=False):
     return "root login: root / nest"
 
 
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+
+
+def ssh_login(con):
+    """Let root log in over ssh (run.sh --ssh): the stock sshd refuses it."""
+    if con.run(f"grep -q '^PermitRootLogin yes' {SSHD_CONFIG}") == 0:
+        return "ssh: root login already"
+    if con.run(f"test -f {SSHD_CONFIG}") != 0:
+        return "ssh: no sshd config"
+    if con.run(f"sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' {SSHD_CONFIG} && "
+               f"grep -q '^PermitRootLogin yes' {SSHD_CONFIG} || "
+               f"echo 'PermitRootLogin yes' >> {SSHD_CONFIG}") != 0:
+        raise RuntimeError(f"could not write {SSHD_CONFIG}")
+    return "ssh: root login"
+
+
 # Ahead of rcS, as a loop of its own: busybox init starts its respawn
 # entries only once sysinit is done, and NoLongerEvil's rcS never is (it
 # ends in sshconnect's endless loop).
@@ -534,6 +550,7 @@ def main():
             mac, root = shell(con, root=args.root)
             done.append(f"root file system: {root}")
             done.append(root_login(con))
+            done.append(ssh_login(con))
             done.append(quiet_console(con))
             done.append(screen(con, args.sleep))
             done.append(hostname(con, args.hostname))

@@ -17,8 +17,8 @@ logical NAND image ([what it must be](nand-image.md)) and pass it to the
 first boot with `--nand`, which seeds the unit's working copy from it. The
 host needs Docker and `python3` (macOS and Linux alike; QEMU builds and
 runs in Docker).
-The unit boots to the thermostat, with a root login (root / nest), WiFi
-joined, setup done.
+The unit boots to the thermostat, with a root login (root / nest) on the
+console and over ssh (`--ssh`), WiFi joined, setup done.
 
 ```sh
 ./setup.sh docker               # clone QEMU v11.0.0, apply patches/, build QEMU (~15 min once)
