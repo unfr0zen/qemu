@@ -271,6 +271,43 @@ class VivanteTests(VivanteRenderer, unittest.TestCase):
         self.assertEqual(self.pixel(56, 48), 0xffffffff)
         self.assertEqual(self.pixel(8, 48), 0xffffffff)
 
+    def stencil_target(self, top):
+        """D24S8 depth/stencil at 0x85000000: stencil `top` in rows 0-31."""
+        self.states.update({0x500: 1 << 4, 0x504: 0x05000000, 0x505: 64 * 4})
+        stencil = bytearray(64 * 64 * 4)
+        for y in range(32):
+            for x in range(64):
+                stencil[self.offset(x, y, 64 * 4, 4)] = top
+        self.write(0x85000000, stencil)
+
+    def stencil(self, x, y):
+        address = 0x85000000 + self.offset(x, y, 64 * 4, 4)
+        return int(self.command(f"readl {address:#x}")[1], 16) & 0xff
+
+    def test_stencil_masks_cover_quad(self):
+        self.stencil_target(1)
+        # EQUAL against reference 1, all bits compared, nothing written.
+        self.states.update({0x506: 2, 0x507: 1 | (1 << 8) | (0xff << 16)})
+        self.draw()
+        self.assertEqual(self.pixel(56, 8), 0xffffffff)
+        self.assertEqual(self.pixel(56, 48), 0)
+
+    def test_two_sided_stencil_ops(self):
+        self.stencil_target(0)
+        # ALWAYS; the quad faces front: INCR_WRAP there, DECR_WRAP on back.
+        self.states.update({
+            0x506: 7 | (6 << 4) | ((7 | (7 << 4)) << 16),
+            0x507: 2 | (0xff << 16) | (0xff << 24),
+            0x528: 0, 0x52e: 0xffff,
+        })
+        self.draw()
+        self.assertEqual(self.stencil(56, 8), 1)
+        self.assertEqual(self.stencil(8, 48), 1)
+        self.states[0x506] = 7 | (7 << 4)  # Front DECR_WRAP: back to zero.
+        self.states[0x50c] += 0x10000
+        self.draw()
+        self.assertEqual(self.stencil(56, 8), 0)
+
     def wide_atlas(self, width):
         self.states[0x810] = (4 << 16) | width
         stride = (width + 15) & ~15

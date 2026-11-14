@@ -1,0 +1,52 @@
+From 1685297e6720bbf4b0a7950102c9a9031969b88d Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 10:08:28 -0500
+Subject: [PATCH] hw/display: vivante: apply stencil state on the host GPU
+
+The host renderer disabled the stencil test, so femtovg's stencil-then-cover
+fills drew their whole bounding box: a solid block where a concave path or
+translucent stroke belonged. Map the one- and two-sided stencil state to GL.
+---
+ hw/display/vivante_host_gl.inc.c | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/vivante_host_gl.inc.c b/hw/display/vivante_host_gl.inc.c
+index db9b98e..1d2c16f 100644
+--- a/hw/display/vivante_host_gl.inc.c
++++ b/hw/display/vivante_host_gl.inc.c
+@@ -1325,7 +1325,34 @@ static bool viv_host_draw(VivDraw *d, uint32_t prim, uint32_t start,
+         glDisable(GL_DEPTH_TEST);
+     }
+     glDepthMask(d->zs && (d->z_cfg & PE_DEPTH_WRITE));
+-    glDisable(GL_STENCIL_TEST);
++    unsigned smode = d->st[ST_PE_STENCIL_CONFIG] & 3;
++    if (d->zs && d->z_bpp == 4 && smode) {
++        static const GLenum ops[] = {
++            GL_KEEP, GL_ZERO, GL_REPLACE, GL_INCR, GL_DECR, GL_INVERT,
++            GL_INCR_WRAP, GL_DECR_WRAP,
++        };
++        uint32_t scfg = d->st[ST_PE_STENCIL_CONFIG];
++        uint32_t ext = d->st[ST_PE_STENCIL_CONFIG_EXT];
++        uint32_t ext2 = d->st[ST_PE_STENCIL_CONFIG_EXT2];
++
++        glEnable(GL_STENCIL_TEST);
++        /* Mode 1 applies the front state to both faces; mode 2 is two-sided. */
++        for (unsigned face = 0; face < 2; face++) {
++            bool back = face && smode == 2;
++            uint32_t op = d->st[ST_PE_STENCIL_OP] >> (back ? 16 : 0);
++            GLenum side = face ? GL_BACK : GL_FRONT;
++
++            glStencilFuncSeparate(side, compare[op & 7],
++                                  back ? ext & 0xff : (scfg >> 8) & 0xff,
++                                  back ? ext2 & 0xff : (scfg >> 16) & 0xff);
++            glStencilOpSeparate(side, ops[(op >> 8) & 7], ops[(op >> 12) & 7],
++                                ops[(op >> 4) & 7]);
++            glStencilMaskSeparate(side,
++                                  back ? (ext2 >> 8) & 0xff : scfg >> 24);
++        }
++    } else {
++        glDisable(GL_STENCIL_TEST);
++    }
+     glColorMask(d->rt_mask & 1, d->rt_mask & 2,
+                  d->rt_mask & 4, (d->rt_mask & 8) && d->rt_fmt != 5);
+     uint32_t blend = d->st[ST_PE_ALPHA_CONFIG];

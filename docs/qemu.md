@@ -551,9 +551,9 @@ Docker runs and other machines retain their defaults. Running QEMU directly
 uses software unless `-global vivante-gc.host-gpu=on` is supplied.
 macOS uses an accelerated CGL context; Linux uses EGL device enumeration and
 libepoxy with an offscreen OpenGL 3.3 core context. The shared renderer translates GC400 vertex/fragment
-instructions, keeps render targets on the host GPU between draws, and writes
-tiled guest surfaces before pixel engine completion events, resolves, and
-software fallback. Synchronized targets remain cached until the guest changes
+instructions, applies depth, stencil and blend state, keeps render targets on
+the host GPU between draws, and writes tiled guest surfaces before pixel
+engine completion events, resolves, and software fallback. Synchronized targets remain cached until the guest changes
 their memory. Textures use the host's reported size limit, including large
 A8 glyph atlases. A8 textures use single-channel host storage and upload only
 changed tile rows. Unsupported textures or shader instructions fall back to
