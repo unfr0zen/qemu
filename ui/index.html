@@ -227,8 +227,14 @@
           <tspan x="170" dy="-6">Guest has not initialized</tspan>
           <tspan x="170" dy="12">the display (yet).</tspan>
         </text>
-        <image id="screen" x="58" y="58" width="224" height="299" preserveAspectRatio="none"
-               transform="rotate(-90 170 170)" href="" style="display:none"/>
+        <!-- frames are drawn on a canvas once decoded: an <image> given a new
+             href paints empty until the browser decodes it, a black flash
+             whenever frames come in quick succession -->
+        <foreignObject id="screen" x="58" y="58" width="224" height="299"
+                       transform="rotate(-90 170 170)" style="display:none">
+          <canvas xmlns="http://www.w3.org/1999/xhtml" id="screenCanvas"
+                  style="display:block; width:100%; height:100%; object-fit:fill"></canvas>
+        </foreignObject>
       </g>
       <!-- the cover glass catching the light (over the display too) -->
       <g pointer-events="none">
@@ -351,7 +357,7 @@
     $("screenPlaceholder").setAttribute("height", 2 * r);
     const img = $("screen");
     img.setAttribute("height", panel ? 299 : 2 * r);  // the display is 2r across
-    img.setAttribute("preserveAspectRatio", panel ? "none" : "xMidYMid meet");
+    $("screenCanvas").style.objectFit = panel ? "fill" : "contain";
     if (panel) img.setAttribute("transform", "rotate(-90 170 170)");
     else img.removeAttribute("transform");
     if (!panel && !j49) {
@@ -362,15 +368,29 @@
       img.setAttribute("height", height * scale);
     }
   }
+  // Frames decode off screen and are drawn in order: one that finishes
+  // decoding after a newer one was drawn is dropped.
+  let screenFrame = 0, screenDrawn = 0;
   function openScreen(es) {
-    es.addEventListener("frame", (e) => {
+    es.addEventListener("frame", async (e) => {
+      const n = ++screenFrame;
+      const png = Uint8Array.from(atob(e.data), (c) => c.charCodeAt(0));
+      const bitmap = await createImageBitmap(new Blob([png], { type: "image/png" }));
+      if (n < screenDrawn) { bitmap.close(); return; }
+      screenDrawn = n;
       if (!gotFrame) {
         gotFrame = true;
         $("screenUnavailable").style.display = "none";
         $("screen").style.display = "";
       }
       placeScreen(e.data);
-      $("screen").setAttribute("href", "data:image/png;base64," + e.data);
+      const canvas = $("screenCanvas");
+      if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+        canvas.width = bitmap.width;          // resizing clears the canvas
+        canvas.height = bitmap.height;
+      }
+      canvas.getContext("2d").drawImage(bitmap, 0, 0);
+      bitmap.close();
     });
     es.addEventListener("fps", (e) => { $("fpsDevice").textContent = e.data; });
   }
