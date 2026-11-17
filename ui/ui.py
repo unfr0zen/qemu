@@ -523,7 +523,7 @@ def backplate_control(spec, want):
 
 
 def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem=None,
-                 debugger=None):
+                 debugger=None, face="steel"):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -554,7 +554,7 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
                     self.send_body(200, "text/html; charset=utf-8", f.read())
             elif self.path == "/config":
-                body = json.dumps({"pins": pins, "name": name}).encode()
+                body = json.dumps({"pins": pins, "name": name, "face": face}).encode()
                 self.send_body(200, "application/json", body)
             elif self.path == "/usb":
                 self.usb({})
@@ -1125,6 +1125,9 @@ def main():
     ap.add_argument("--pins", help="name=LINE,... from the board's wiring")
     ap.add_argument("--name", default="Nest",
                     help="the unit, as the page titles it (e.g. 'Nest diamond3')")
+    ap.add_argument("--face", choices=("steel", "onyx"), default="steel",
+                    help="the housing the page draws: the steel-ring Learning "
+                         "thermostats, or the Thermostat E's white body")
     ap.add_argument("--screen-period", type=float, default=0.01,
                     help="seconds between screendumps")
     ap.add_argument("--parent", type=int,
@@ -1162,7 +1165,7 @@ def main():
     server = Server(("127.0.0.1", args.port),
                     make_handler(board, log, screen, qmp, parse_pins(args.pins),
                                  args.name, args.backplate,
-                                 filesystem, debugger))
+                                 filesystem, debugger, args.face))
     if log and args.keyboard and os.isatty(0):
         threading.Thread(target=Keyboard(log, qmp, args.parent).run,
                          daemon=True).start()

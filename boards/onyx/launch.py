@@ -108,7 +108,7 @@ def launch(args):
                       "--console", f"tcp:127.0.0.1:{console}", "--echo-console",
                       "--screen-file", str(Path(directory) / "screen.ppm"),
                       "--screen-period", "1", "--port", str(http),
-                      "--name", "Nest onyx", "--parent", str(os.getpid())]
+                      "--name", "Nest onyx", "--face", "onyx", "--parent", str(os.getpid())]
         keyboard = sys.stdin.isatty() and sys.stdout.isatty()
         if keyboard:
             ui_command.append("--keyboard")
