@@ -1,0 +1,32 @@
+From d13d3ef0552574628824a14eb8a9f376caf2fa4b Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:50:59 -0500
+Subject: [PATCH 151/151] hw/net: wl1271: post at most 7 rx frames a batch
+
+wl12xx counts the frames in a batch as fw_rx_counter's change modulo its 8
+descriptors, so a batch of 8 read as none: the driver never read it and
+every later frame queued behind it, which stopped the link for good.
+---
+ hw/net/wl1271.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/hw/net/wl1271.c b/hw/net/wl1271.c
+index 046ae66..776e592 100644
+--- a/hw/net/wl1271.c
++++ b/hw/net/wl1271.c
+@@ -341,7 +341,11 @@ static void wl_rx_kick(WL1271State *s)
+     }
+     g_byte_array_set_size(s->rxbuf, 0);
+     s->rx_pos = 0;
+-    while (n < 8 && !g_queue_is_empty(s->rxq)) {
++    /*
++     * At most 7: the driver counts new frames as the counter's change
++     * modulo the 8 descriptors, so a batch of 8 would read as none.
++     */
++    while (n < 7 && !g_queue_is_empty(s->rxq)) {
+         GByteArray *f = g_queue_peek_head(s->rxq);
+ 
+         if (s->rxbuf->len + f->len > WL_RX_BATCH_MAX) {
+-- 
+2.54.0 (Apple Git-157)
+

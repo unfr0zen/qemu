@@ -201,6 +201,7 @@ per patch, applied after the diamond3's (0001–0036):
 | 0121 | GPMC READ0 resumes page data after NAND status polling |
 | 0122 | DISPC reset clock divisors |
 | 0123 | Selectable WL1271 firmware API version |
+| 0150–0151 | WL1271 RX tracing; RX batches of at most 7 frames |
 
 ## Homebrew Linux
 
