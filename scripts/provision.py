@@ -376,7 +376,7 @@ SLIRP_ADDR, SLIRP_GW, SLIRP_DNS, SLIRP_PREFIX = \
 IPV4_STATIC = ["IPv4.method=manual", f"IPv4.local_address={SLIRP_ADDR}",
                f"IPv4.netmask_prefixlen={SLIRP_PREFIX}",
                f"IPv4.gateway={SLIRP_GW}",
-               f"Nameservers.configuration={SLIRP_DNS};"]
+               f"Nameservers={SLIRP_DNS};"]
 
 
 def wifi(con, mac, ssid):
@@ -404,9 +404,12 @@ def wifi(con, mac, ssid):
                    f"chmod 600 {d}/settings") != 0:
             raise RuntimeError("could not save the network")
         return f"wifi: \"{ssid}\" saved with a gateway, joined at boot"
-    if con.run(f"grep -q '^IPv4.gateway={SLIRP_GW}$' {d}/settings") == 0:
+    if con.run(f"grep -q '^IPv4.gateway={SLIRP_GW}$' {d}/settings && "
+               f"grep -q '^Nameservers={SLIRP_DNS};$' "
+               f"{d}/settings") == 0:
         return f"wifi: \"{ssid}\" already saved"
-    # An older run saved it with DHCP: drop its IPv4 lines and append ours.
+    # Saved with DHCP, or without a nameserver connman reads: drop its IPv4
+    # and nameserver lines and append ours.
     add = " ".join(map(shlex.quote, IPV4_STATIC))
     if con.run(f"sed -i -e '/^IPv4\\./d' -e '/^Nameservers/d' {d}/settings && "
                f"printf '%s\\n' {add} >> {d}/settings") != 0:
