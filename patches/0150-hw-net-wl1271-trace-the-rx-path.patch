@@ -1,0 +1,53 @@
+From 03de1f5bae9eb921fd161816ca43f672bfa52b6d Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:50:59 -0500
+Subject: [PATCH 150/151] hw/net: wl1271: trace the rx path
+
+Log each batch posted, read, held behind an unread one, and each frame
+dropped, with wl1271.trace=on: what a stalled link needs to be told apart.
+---
+ hw/net/wl1271.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hw/net/wl1271.c b/hw/net/wl1271.c
+index 84acdb1..046ae66 100644
+--- a/hw/net/wl1271.c
++++ b/hw/net/wl1271.c
+@@ -335,6 +335,8 @@ static void wl_rx_kick(WL1271State *s)
+     unsigned n = 0;
+ 
+     if (s->rx_pos < s->rxbuf->len) {
++        wl_trace(s, "rx held: pos %u len %u q %u", s->rx_pos, s->rxbuf->len,
++                 g_queue_get_length(s->rxq));
+         return;
+     }
+     g_byte_array_set_size(s->rxbuf, 0);
+@@ -357,6 +359,8 @@ static void wl_rx_kick(WL1271State *s)
+         s->intr |= INTR_DATA;
+         wl_sync_status(s);
+         wl_update_irq(s);
++        wl_trace(s, "rx post %u (%u bytes) counter %u", n, s->rxbuf->len,
++                 s->fw_rx_counter);
+     }
+     if (s->nic && g_queue_get_length(s->rxq) < WL_RXQ_MAX) {
+         qemu_flush_queued_packets(qemu_get_queue(s->nic));
+@@ -372,6 +376,8 @@ static void wl_rx_frame(WL1271State *s, const uint8_t *frame, unsigned len,
+     uint8_t d[16] = { 0 };
+ 
+     if (!s->running || g_queue_get_length(s->rxq) >= WL_RXQ_MAX) {
++        wl_trace(s, "rx drop: running %d q %u", s->running,
++                 g_queue_get_length(s->rxq));
+         return;
+     }
+     stw_le_p(d, total >> 2);
+@@ -401,6 +407,7 @@ static void wl_rx_read(WL1271State *s, uint8_t *buf, unsigned len)
+ 
+     memcpy(buf, s->rxbuf->data + s->rx_pos, n);
+     memset(buf + n, 0, len - n);
++    wl_trace(s, "rx read %u at %u of %u", len, s->rx_pos, s->rxbuf->len);
+     s->rx_pos += n;
+     wl_rx_kick(s);
+ }
+-- 
+2.54.0 (Apple Git-157)
+
