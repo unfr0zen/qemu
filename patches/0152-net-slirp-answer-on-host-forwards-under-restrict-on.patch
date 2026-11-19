@@ -1,0 +1,182 @@
+From 01a115b4df6e21be096647ea6e6cd212b322ea80 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:21:04 -0500
+Subject: [PATCH 152/152] net/slirp: answer on host forwards under restrict=on
+
+libslirp's restricted mode drops every UDP packet the guest sends but
+DHCP, DNS and TFTP, so a guest never answered on a UDP host forward
+(Matter's 5540). Enforce restrict=on here instead: the guest reaches the
+virtual network's DHCP and DNS and its guest forwards, and answers on its
+host forwards; nothing else leaves.
+---
+ net/slirp.c | 111 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 110 insertions(+), 1 deletion(-)
+
+diff --git a/net/slirp.c b/net/slirp.c
+index 04925f3..da6d152 100644
+--- a/net/slirp.c
++++ b/net/slirp.c
+@@ -96,6 +96,11 @@ typedef struct SlirpState {
+     gchar *smb_dir;
+ #endif
+     GSList *fwd;
++    /* restrict=on, enforced by slirp_restricted_allows() */
++    bool restricted;
++    struct in_addr vnet, vmask, vdns;
++    GArray *hostfwd_ports;  /* guest port, | 0x10000 for UDP */
++    GArray *guestfwd_addrs; /* address << 16 | port, host byte order */
+ } SlirpState;
+ 
+ static struct slirp_config_str *slirp_configs;
+@@ -130,10 +135,96 @@ static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
+     return qemu_send_packet(&s->nc, pkt, pkt_len);
+ }
+ 
++/*
++ * restrict=on, enforced here instead of by libslirp, whose restricted mode
++ * drops every UDP packet the guest sends but DHCP, DNS and TFTP: the replies
++ * on its UDP host forwards with them. The guest still reaches no one but
++ * the virtual network's DHCP and DNS and its guest forwards; it answers on
++ * its host forwards, TCP and UDP alike.
++ */
++static bool slirp_forwarded(SlirpState *s, bool udp, uint16_t port)
++{
++    uint32_t want = port | (udp ? 0x10000 : 0);
++
++    for (guint i = 0; i < s->hostfwd_ports->len; i++) {
++        if (g_array_index(s->hostfwd_ports, uint32_t, i) == want) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool slirp_restricted_allows(SlirpState *s, const uint8_t *buf,
++                                    size_t size)
++{
++    uint16_t type;
++
++    if (size < ETH_HLEN) {
++        return false;
++    }
++    type = lduw_be_p(buf + 12);
++    if (type == ETH_P_ARP) {
++        return true;
++    }
++    if (type == ETH_P_IP && size >= ETH_HLEN + 20) {
++        const uint8_t *ip = buf + ETH_HLEN;
++        size_t ihl = (ip[0] & 0xf) * 4;
++        uint8_t proto = ip[9];
++        bool first = (lduw_be_p(ip + 6) & 0x1fff) == 0;
++        uint32_t dst = ldl_be_p(ip + 16);
++        uint16_t sport = 0, dport = 0;
++
++        if ((proto == IPPROTO_TCP || proto == IPPROTO_UDP) && first &&
++            size >= ETH_HLEN + ihl + 4) {
++            sport = lduw_be_p(ip + ihl);
++            dport = lduw_be_p(ip + ihl + 2);
++        }
++        if (proto == IPPROTO_UDP && dport == 67) {
++            return true; /* DHCP */
++        }
++        if (dst == ntohl(s->vdns.s_addr)) {
++            return true;
++        }
++        if (sport && slirp_forwarded(s, proto == IPPROTO_UDP, sport)) {
++            return true;
++        }
++        if (proto == IPPROTO_TCP && dport) {
++            uint64_t want = (uint64_t)dst << 16 | dport;
++
++            for (guint i = 0; i < s->guestfwd_addrs->len; i++) {
++                if (g_array_index(s->guestfwd_addrs, uint64_t, i) == want) {
++                    return true;
++                }
++            }
++        }
++        return proto == IPPROTO_ICMP &&
++               (dst & ntohl(s->vmask.s_addr)) == ntohl(s->vnet.s_addr);
++    }
++    if (type == ETH_P_IPV6 && size >= ETH_HLEN + 40) {
++        const uint8_t *ip6 = buf + ETH_HLEN;
++        uint8_t next = ip6[6];
++
++        if (next == IPPROTO_ICMPV6) {
++            /* Neighbour discovery, which slirp answers itself. */
++            return ip6[24] == 0xff ||
++                   (ip6[24] == 0xfe && (ip6[25] & 0xc0) == 0x80);
++        }
++        if ((next == IPPROTO_TCP || next == IPPROTO_UDP) &&
++            size >= ETH_HLEN + 40 + 4) {
++            return slirp_forwarded(s, next == IPPROTO_UDP,
++                                   lduw_be_p(ip6 + 40));
++        }
++    }
++    return false;
++}
++
+ static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+ {
+     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+ 
++    if (s->restricted && !slirp_restricted_allows(s, buf, size)) {
++        return size;
++    }
+     slirp_input(s->slirp, buf, size);
+ 
+     return size;
+@@ -158,6 +249,8 @@ static void net_slirp_cleanup(NetClientState *nc)
+     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+ 
+     g_slist_free_full(s->fwd, slirp_free_fwd);
++    g_array_free(s->hostfwd_ports, true);
++    g_array_free(s->guestfwd_addrs, true);
+     main_loop_poll_remove_notifier(&s->poll_notifier);
+     unregister_savevm(NULL, "slirp", s->slirp);
+     slirp_cleanup(s->slirp);
+@@ -640,11 +733,17 @@ static int net_slirp_init(NetClientState *peer, const char *model,
+                       restricted ? "on" : "off");
+ 
+     s = DO_UPCAST(SlirpState, nc, nc);
++    s->restricted = restricted;
++    s->vnet = net;
++    s->vmask = mask;
++    s->vdns = dns;
++    s->hostfwd_ports = g_array_new(false, false, sizeof(uint32_t));
++    s->guestfwd_addrs = g_array_new(false, false, sizeof(uint64_t));
+ 
+     cfg.version =
+          SLIRP_CHECK_VERSION(4, 9, 0) ? 6 :
+          SLIRP_CHECK_VERSION(4, 7, 0) ? 4 : 1;
+-    cfg.restricted = restricted;
++    cfg.restricted = false; /* see slirp_restricted_allows() */
+     cfg.in_enabled = ipv4;
+     cfg.vnetwork = net;
+     cfg.vnetmask = mask;
+@@ -946,6 +1045,11 @@ static int slirp_hostfwd(SlirpState *s, const char *redir_str, Error **errp)
+                    redir_str);
+         return -1;
+     }
++    {
++        uint32_t forwarded = guest_port | (is_udp ? 0x10000 : 0);
++
++        g_array_append_val(s->hostfwd_ports, forwarded);
++    }
+     return 0;
+ 
+  fail_syntax:
+@@ -1147,6 +1251,11 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp)
+ 
+     snprintf(buf, sizeof(buf), "guestfwd.tcp.%d", port);
+ 
++    {
++        uint64_t forwarded = (uint64_t)ntohl(server.s_addr) << 16 | port;
++
++        g_array_append_val(s->guestfwd_addrs, forwarded);
++    }
+     if (g_str_has_prefix(p, "cmd:")) {
+         if (slirp_add_exec(s->slirp, &p[4], &server, port) < 0) {
+             error_setg(errp, "Conflicting/invalid host:port in guest "
+-- 
+2.54.0 (Apple Git-157)
+

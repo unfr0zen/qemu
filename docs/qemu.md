@@ -376,7 +376,9 @@ unit's own network is the open access point `QEMU`, channel 6, BSSID
 `02:43:34:10:00:01`. `run.sh` puts QEMU's user-mode network behind it
 (`-nic user,model=bcm43341,restrict=on`), so the unit is 10.0.2.15 with a
 default route through 10.0.2.2 (set by the pre-boot, below), and nothing
-past that. `--cloud`
+past that. `restrict=on` is enforced by QEMU's front end (patch 0152), not
+libslirp: the unit still answers on host forwards, UDP included (Matter on
+5540), and reaches its guest forwards and slirp's DHCP and DNS. `--cloud`
 lifts `restrict=on`. Online, the unit signs in to Nest's service as the
 device the image came from and takes on that account's state: °F, and
 firmware updates, which it downloads and installs into
