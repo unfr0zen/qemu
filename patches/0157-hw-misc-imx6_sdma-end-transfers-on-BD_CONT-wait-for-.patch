@@ -1,0 +1,70 @@
+From 964180fdc9440dd6917e7a4a3eb1f87a3b641317 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 01:38:24 -0500
+Subject: [PATCH 157/158] hw/misc: imx6_sdma: end transfers on BD_CONT, wait
+ for re-armed BDs
+
+A channel stopped at the first BD without DONE. A cyclic transfer
+(the vendor UART driver's receive ring) has the driver re-arm its BDs
+in memory, with no H_START, so a channel that caught up with the
+driver stopped for good.
+
+Follow the descriptors instead: a BD without CONT ends the transfer and
+stops the channel, as scatter-gather's last BD does; otherwise the
+channel waits at a BD the driver has not handed back and retries it on
+its next request.
+---
+ hw/misc/imx6_sdma.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/hw/misc/imx6_sdma.c b/hw/misc/imx6_sdma.c
+index b09cbc1..34c1110 100644
+--- a/hw/misc/imx6_sdma.c
++++ b/hw/misc/imx6_sdma.c
+@@ -23,9 +23,12 @@
+  * line is high, the channel moves one word per step (the BD command is
+  * the width: 0 for 32 bits, else bytes). Events in the rx-events mask
+  * read the peripheral into memory, the others write memory to it. A
+- * finished BD drops DONE, raises the channel's interrupt if it has INTR
+- * and passes to the next BD, or back to the base one after WRAP. A
+- * channel stops at a BD that is not DONE, or on H_STATSTOP.
++ * finished BD drops DONE and raises the channel's interrupt if it has
++ * INTR. With CONT the channel passes to the next BD, or back to the base
++ * one after WRAP, and waits there until the driver hands that BD back
++ * with DONE (a cyclic ring re-arms its BDs in memory only); without CONT
++ * the transfer is over and the channel stops. A channel also stops on
++ * H_STATSTOP.
+  *
+  * Transfers run in a bottom half, so a peripheral that raises a request
+  * while the model writes it does not re-enter the model.
+@@ -65,6 +68,7 @@
+ 
+ #define BD_DONE         0x01
+ #define BD_WRAP         0x02
++#define BD_CONT         0x04
+ #define BD_INTR         0x08
+ 
+ #define C0_SETDM        0x01
+@@ -175,8 +179,7 @@ static bool sdma_channel_step(Imx6SdmaState *s, int ch)
+     mode = sdma_ldl(bd);
+     status = (mode >> 16) & 0xff;
+     if (!(status & BD_DONE)) {
+-        s->running &= ~BIT(ch);
+-        return false;
++        return false;               /* not handed back yet */
+     }
+     count = mode & 0xffff;
+     width = (mode >> 24) & 3 ? (mode >> 24) & 3 : 4;
+@@ -202,6 +205,9 @@ static bool sdma_channel_step(Imx6SdmaState *s, int ch)
+         s->bd[ch] = status & BD_WRAP ? sdma_ldl(sdma_ccb(s, ch) + 4)
+                                      : bd + SDMA_BD_SIZE;
+         s->pos[ch] = 0;
++        if (!(status & BD_CONT)) {
++            s->running &= ~BIT(ch);
++        }
+     }
+     return true;
+ }
+-- 
+2.56.1
+
