@@ -45,7 +45,7 @@
 #   ./run.sh --diamond3 [--ui]   # diamond3 (the default machine)
 #   ./run.sh --j49 [--ui]        # j49 from its own image
 #   ./run.sh --diamond [--ui]    # diamond from its own raw NAND
-#   ./run.sh --onyx [--ui]       # Onyx NAND bring-up (serial/QMP only)
+#   ./run.sh --onyx [--ui]       # onyx (Nest Thermostat E) from its own image
 #   ./run.sh --machine diamond   # explicit machine selection
 #
 # QEMU_FORCE_DOCKER=1 runs a native build through Linux/Docker as well.
@@ -149,9 +149,9 @@ if [ "$machine" = diamond ] && [ -n "$stock_image" ]; then
     exit 1
 fi
 if [ "$machine" = onyx ]; then
-    if [ "$usb" = 1 ] || [ "$cloud" = 1 ] || [ "$sleep" = 1 ] ||
-        [ -n "$hostname$stock_image$mqtt$nic_extra$ssh_port$root" ] || [ "$gdb" = 1 ]; then
-        echo "ERROR: Onyx supports --nand, --ui, --ui-port and --no-provision; networking and board helpers are not modelled" >&2
+    if [ "$usb" = 1 ] || [ "$sleep" = 1 ] ||
+        [ -n "$hostname$stock_image$root" ] || [ "$gdb" = 1 ]; then
+        echo "ERROR: Onyx supports --nand, --ui, --ui-port, --no-provision, --cloud, --ssh, --mqtt and --nic-extra" >&2
         exit 1
     fi
     usb=0
@@ -325,34 +325,6 @@ QEMU_ICOUNT="${QEMU_ICOUNT:-off}"
 ICOUNT_ARGS=""
 [ "$QEMU_ICOUNT" != "off" ] && ICOUNT_ARGS="-icount $QEMU_ICOUNT"
 
-if [ "$machine" = onyx ]; then
-    tag="imx6-qemu-build:$(shasum -a 256 "$script_path/docker/Dockerfile" | cut -c1-12)"
-    # The pre-boot (root / nest, root over ssh, quiet console, display on,
-    # the backplate's wiring as the saved one)
-    # drives U-Boot's prompt and a shell on the console. Closed fuses
-    # disconnect that UART, so its short boot runs with open fuses; the
-    # boot below keeps the fuses it is given.
-    if [ "$provision" = 1 ]; then
-        onyx_pre="-M onyx,secure-boot=off -m 128M -nographic -nic none -parallel none -watchdog-action none"
-        if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
-            python3 "$script_path/scripts/provision.py" --onyx -- \
-                docker run --rm -i --init -v "$repo_root:$repo_root" \
-                -w "$repo_root" "$tag" "$QEMU" $onyx_pre \
-                -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
-        else
-            python3 "$script_path/scripts/provision.py" --onyx -- "$QEMU" $onyx_pre \
-                -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
-        fi || echo "provision: booting the unit as it is" >&2
-    fi
-    set -- -- "$@"
-    if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
-        set -- --docker "$tag" "$@"
-    fi
-    [ "$ui" = 1 ] && set -- --ui "$@"
-    exec python3 "$script_path/boards/onyx/launch.py" \
-        --qemu "$QEMU" --nand "$NAND" --snapshot "$NAND_SNAP" \
-        --ui-port "$ui_port" "$@"
-fi
 
 extra=""
 case "$*" in
@@ -389,6 +361,39 @@ if [ -n "$ssh_port" ]; then
     else
         nic_extra="$nic_extra,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
     fi
+fi
+if [ "$machine" = onyx ]; then
+    tag="imx6-qemu-build:$(shasum -a 256 "$script_path/docker/Dockerfile" | cut -c1-12)"
+    # The pre-boot (root / nest, root over ssh, quiet console, display on,
+    # the backplate's wiring as the saved one)
+    # drives U-Boot's prompt and a shell on the console. Closed fuses
+    # disconnect that UART, so its short boot runs with open fuses; the
+    # boot below keeps the fuses it is given.
+    if [ "$provision" = 1 ]; then
+        onyx_pre="-M onyx,secure-boot=off -m 128M -nographic -nic none -parallel none -watchdog-action none"
+        if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
+            python3 "$script_path/scripts/provision.py" --onyx -- \
+                docker run --rm -i --init -v "$repo_root:$repo_root" \
+                -w "$repo_root" "$tag" "$QEMU" $onyx_pre \
+                -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
+        else
+            python3 "$script_path/scripts/provision.py" --onyx -- "$QEMU" $onyx_pre \
+                -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
+        fi || echo "provision: booting the unit as it is" >&2
+    fi
+    onyx_nic="$NIC$nic_extra"
+    case "$*" in
+        *-nic*|*-netdev*|*-net\ *) onyx_nic="" ;;
+    esac
+    set -- --nic "$onyx_nic" -- "$@"
+    if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
+        set -- --docker "$tag" "$@"
+        [ -n "$ssh_port" ] && set -- --publish "$ssh_port" "$@"
+    fi
+    [ "$ui" = 1 ] && set -- --ui "$@"
+    exec python3 "$script_path/boards/onyx/launch.py" \
+        --qemu "$QEMU" --nand "$NAND" --snapshot "$NAND_SNAP" \
+        --ui-port "$ui_port" "$@"
 fi
 if [ -n "$mqtt" ] || [ -n "$nic_extra" ]; then
     set -- "$@" -nic "$NIC$nic_extra"

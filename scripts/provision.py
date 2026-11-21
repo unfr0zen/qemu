@@ -42,9 +42,9 @@ boot, on the NAND that boot uses; nothing is kept on the host, so every
 checkout and every NAND image behave the same.
 
 The onyx (--onyx) boots the same way, its kernel's command line ending in
-"run final_bootm_command" rather than "bootm". It gets the login, ssh,
-console, display and wiring steps: its WiFi and network are not
-modelled, so there is nothing for the rest to set up.
+"run final_bootm_command" rather than "bootm". Its U-Boot runs on its
+default environment, so the MAC comes from the saved one (fw_printenv).
+It gets every step but the hostname and nestlocal ones.
 
 The j49 (--j49 NAND) has no U-Boot prompt to stop at:
 its release U-Boot is silent. There the shell comes from the unit's own
@@ -264,6 +264,17 @@ def set_root(con, n):
     con.send("saveenv\n")
     if not con.expect(rb"=> ", 60) or printenv(con, "bootcmd") != new:
         raise RuntimeError("could not save bootcmd")
+
+
+def onyx_mac(con):
+    """The onyx's MAC, from its saved environment: its U-Boot runs on the
+    default one, without ethaddr, and the wlan init script hands the
+    driver the saved one (fw_printenv, env0/env1 through gluebi)."""
+    con.send("echo MAC$((6*7))@$(fw_printenv -n ethaddr)@\n")
+    m = con.expect(rb"MAC42@([0-9A-Fa-f:]{17})@", 10)
+    if not m:
+        raise RuntimeError("no ethaddr in the saved environment")
+    return m.group(1).decode().replace(":", "").lower()
 
 
 def root_login(con, replace=False):
@@ -544,8 +555,8 @@ def main():
                     help="boot this root file system first from now on "
                          "(the diamond3's U-Boot env; run.sh --root0/--root1)")
     ap.add_argument("--onyx", action="store_true",
-                    help="an onyx: only the login, console, display and "
-                         "wiring steps")
+                    help="an onyx: its MAC from the saved environment, no "
+                         "hostname or nestlocal step")
     ap.add_argument("--j49", metavar="NAND",
                     help="the j49 whose NAND image this is")
     ap.add_argument("--transcript", help="save the console session here")
@@ -575,18 +586,19 @@ def main():
             done.append(ssh_login(con))
             done.append(quiet_console(con))
             done.append(screen(con, args.sleep))
-            if not args.onyx:
+            if args.onyx:
+                mac = onyx_mac(con)
+            else:
                 done.append(hostname(con, args.hostname))
             if con.run("mount -t ubifs ubi0:user-config "
                        "/media/user-config") != 0:
                 raise RuntimeError("could not mount user-config")
-            if not args.onyx:
-                done.append(wifi(con, mac, args.ssid))
-                done.append(onboarding(con))
+            done.append(wifi(con, mac, args.ssid))
+            done.append(onboarding(con))
             done.append(wiring(con))
             if not args.onyx:
                 done.append(nestlocal(con))
-                done.append(resolv(con))
+            done.append(resolv(con))
             # Unmounting commits the UBIFS journals before we pull the plug.
             if con.run("sync; umount /media/user-config") != 0:
                 raise RuntimeError("user-config did not unmount cleanly")

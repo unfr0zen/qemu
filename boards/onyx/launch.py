@@ -43,7 +43,7 @@ def launch(args):
         machine += ",boot-rom=" + str(Path(args.boot_rom).resolve())
     command = [args.qemu, "-M", machine, "-m", "128M",
                "-drive", f"if=none,id=nand,format=raw,file={args.nand.replace(',', ',,')},"
-               f"snapshot={args.snapshot}", "-nic", "none", "-parallel", "none",
+               f"snapshot={args.snapshot}", "-parallel", "none",
                "-watchdog-action", "none"]
     usb_socket = REPO / ".qemu" / f"onyx-sdp-{os.getpid()}.sock"
     if args.sdp_image:
@@ -57,6 +57,10 @@ def launch(args):
                    "--socket", str(usb_socket), "--image", args.sdp_image or ""]
     if args.sdp_fit:
         sdp_command += ["--fit", args.sdp_fit]
+    # The WiFi chip's network (run.sh's, as the diamond3's); empty when the
+    # extra arguments bring their own -nic/-netdev.
+    if args.nic:
+        command += ["-nic", args.nic]
     icount = os.environ.get("QEMU_ICOUNT", "off")
     if icount != "off":
         command += ["-icount", icount]
@@ -69,7 +73,8 @@ def launch(args):
     command += ["-chardev", f"socket,id=bp,host={bind},port={bp},server=on,"
                 "wait=off,nodelay=on"]
     if args.docker:
-        docker += ["-p", f"127.0.0.1:{bp}:{bp}"]
+        for port in [bp, *args.publish]:
+            docker += ["-p", f"127.0.0.1:{port}:{port}"]
     backplate = [sys.executable, str(REPO / "ui/backplate.py"),
                  "--serial", f"tcp:127.0.0.1:{bp}", "--board", "onyx",
                  "--flash", args.nand + ".backplate", "--parent", str(os.getpid())]
@@ -181,6 +186,10 @@ def main():
     parser.add_argument("--sdp-image", help="upload an SDP loader through the mask ROM")
     parser.add_argument("--boot-rom", help="execute a complete 96 KiB mask ROM dump")
     parser.add_argument("--docker", metavar="IMAGE")
+    parser.add_argument("--nic", default="none",
+                        help="the -nic the WiFi chip gets (empty: none added)")
+    parser.add_argument("--publish", type=int, action="append", default=[],
+                        metavar="PORT", help="with --docker: publish this port")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if not 1 <= args.ui_port <= 65535:

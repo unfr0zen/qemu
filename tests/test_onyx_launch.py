@@ -106,6 +106,24 @@ class OnyxLaunchTests(unittest.TestCase):
         devices = [args[index + 1] for index, arg in enumerate(args) if arg == '-chardev']
         self.assertTrue(any(device.startswith('socket,id=onyxusb,') for device in devices))
 
+    def test_wifi_network(self):
+        # The diamond3's: the WiFi chip on slirp, offline unless --cloud.
+        result = self.run_sh('--onyx', '--ssh', '2222')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.capture.read_text())
+        self.assertEqual(args[args.index('-nic') + 1],
+                         'user,model=bcm43341,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22')
+        self.capture.unlink()
+        result = self.run_sh('--onyx', '--cloud')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.capture.read_text())
+        self.assertEqual(args[args.index('-nic') + 1], 'user,model=bcm43341')
+        self.capture.unlink()
+        # A -netdev of the user's own replaces it.
+        result = self.run_sh('--onyx', '-netdev', 'user,id=n0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('-nic', json.loads(self.capture.read_text()))
+
     def test_machine_alias_and_seed(self):
         self.nand.unlink()
         source = self.repo / 'source.bin'
@@ -124,7 +142,7 @@ class OnyxLaunchTests(unittest.TestCase):
         self.assertEqual(args[args.index('-icount') + 1], 'shift=3')
 
     def test_unsupported_options_and_conflicting_machine(self):
-        for option in ('--usb', '--cloud', '--root1', '--gdb', '--j49'):
+        for option in ('--usb', '--root1', '--gdb', '--j49'):
             with self.subTest(option=option):
                 result = self.run_sh('--onyx', option)
                 self.assertNotEqual(result.returncode, 0)
@@ -205,7 +223,7 @@ class OnyxLaunchTests(unittest.TestCase):
         args = argparse.Namespace(qemu='/qemu', nand='/nand', snapshot='off',
                                   extra=['--', '-S'], ui=False, docker='test-image',
                                   open_security=False, boot_rom=None, sdp_image=None,
-                                  sdp_fit=None)
+                                  sdp_fit=None, nic='none', publish=[2222])
         with mock.patch.object(launcher.os, 'execvp') as execute:
             # exec never returns in production.
             execute.side_effect = SystemExit
@@ -214,6 +232,7 @@ class OnyxLaunchTests(unittest.TestCase):
         command = execute.call_args.args[1]
         self.assertEqual(command[:3], ['docker', 'run', '--rm'])
         self.assertIn('test-image', command)
+        self.assertIn('127.0.0.1:2222:2222', command)
         self.assertEqual(command[-1], '-S')
 
 
