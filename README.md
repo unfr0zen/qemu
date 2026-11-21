@@ -79,8 +79,8 @@ You supply the NAND image; formats in [docs/nand-image.md](docs/nand-image.md).
 ```
 
 Onyx's UI provides the display, ring, button, piezo, backplate, serial
-console, QMP and WiFi (`--ssh`, `--cloud`, `--mqtt` as on the diamond3);
-the Thread radio and USB are not modelled. Its pre-boot
+console, QMP, WiFi (`--ssh`, `--cloud`, `--mqtt` as on the diamond3) and a
+lone Thread radio (`ui/spinel_ncp.py`); USB is not modelled. Its pre-boot
 gives root the password `nest`, allows root over ssh, quiets the console,
 keeps the screen on, saves the `QEMU` WiFi network and the backplate's
 wiring. `--onyx --nand FILE` seeds its working copy from a prepared Onyx NAND

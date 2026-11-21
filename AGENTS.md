@@ -44,7 +44,7 @@ shellcheck --severity=warning $(git ls-files '*.sh')
 - diamond3: i.MX6SX SoC container + `diamond3` machine, GPMI NAND/BCH, a boot-ROM stub that loads U-Boot from NAND (applies the IVT's DCD), LCDIF, Vivante GC400T GPU (software 3D pipeline), BCM43341 SDIO Wi-Fi, vf610 ADC magwheel, PWM piezo, EM357 Thread radio SPI.
 - j49: OMAP3 peripherals (INTC, GP timers, PRCM, GPMC+BCH4 NAND, TPS65921, UART, I2C, GPIO, WDT, MMCHS, McSPI, SDMA, DSS) + `j49` machine, WL1271 Wi-Fi, ADBS-A320 ring sensor.
 
-- onyx: i.MX6UL with MMDC, GPMI/BCH, LCDIF, LM3695, GPIO button, peripheral USB, SDMA (ECSPI and UART transfers) ADC1 (battery, ring Hall pair) PWM8 (piezo) and the BCM43341 WiFi on usdhc2; `ui/backplate.py --board onyx` on UART3. Closed fuses are the default; `secure-boot=off` selects open development fuses. An optional mask ROM can load the public SDP U-Boot over USB. The Thread radio is not modelled.
+- onyx: i.MX6UL with MMDC, GPMI/BCH, LCDIF, LM3695, GPIO button, peripheral USB, SDMA (ECSPI and UART transfers) ADC1 (battery, ring Hall pair) PWM8 (piezo), the BCM43341 WiFi on usdhc2 and the OpenThread NCP's SPI port (`spinel-ncp`) on ECSPI4; `ui/backplate.py --board onyx` on UART3. Closed fuses are the default; `secure-boot=off` selects open development fuses. An optional mask ROM can load the public SDP U-Boot over USB.
 
 **Host side (Python, standard library only)** — QEMU exposes chardevs and QMP over sockets; these processes are the "rest of the hardware":
 
@@ -53,6 +53,7 @@ shellcheck --severity=warning $(git ls-files '*.sh')
 - `ui/ui.py` — `--ui` web server (`ui/index.html`): screen via QMP screendump streamed over SSE, button/firmware lines via the `flintstone.board` chardev, wheel via a QMP machine property, serial console shared with the terminal. Its HTTP API is the only path to the unit for other tools.
 - `ui/backplate.py` — fake backplate MCU on the sensor UART (framed protocol reverse-engineered from nlclient: temp, PIR, ALS, wiring).
 - `ui/em35x.py` — the EM35x ConnectIP NCP application behind the `em35x-ncp` device's chardev (framing lives in QEMU, the app here).
+- `ui/spinel_ncp.py` — the onyx's OpenThread spinel NCP application behind the `spinel-ncp` device's chardev (SPI headers in QEMU, spinel here).
 - `ui/mcp_server.py` — MCP server (`nest` in `.mcp.json`) wrapping ui.py's HTTP API: screenshots, recordings (ffmpeg if present), inputs, console, files, clock, backplate, QMP. Requires a running `./run.sh --ui`.
 - `scripts/skip-setup.py` — standalone helper: skip OOB setup on a running unit.
 - `boards/<machine>/` — host code for one board only: `j49/j49_env.py` (read/edit the j49 U-Boot env on a raw NAND with fresh BCH4 ECC), `diamond/diamond_radio.py` (diamond CC2530 UART2 endpoint). `onyx/onyx_env.py` constructs the working NAND with embedded U-Boot and selected volumes, without editing UBIFS contents; `onyx/launch.py` supervises NAND boot and the serial/QMP UI. Shared helpers take `--board` instead.

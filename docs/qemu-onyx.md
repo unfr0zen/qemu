@@ -16,8 +16,25 @@ request (0x8b, ack 0x36). WiFi is the
 diamond3's BCM43341 model on usdhc2 (brcmfmac, brcmfmac43340-sdio; WL_REG_ON
 GPIO2_IO16, host wake GPIO2_IO17) on QEMU's user network: the unit joins
 "QEMU" and gets 10.0.2.15, offline unless `--cloud`; `--ssh PORT` and
-`--mqtt HOST[:PORT]` work as on the diamond3. The Thread radio and CAAM
-cryptography are not modelled.
+`--mqtt HOST[:PORT]` work as on the diamond3.
+
+The Thread radio is an EM358 running OpenThread's NCP (`ot-ncp-app`,
+"OPENTHREAD/1.0d824; Marble-Onyx1-release") on ECSPI4, chip select
+GPIO2_IO15, nRESET GPIO2_IO19, interrupt GPIO2_IO18, which wpantund's
+spinel driver reaches through `spi-hdlc-adapter`. The QEMU device
+(`spinel-ncp`) is its SPI port: the 5-byte spinel SPI headers, the reset
+flag, the interrupt while a frame waits. `ui/spinel_ncp.py` is the NCP
+behind it: it boots on nRESET and on RESET, answers the property gets and
+sets wpantund makes, reports the version of the application in its flash
+and scans an empty air. wpantund comes up `offline`, which the system
+update's NCP check needs before osm validates a new install. A system
+that ships newer NCP firmware (6.5-14: 1.0d1264) has wpantund flash it
+with `zb-loader`: nWAKE held through a reset starts Nest's SPI bootloader,
+which the model runs too (erase, 64-byte writes, CRC-32 of each 64 KiB);
+the device then passes raw bytes and raises the interrupt when a reply
+waits. The flash is kept in `<nand>.ncp` beside the NAND state; without
+it the chip runs the firmware the unit shipped with (1.0d824, 6.1-9's).
+`--debug` logs the frames. CAAM cryptography is not modelled.
 
 ## Development Linux
 

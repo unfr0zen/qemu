@@ -72,16 +72,25 @@ def launch(args):
     bp = pick_port(8110)
     command += ["-chardev", f"socket,id=bp,host={bind},port={bp},server=on,"
                 "wait=off,nodelay=on"]
+    # The Thread radio (spinel-ncp on ECSPI4): ui/spinel_ncp.py.
+    ncp = pick_port(bp + 1)
+    command += ["-chardev", f"socket,id=ncp,host={bind},port={ncp},server=on,"
+                "wait=off,nodelay=on",
+                "-global", "driver=spinel-ncp,property=chardev,value=ncp"]
     if args.docker:
-        for port in [bp, *args.publish]:
+        for port in [bp, ncp, *args.publish]:
             docker += ["-p", f"127.0.0.1:{port}:{port}"]
     backplate = [sys.executable, str(REPO / "ui/backplate.py"),
                  "--serial", f"tcp:127.0.0.1:{bp}", "--board", "onyx",
                  "--flash", args.nand + ".backplate", "--parent", str(os.getpid())]
+    radio = [sys.executable, str(REPO / "ui/spinel_ncp.py"),
+             "--serial", f"tcp:127.0.0.1:{ncp}", "--flash", args.nand + ".ncp",
+             "--parent", str(os.getpid())]
     if not args.ui:
         command += ["-nographic", "-serial", "mon:stdio", "-serial", "null",
                     "-serial", "chardev:bp", *extra]
         subprocess.Popen(backplate, stdin=subprocess.DEVNULL)
+        subprocess.Popen(radio, stdin=subprocess.DEVNULL)
         if args.docker:
             docker += ["-it"] if sys.stdin.isatty() else ["-i"]
             command = docker + shlex.split(os.environ.get("QEMU_DOCKER_ARGS", "")) + [args.docker] + command
@@ -145,6 +154,7 @@ def launch(args):
             children.append(qemu)
             children.append(subprocess.Popen(backplate + ["--control", f"tcp:127.0.0.1:{bpctl}"],
                                              stdin=subprocess.DEVNULL))
+            children.append(subprocess.Popen(radio, stdin=subprocess.DEVNULL))
             sdp = None
             if args.sdp_image:
                 sdp = subprocess.Popen(sdp_command)
@@ -152,7 +162,7 @@ def launch(args):
             print(f"onyx UI: http://127.0.0.1:{http}", file=sys.stderr)
             print(f"  USB host socket: {usb_socket}",
                   file=sys.stderr)
-            print(f"  backplate tcp:{bp} (control {bpctl}); the radio is not modelled.",
+            print(f"  backplate tcp:{bp} (control {bpctl}) · radio tcp:{ncp}",
                   file=sys.stderr)
             while qemu.poll() is None:
                 if sdp and sdp.poll() not in (None, 0):

@@ -1,0 +1,80 @@
+From aa23d4754c1fb4cccab04945291f09db57ac8d7a Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:56:36 -0500
+Subject: [PATCH 166/166] hw/arm: onyx: the Thread radio on ECSPI4
+
+The EM358 running OpenThread's NCP: spinel-ncp on ECSPI4, chip select
+GPIO2_IO15, nRESET GPIO2_IO19, nWAKE (the bootloader's bootmode)
+GPIO2_IO2, its interrupt on GPIO2_IO18.
+---
+ hw/arm/Kconfig |  1 +
+ hw/arm/onyx.c  | 25 +++++++++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 9b763e6..05242c2 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -218,6 +218,7 @@ config ONYX
+     select FSL_IMX6UL
+     select NEST_BOARD
+     select LM3695
++    select SPINEL_NCP
+ 
+ config J49
+     bool
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+index 700d1ee..969720e 100644
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -17,8 +17,10 @@
+ #include "hw/core/boards.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/split-irq.h"
++#include "hw/misc/spinel_ncp.h"
+ #include "hw/net/bcm43341.h"
+ #include "hw/sd/sd.h"
++#include "hw/ssi/ssi.h"
+ #include "net/net.h"
+ #include "qapi/visitor.h"
+ #include "system/block-backend-global-state.h"
+@@ -179,6 +181,28 @@ static void onyx_init_wifi(FslIMX6ULState *soc, DeviceState *board)
+                                 qdev_get_gpio_in(DEVICE(&soc->gpio[1]), 17));
+ }
+ 
++/*
++ * The Thread radio: an EM358 running OpenThread's NCP on ECSPI4, chip
++ * select GPIO2_IO15, nRESET GPIO2_IO19 (the em35x-gpios exporter's
++ * "reset"), nWAKE GPIO2_IO2 ("wake", the bootloader's bootmode), its
++ * interrupt on GPIO2_IO18 ("irq").
++ */
++static void onyx_init_ncp(FslIMX6ULState *soc)
++{
++    DeviceState *ncp = qdev_new(TYPE_SPINEL_NCP);
++
++    qdev_realize_and_unref(ncp, qdev_get_child_bus(DEVICE(&soc->spi[3]),
++                                                   "spi"), &error_fatal);
++    qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 15,
++                          qdev_get_gpio_in_named(ncp, SPINEL_NCP_NSSEL, 0));
++    qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 19,
++                          qdev_get_gpio_in_named(ncp, SPINEL_NCP_NRESET, 0));
++    qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 2,
++                          qdev_get_gpio_in_named(ncp, SPINEL_NCP_NWAKE, 0));
++    qdev_connect_gpio_out_named(ncp, SPINEL_NCP_NINT, 0,
++                                qdev_get_gpio_in(DEVICE(&soc->gpio[1]), 18));
++}
++
+ static void onyx_init(MachineState *machine)
+ {
+     DeviceState *soc, *board, *adc;
+@@ -218,6 +242,7 @@ static void onyx_init(MachineState *machine)
+                                 qdev_get_gpio_in(
+                                     DEVICE(&FSL_IMX6UL(soc)->gpio[3]), 28));
+     onyx_init_wifi(FSL_IMX6UL(soc), board);
++    onyx_init_ncp(FSL_IMX6UL(soc));
+     qdev_connect_gpio_out(DEVICE(&FSL_IMX6UL(soc)->gpio[1]), 21,
+                           qdev_get_gpio_in(board,
+                                            FLINTSTONE_BOARD_IN_HALL_ENABLE));
+-- 
+2.56.1
+

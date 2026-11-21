@@ -189,6 +189,9 @@ class OnyxLaunchTests(unittest.TestCase):
             self.assertEqual(serials, ['chardev:con', 'null', 'chardev:bp'])
             self.assertTrue(any(device.startswith('socket,id=bp,') for device in devices))
             self.assertTrue(ui_args[ui_args.index('--backplate') + 1].startswith('tcp:127.0.0.1:'))
+            # The Thread radio's SPI port, its NCP behind a chardev.
+            self.assertTrue(any(device.startswith('socket,id=ncp,') for device in devices))
+            self.assertIn('driver=spinel-ncp,property=chardev,value=ncp', args)
             self.assertTrue(ui_args[ui_args.index('--board') + 1].endswith('/board.sock'))
             process.send_signal(signal.SIGTERM)
             self.assertEqual(process.wait(timeout=10), 128 + signal.SIGTERM)

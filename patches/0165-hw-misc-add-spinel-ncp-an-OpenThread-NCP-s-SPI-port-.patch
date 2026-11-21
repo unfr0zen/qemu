@@ -1,0 +1,492 @@
+From 36478cd54ed736e01f4ad3c1519ca5ac85260c3c Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:56:36 -0500
+Subject: [PATCH 165/166] hw/misc: add spinel-ncp, an OpenThread NCP's SPI port
+ on a chardev
+
+OpenThread's network co-processor on SPI (ncp_spi.cpp): each transaction
+carries a 5-byte header each way (flag with the reset bit, accept and
+data lengths) and a frame passes when the transaction carries it and the
+other side accepts that many bytes. The interrupt is low while a frame
+or the reset header waits. The spinel application lives behind a
+chardev, which carries whole frames, nRESET and nWAKE.
+
+nWAKE held low through a reset starts Nest's SPI bootloader, which
+zb-loader drives to flash new NCP firmware. The model then switches the
+port to raw mode: MOSI goes out byte by byte (zb-loader keeps the chip
+selected after a command and waits for the interrupt), the next
+transaction clocks out the queued reply from its first byte, and the
+interrupt is low while a reply waits.
+---
+ hw/misc/Kconfig              |   4 +
+ hw/misc/meson.build          |   1 +
+ hw/misc/spinel_ncp.c         | 409 +++++++++++++++++++++++++++++++++++
+ include/hw/misc/spinel_ncp.h |  18 ++
+ 4 files changed, 432 insertions(+)
+ create mode 100644 hw/misc/spinel_ncp.c
+ create mode 100644 include/hw/misc/spinel_ncp.h
+
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 8c30b4c..5278dd1 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -267,3 +267,7 @@ source macio/Kconfig
+ config EM35X_NCP
+     bool
+     depends on SSI
++
++config SPINEL_NCP
++    bool
++    depends on SSI
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 5e9ff94..35e76e1 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -173,4 +173,5 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+ system_ss.add(when: 'CONFIG_EM35X_NCP', if_true: files('em35x_ncp.c'))
++system_ss.add(when: 'CONFIG_SPINEL_NCP', if_true: files('spinel_ncp.c'))
+ system_ss.add(when: 'CONFIG_OMAP3630', if_true: files('omap3_prcm.c', 'omap3_gpmc.c', 'omap3_bch.c', 'tps65921.c'))
+diff --git a/hw/misc/spinel_ncp.c b/hw/misc/spinel_ncp.c
+new file mode 100644
+index 0000000..462a241
+--- /dev/null
++++ b/hw/misc/spinel_ncp.c
+@@ -0,0 +1,409 @@
++/*
++ * OpenThread network co-processor on SPI (spinel), as a chardev.
++ *
++ * The Nest Thermostat E carries an EM358 running OpenThread's NCP
++ * ("ot-ncp-app") on ECSPI4, with its chip select on a GPIO, nRESET and
++ * nWAKE from the SoC and an active-low interrupt back to it. The host
++ * side is spi-hdlc-adapter. This device is the chip's SPI slave port as
++ * OpenThread's ncp_spi.cpp drives it; the spinel application behind the
++ * port lives outside QEMU (qemu/ui/spinel_ncp.py) and sees whole frames.
++ *
++ * Every transaction starts with a 5-byte header each way: a flag byte
++ * (0x02, | 0x80 until the first transaction after a reset), the length
++ * the sender accepts and the length of the frame it sends (both u16 LE),
++ * then that frame. A frame passes only when the transaction is long
++ * enough to carry it and the other side accepts that many bytes; one
++ * that does not pass stays queued for the next transaction. The
++ * interrupt is low while a frame (or the reset header) waits for the
++ * host and the chip is not selected.
++ *
++ * nWAKE held low while nRESET rises starts Nest's SPI bootloader instead
++ * (zb-loader's "bootmode"). The model then puts the port in raw mode:
++ * no headers, MOSI goes to the model byte by byte as it is clocked (the
++ * host keeps the chip selected after a command, and the bootloader acts
++ * on it all the same), the next transaction clocks out the reply the
++ * model queued from its first byte, and the interrupt is low while a
++ * reply waits, selected or not.
++ *
++ *   QEMU -> model:
++ *     'F' len16 bytes   a spinel frame the host sent (len16 little-endian)
++ *     'd' byte          in raw mode, a byte the host clocked in
++ *     'r' level         nRESET (0 = held in reset)
++ *     'w' level         nWAKE
++ *   model -> QEMU:
++ *     'F' len16 bytes   queue a spinel frame (in raw mode, a reply)
++ *     'b' 0             the chip rebooted: drop the queue, set the reset flag
++ *     'm' raw           the port's mode (1 raw, 0 spinel); drops the queue
++ *
++ * With no model attached, or in reset, the chip reads as absent: 0xff,
++ * the interrupt high.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "chardev/char-fe.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/misc/spinel_ncp.h"
++#include "hw/ssi/ssi.h"
++#include "qemu/bswap.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define SPINEL_NCP_BUF      1300    /* OPENTHREAD_CONFIG_NCP_SPI_BUFFER_SIZE */
++#define SPINEL_NCP_HDR      5
++#define SPINEL_NCP_ACCEPT   (SPINEL_NCP_BUF - SPINEL_NCP_HDR)
++#define SPINEL_NCP_QUEUE    64      /* frames */
++
++#define SPINEL_FLAG_PATTERN 0x02
++#define SPINEL_FLAG_MASK    0x03
++#define SPINEL_FLAG_RESET   0x80
++
++OBJECT_DECLARE_SIMPLE_TYPE(SpinelNcpState, SPINEL_NCP)
++
++struct SpinelNcpState {
++    SSIPeripheral parent_obj;
++
++    CharFrontend chr;
++    qemu_irq nint;
++    GQueue tx;                  /* GByteArray frames for the host */
++    bool connected;
++    bool nssel, nreset, nwake;
++    bool reset_flag;            /* no transaction since the reset yet */
++    bool raw;                   /* the bootloader runs */
++
++    /* The transaction in progress. */
++    uint8_t miso[SPINEL_NCP_BUF];
++    int miso_len;
++    uint8_t mosi[SPINEL_NCP_BUF];
++    int clocked;
++
++    /* A message from the model, in progress. */
++    uint8_t kind;
++    int hdr_len;                /* bytes of len16 (or of the 'b'/'m' arg) */
++    int want;
++    GByteArray *in;
++};
++
++static bool spinel_up(SpinelNcpState *s)
++{
++    return s->connected && s->nreset;
++}
++
++static void spinel_update_int(SpinelNcpState *s)
++{
++    bool low = spinel_up(s) &&
++               (s->raw ? !g_queue_is_empty(&s->tx)
++                       : s->nssel && (s->reset_flag ||
++                                      !g_queue_is_empty(&s->tx)));
++
++    qemu_set_irq(s->nint, !low);
++}
++
++static void spinel_flush(SpinelNcpState *s)
++{
++    GByteArray *f;
++
++    while ((f = g_queue_pop_head(&s->tx))) {
++        g_byte_array_unref(f);
++    }
++}
++
++static void spinel_send(SpinelNcpState *s, const uint8_t *buf, int len)
++{
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_write_all(&s->chr, buf, len);
++    }
++}
++
++/* nSSEL fell: lay out what the chip clocks back. */
++static void spinel_select(SpinelNcpState *s)
++{
++    GByteArray *f = g_queue_peek_head(&s->tx);
++    int len = f ? f->len : 0;
++
++    s->clocked = 0;
++    s->miso_len = 0;
++    if (!spinel_up(s)) {
++        return;
++    }
++    if (s->raw) {
++        len = MIN(len, SPINEL_NCP_BUF);
++        if (len) {
++            memcpy(s->miso, f->data, len);
++        }
++        s->miso_len = len;
++        return;
++    }
++    s->miso[0] = SPINEL_FLAG_PATTERN | (s->reset_flag ? SPINEL_FLAG_RESET : 0);
++    stw_le_p(s->miso + 1, SPINEL_NCP_ACCEPT);
++    stw_le_p(s->miso + 3, len);
++    if (len) {
++        memcpy(s->miso + SPINEL_NCP_HDR, f->data, len);
++    }
++    s->miso_len = SPINEL_NCP_HDR + len;
++}
++
++/* nSSEL rose: retire the frame that went out, pass on the one that came. */
++static void spinel_deselect(SpinelNcpState *s)
++{
++    GByteArray *f;
++    int data, accept, rx_len;
++
++    if (!spinel_up(s)) {
++        return;
++    }
++    if (s->raw) {
++        if (s->clocked > 0 && s->miso_len > 0) {
++            g_byte_array_unref(g_queue_pop_head(&s->tx));
++        }
++        return;
++    }
++    if (s->clocked < SPINEL_NCP_HDR) {
++        return;
++    }
++    s->reset_flag = false;
++    if ((s->mosi[0] & SPINEL_FLAG_MASK) != SPINEL_FLAG_PATTERN) {
++        qemu_log_mask(LOG_GUEST_ERROR, "spinel-ncp: bad header flag 0x%02x\n",
++                      s->mosi[0]);
++        return;
++    }
++    data = s->clocked - SPINEL_NCP_HDR;
++    accept = lduw_le_p(s->mosi + 1);
++    rx_len = lduw_le_p(s->mosi + 3);
++
++    f = g_queue_peek_head(&s->tx);
++    if (f && f->len <= data && f->len <= accept && s->miso_len > 0) {
++        g_byte_array_unref(g_queue_pop_head(&s->tx));
++    }
++    if (rx_len > 0 && rx_len <= data && rx_len <= SPINEL_NCP_ACCEPT) {
++        uint8_t hdr[3] = { 'F', rx_len & 0xff, rx_len >> 8 };
++
++        spinel_send(s, hdr, sizeof(hdr));
++        spinel_send(s, s->mosi + SPINEL_NCP_HDR, rx_len);
++    }
++}
++
++static uint32_t spinel_transfer(SSIPeripheral *dev, uint32_t val)
++{
++    SpinelNcpState *s = SPINEL_NCP(dev);
++    uint8_t out;
++
++    /* The bus is shared by chip selects this device doesn't see. */
++    if (s->nssel || !spinel_up(s)) {
++        return 0xff;
++    }
++    out = s->clocked < s->miso_len ? s->miso[s->clocked] : 0xff;
++    if (s->raw) {
++        uint8_t msg[2] = { 'd', val };
++
++        spinel_send(s, msg, sizeof(msg));
++    }
++    if (s->clocked < SPINEL_NCP_BUF) {
++        s->mosi[s->clocked] = val;
++    }
++    if (s->clocked < INT_MAX) {
++        s->clocked++;
++    }
++    return out;
++}
++
++static void spinel_nssel(void *opaque, int n, int level)
++{
++    SpinelNcpState *s = opaque;
++    bool was = s->nssel;
++
++    s->nssel = !!level;
++    if (was && !s->nssel) {
++        spinel_select(s);
++    } else if (!was && s->nssel) {
++        spinel_deselect(s);
++    }
++    spinel_update_int(s);
++}
++
++static void spinel_nreset(void *opaque, int n, int level)
++{
++    SpinelNcpState *s = opaque;
++    uint8_t msg[2] = { 'r', !!level };
++
++    if (s->nreset == !!level) {
++        return;
++    }
++    s->nreset = !!level;
++    spinel_flush(s);
++    s->reset_flag = true;
++    spinel_send(s, msg, sizeof(msg));
++    spinel_update_int(s);
++}
++
++static void spinel_nwake(void *opaque, int n, int level)
++{
++    SpinelNcpState *s = opaque;
++    uint8_t msg[2] = { 'w', !!level };
++
++    if (s->nwake == !!level) {
++        return;
++    }
++    s->nwake = !!level;
++    spinel_send(s, msg, sizeof(msg));
++}
++
++static void spinel_message(SpinelNcpState *s, uint8_t arg)
++{
++    switch (s->kind) {
++    case 'F':
++        if (s->in->len > SPINEL_NCP_ACCEPT ||
++            g_queue_get_length(&s->tx) >= SPINEL_NCP_QUEUE) {
++            qemu_log_mask(LOG_GUEST_ERROR, "spinel-ncp: frame dropped\n");
++            g_byte_array_unref(s->in);
++        } else {
++            g_queue_push_tail(&s->tx, s->in);
++        }
++        s->in = NULL;
++        break;
++    case 'b':
++        spinel_flush(s);
++        s->reset_flag = true;
++        break;
++    case 'm':
++        spinel_flush(s);
++        s->raw = arg != 0;
++        break;
++    }
++    spinel_update_int(s);
++}
++
++static int spinel_chr_can_read(void *opaque)
++{
++    return 4096;
++}
++
++static void spinel_chr_read(void *opaque, const uint8_t *buf, int size)
++{
++    SpinelNcpState *s = opaque;
++
++    for (int i = 0; i < size; i++) {
++        uint8_t c = buf[i];
++
++        if (!s->kind) {
++            if (c != 'F' && c != 'b' && c != 'm') {
++                qemu_log_mask(LOG_GUEST_ERROR,
++                              "spinel-ncp: bad message 0x%02x\n", c);
++                continue;
++            }
++            s->kind = c;
++            s->hdr_len = 0;
++            s->want = 0;
++            continue;
++        }
++        if (s->kind != 'F') {
++            spinel_message(s, c);
++            s->kind = 0;
++            continue;
++        }
++        if (s->hdr_len < 2) {
++            s->want |= c << (8 * s->hdr_len++);
++            if (s->hdr_len == 2) {
++                s->in = g_byte_array_sized_new(s->want);
++            }
++        } else {
++            g_byte_array_append(s->in, &c, 1);
++        }
++        if (s->hdr_len == 2 && s->in->len == s->want) {
++            spinel_message(s, 0);
++            s->kind = 0;
++        }
++    }
++}
++
++static void spinel_chr_event(void *opaque, QEMUChrEvent event)
++{
++    SpinelNcpState *s = opaque;
++    uint8_t msg[4] = { 'w', s->nwake, 'r', s->nreset };
++
++    switch (event) {
++    case CHR_EVENT_OPENED:
++        /* A new model: the chip powers on. */
++        s->connected = true;
++        s->kind = 0;
++        s->raw = false;
++        spinel_flush(s);
++        s->reset_flag = true;
++        spinel_send(s, msg, sizeof(msg));
++        break;
++    case CHR_EVENT_CLOSED:
++        /* The chip is gone with it. */
++        s->connected = false;
++        spinel_flush(s);
++        if (s->in) {
++            g_byte_array_unref(s->in);
++            s->in = NULL;
++        }
++        break;
++    default:
++        break;
++    }
++    spinel_update_int(s);
++}
++
++static void spinel_realize(SSIPeripheral *dev, Error **errp)
++{
++    SpinelNcpState *s = SPINEL_NCP(dev);
++
++    g_queue_init(&s->tx);
++    qdev_init_gpio_in_named(DEVICE(dev), spinel_nssel, SPINEL_NCP_NSSEL, 1);
++    qdev_init_gpio_in_named(DEVICE(dev), spinel_nreset, SPINEL_NCP_NRESET, 1);
++    qdev_init_gpio_in_named(DEVICE(dev), spinel_nwake, SPINEL_NCP_NWAKE, 1);
++    qdev_init_gpio_out_named(DEVICE(dev), &s->nint, SPINEL_NCP_NINT, 1);
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_set_handlers(&s->chr, spinel_chr_can_read,
++                                 spinel_chr_read, spinel_chr_event, NULL, s,
++                                 NULL, true);
++    }
++}
++
++static void spinel_reset(DeviceState *dev)
++{
++    SpinelNcpState *s = SPINEL_NCP(dev);
++
++    /*
++     * The SoC's reset is not the chip's: its queue stands until the
++     * model or nRESET reboots it.
++     */
++    s->nssel = s->nreset = s->nwake = true;
++    s->clocked = s->miso_len = 0;
++    spinel_update_int(s);
++}
++
++static const Property spinel_properties[] = {
++    DEFINE_PROP_CHR("chardev", SpinelNcpState, chr),
++};
++
++static void spinel_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(oc);
++
++    k->realize = spinel_realize;
++    k->transfer_raw = spinel_transfer;
++    device_class_set_legacy_reset(dc, spinel_reset);
++    device_class_set_props(dc, spinel_properties);
++    dc->desc = "OpenThread spinel NCP (SPI port; application via chardev)";
++}
++
++static const TypeInfo spinel_info = {
++    .name = TYPE_SPINEL_NCP,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(SpinelNcpState),
++    .class_init = spinel_class_init,
++};
++
++static void spinel_register_types(void)
++{
++    type_register_static(&spinel_info);
++}
++
++type_init(spinel_register_types)
+diff --git a/include/hw/misc/spinel_ncp.h b/include/hw/misc/spinel_ncp.h
+new file mode 100644
+index 0000000..e4ae322
+--- /dev/null
++++ b/include/hw/misc/spinel_ncp.h
+@@ -0,0 +1,18 @@
++/*
++ * OpenThread network co-processor on SPI (spinel), as a chardev.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_SPINEL_NCP_H
++#define HW_MISC_SPINEL_NCP_H
++
++#define TYPE_SPINEL_NCP "spinel-ncp"
++
++/* Named GPIO inputs (driven by the host SoC) and output (to it). */
++#define SPINEL_NCP_NSSEL    "nssel"
++#define SPINEL_NCP_NRESET   "nreset"
++#define SPINEL_NCP_NWAKE    "nwake"
++#define SPINEL_NCP_NINT     "nint"
++
++#endif
+-- 
+2.56.1
+
