@@ -1,0 +1,36 @@
+From 87b4998436dcc92a7dfde1193d2c4db2b12e4d07 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:39:38 -0500
+Subject: [PATCH 153/154] hw/misc: imx6ul_ccm: reset LCDIF1_CLK_SEL to a valid
+ parent
+
+CSCDR2 reset to the i.MX6Q value, whose bits 11:9 (5) select an IPU
+DI0 clock there. On the 6UL those bits are LCDIF1_CLK_SEL, a mux of
+five parents, so 5 is out of range. The stock Onyx 4.1.15 kernel
+registers that mux before anything programs it, gets -EINVAL from
+clk_mux_get_parent and dereferences a NULL parent name in
+imx6ul_clocks_init. Neither the stock DCD nor U-Boot writes CSCDR2.
+
+Reset the field to 0 (lcdif1_podf), the setting U-Boot's
+enable_lcdif_clock selects.
+---
+ hw/misc/imx6ul_ccm.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/hw/misc/imx6ul_ccm.c b/hw/misc/imx6ul_ccm.c
+index d879a2e..c211417 100644
+--- a/hw/misc/imx6ul_ccm.c
++++ b/hw/misc/imx6ul_ccm.c
+@@ -554,7 +554,8 @@ static void imx6ul_ccm_reset(DeviceState *dev)
+     s->ccm[CCM_CS2CDR] = 0x000336C1;
+     s->ccm[CCM_CDCDR] = 0x33F71F92;
+     s->ccm[CCM_CHSCCDR] = 0x000248A4;
+-    s->ccm[CCM_CSCDR2] = 0x00029B48;
++    /* LCDIF1_CLK_SEL (bits 11:9) is 0: the 6UL mux has five parents. */
++    s->ccm[CCM_CSCDR2] = 0x00029148;
+     s->ccm[CCM_CSCDR3] = 0x00014841;
+     s->ccm[CCM_CDHIPR] = 0x00000000;
+     s->ccm[CCM_CTOR] = 0x00000000;
+-- 
+2.56.1
+
