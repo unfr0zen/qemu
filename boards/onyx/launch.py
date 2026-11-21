@@ -44,7 +44,7 @@ def launch(args):
     command = [args.qemu, "-M", machine, "-m", "128M",
                "-drive", f"if=none,id=nand,format=raw,file={args.nand.replace(',', ',,')},"
                f"snapshot={args.snapshot}", "-parallel", "none",
-               "-watchdog-action", "none"]
+               "-watchdog-action", "reset"]
     usb_socket = REPO / ".qemu" / f"onyx-sdp-{os.getpid()}.sock"
     if args.sdp_image:
         if not args.boot_rom:

@@ -224,10 +224,12 @@ J49_MONO = dict(version="4.2.8", description="TFE (BP_D2D)",
                  host="jenkins-agent-143-v17-emb-prod", user="jenkins-slave",
                  date="2019-04-03 17:36:54")
 J49_BSL = dict(J49_MONO, version="3.1", description="BSL")
-# The onyx's: what its own backplate reported (nlclient's log on the unit:
-# Mono 1.4.11, BSL 4.0, model "X", which nlclient takes as Backplate-7.19),
-# with the build strings the onyx plist ships for those versions.
-ONYX_MODEL = b"X"
+# The onyx's: the firmware its own backplate ran (nlclient's log on the
+# unit: Mono 1.4.11, BSL 4.0), with the build strings the onyx plist ships
+# for those versions. That (EVT) backplate reported model "X", which
+# nlclient takes as Backplate-7.19 but nlbpupdater finds no firmware for,
+# failing every system update; this one reports Backplate-7.19 itself.
+ONYX_MODEL = b"Backplate-7.19"
 ONYX_MONO = dict(version="1.4.11", description="TFE (BP_ONYX1_EVT)",
                  host="jenkins-agent-191-v17-emb-prod", user="jenkins-slave",
                  date="2019-03-14 16:48:28")

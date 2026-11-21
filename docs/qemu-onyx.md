@@ -9,8 +9,10 @@ divider on channel 4 (a 3.90 V pack) and the ring's Hall pair on channels
 (the UI plays its clicks, 2 kHz for 3 ms). The firmware presents 60 frames
 a second. The launcher runs
 `ui/backplate.py --board onyx` on UART3 (`/dev/ttysensormcu0`): it reports
-the firmware the unit's own backplate ran (mono 1.4.11, BSL 4.0, model
-"X") and acks the onyx's MCU mode request (0x8b, ack 0x36). WiFi is the
+the firmware the unit's own backplate ran (mono 1.4.11, BSL 4.0) as model
+Backplate-7.19 (the EVT backplate's "X" has no firmware in nlbpupdater's
+plist, which fails every system update) and acks the onyx's MCU mode
+request (0x8b, ack 0x36). WiFi is the
 diamond3's BCM43341 model on usdhc2 (brcmfmac, brcmfmac43340-sdio; WL_REG_ON
 GPIO2_IO16, host wake GPIO2_IO17) on QEMU's user network: the unit joins
 "QEMU" and gets 10.0.2.15, offline unless `--cloud`; `--ssh PORT` and
@@ -88,4 +90,5 @@ source's `system-config`, `root0` and `root1` volumes, including per-unit
 state. A Diamond3 source root is not an Onyx Linux image.
 
 The emulated UID is `51454d5500000001`. Thermal trim and a sensor sample
-are synthetic. The launcher disables watchdog actions during bring-up.
+are synthetic. A watchdog reset reboots the unit (the kernel reboots
+through it, a system update included); the short pre-boot boot ignores it.

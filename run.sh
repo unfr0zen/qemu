@@ -149,9 +149,9 @@ if [ "$machine" = diamond ] && [ -n "$stock_image" ]; then
     exit 1
 fi
 if [ "$machine" = onyx ]; then
-    if [ "$usb" = 1 ] || [ "$sleep" = 1 ] ||
+    if [ "$usb" = 1 ] ||
         [ -n "$hostname$stock_image$root" ] || [ "$gdb" = 1 ]; then
-        echo "ERROR: Onyx supports --nand, --ui, --ui-port, --no-provision, --cloud, --ssh, --mqtt and --nic-extra" >&2
+        echo "ERROR: Onyx supports --nand, --ui, --ui-port, --no-provision, --sleep, --cloud, --ssh, --mqtt and --nic-extra" >&2
         exit 1
     fi
     usb=0
@@ -370,14 +370,16 @@ if [ "$machine" = onyx ]; then
     # disconnect that UART, so its short boot runs with open fuses; the
     # boot below keeps the fuses it is given.
     if [ "$provision" = 1 ]; then
+        onyx_sleep=""
+        [ "$sleep" = 1 ] && onyx_sleep="--sleep"
         onyx_pre="-M onyx,secure-boot=off -m 128M -nographic -nic none -parallel none -watchdog-action none"
         if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
-            python3 "$script_path/scripts/provision.py" --onyx -- \
+            python3 "$script_path/scripts/provision.py" --onyx $onyx_sleep -- \
                 docker run --rm -i --init -v "$repo_root:$repo_root" \
                 -w "$repo_root" "$tag" "$QEMU" $onyx_pre \
                 -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
         else
-            python3 "$script_path/scripts/provision.py" --onyx -- "$QEMU" $onyx_pre \
+            python3 "$script_path/scripts/provision.py" --onyx $onyx_sleep -- "$QEMU" $onyx_pre \
                 -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
         fi || echo "provision: booting the unit as it is" >&2
     fi

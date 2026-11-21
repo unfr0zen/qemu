@@ -97,7 +97,7 @@ class OnyxLaunchTests(unittest.TestCase):
         self.assertEqual(args[:4], ['-M', 'onyx', '-m', '128M'])
         self.assertIn(f'if=none,id=nand,format=raw,file={self.nand},snapshot=off', args)
         self.assertIn('-nographic', args)
-        self.assertEqual(args[args.index('-watchdog-action') + 1], 'none')
+        self.assertEqual(args[args.index('-watchdog-action') + 1], 'reset')
         self.assertEqual(args[args.index('-parallel') + 1], 'none')
         self.assertEqual(args[-2:], ['-d', 'guest_errors'])
         self.assertNotIn('-bios', args)
