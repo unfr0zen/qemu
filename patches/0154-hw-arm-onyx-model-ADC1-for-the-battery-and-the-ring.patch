@@ -1,0 +1,250 @@
+From 6e6fb15615fb6dda7261029d7fc71cd9fd9c67c6 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:39:38 -0500
+Subject: [PATCH 154/154] hw/arm: onyx: model ADC1 for the battery and the ring
+
+ADC1 was an unimplemented region, so the vf610 calibration timed out
+and adc-div-battery failed every read with -ETIMEDOUT. The stock
+nlscpm-shutdown-manager then read the battery as empty and halted the
+unit about 40 s after boot.
+
+Instantiate the imx6 ADC model for both i.MX6UL ADC blocks. The model
+takes the battery and Hall channel numbers as properties (defaults
+unchanged for the diamond3) and an ungated mode for a block whose
+functions have separate enables. The Onyx wires ADC1 as its device
+tree does: Hall pair on channels 7 and 6, the battery divider
+(169k/124k, 1.8 V reference) on channel 4, reading a 3.90 V pack.
+/machine/wheel-position drives the ring as on the diamond3.
+---
+ hw/adc/imx6_adc.c           | 32 +++++++++++++++++++++-----------
+ hw/arm/fsl-imx6ul.c         | 23 +++++++++++++++++------
+ hw/arm/onyx.c               | 30 +++++++++++++++++++++++++++++-
+ include/hw/adc/imx6_adc.h   |  4 ++++
+ include/hw/arm/fsl-imx6ul.h |  2 ++
+ 5 files changed, 73 insertions(+), 18 deletions(-)
+
+diff --git a/hw/adc/imx6_adc.c b/hw/adc/imx6_adc.c
+index 3c29f56..0d666cd 100644
+--- a/hw/adc/imx6_adc.c
++++ b/hw/adc/imx6_adc.c
+@@ -24,6 +24,11 @@
+  *   adc@02284000, "fsl,vf610-adc" — channel 0 reads the battery divider
+  *   (adc-div-battery), enabled by GPIO6_IO16 (active high).
+  *
++ * The channel numbers are properties (defaults: the diamond3's). The Onyx
++ * (i.MX6UL) has both functions in one block, ADC1 at 0x02198000: Hall on
++ * channels 7 and 6, the battery divider on channel 4. Its enables are
++ * separate GPIOs of opposite polarity, so that block runs ungated.
++ *
+  * The hardware is single-conversion-per-transaction: the driver writes
+  * HC0 = channel | AIEN, waits for the conversion-complete interrupt, then
+  * reads R0 (which clears the COCO flag). Calibration is the same dance
+@@ -106,6 +111,9 @@ static void imx6_adc_gate_set(void *opaque, int n, int level)
+ /* Whether the analog front end the gate line powers is active. */
+ static bool adc_gate_enabled(Imx6AdcState *s)
+ {
++    if (s->ungated) {
++        return true;
++    }
+     return s->gate_active_low ? !s->gate : s->gate;
+ }
+ 
+@@ -126,13 +134,11 @@ static uint32_t adc_channel_sample(Imx6AdcState *s, unsigned ch)
+ {
+     double theta;
+ 
+-    switch (ch) {
+-    case 0:
++    if (ch == s->battery_ch) {
+         /* Battery divider: enabled (gate high) reads the pack, else ~0 V. */
+         return adc_gate_enabled(s) ? s->ch0_sample : 0;
+-
+-    case 1:
+-    case 2:
++    }
++    if (ch == s->wheel_ch1 || ch == s->wheel_ch2) {
+         /*
+          * The wheel's Hall pair, in quadrature around their midpoints:
+          * ch1 = mid1 + A*sin(θ), ch2 = mid2 + A*cos(θ), θ the magnet angle.
+@@ -141,15 +147,13 @@ static uint32_t adc_channel_sample(Imx6AdcState *s, unsigned ch)
+             return 0;               /* hall sensors unpowered */
+         }
+         theta = (double)s->wheel_angle * M_PI / 180000.0;
+-        if (ch == 1) {
++        if (ch == s->wheel_ch1) {
+             return s->mid1 + s->amplitude * sin(theta);
+         }
+         return s->mid2 + s->amplitude * cos(theta);
+-
+-    default:
+-        /* Unused channels float to mid scale. */
+-        return 0x800;
+     }
++    /* Unused channels float to mid scale. */
++    return 0x800;
+ }
+ 
+ static void adc_convert_done(void *opaque)
+@@ -378,10 +382,16 @@ static const Property imx6_adc_properties[] = {
+     DEFINE_PROP_UINT32("wheel-amplitude", Imx6AdcState, amplitude, 0x180),
+     DEFINE_PROP_UINT32("wheel-mid1", Imx6AdcState, mid1, 0x7ad),
+     DEFINE_PROP_UINT32("wheel-mid2", Imx6AdcState, mid2, 0x7f6),
+-    /* What channel 0 (the battery divider) reads while enabled. */
++    /* What the battery divider's channel reads while enabled. */
+     DEFINE_PROP_UINT32("ch0-sample", Imx6AdcState, ch0_sample, 3450),
++    /* Which channels carry the battery divider and the Hall pair. */
++    DEFINE_PROP_UINT32("battery-channel", Imx6AdcState, battery_ch, 0),
++    DEFINE_PROP_UINT32("wheel-channel1", Imx6AdcState, wheel_ch1, 1),
++    DEFINE_PROP_UINT32("wheel-channel2", Imx6AdcState, wheel_ch2, 2),
+     /* Gate line polarity: hall-enable is active low, the divider high. */
+     DEFINE_PROP_BOOL("gate-active-low", Imx6AdcState, gate_active_low, false),
++    /* A block holding both functions has no single enable to follow. */
++    DEFINE_PROP_BOOL("ungated", Imx6AdcState, ungated, false),
+ };
+ 
+ static const VMStateDescription vmstate_imx6_adc = {
+diff --git a/hw/arm/fsl-imx6ul.c b/hw/arm/fsl-imx6ul.c
+index f426ec1..3e0d01b 100644
+--- a/hw/arm/fsl-imx6ul.c
++++ b/hw/arm/fsl-imx6ul.c
+@@ -56,6 +56,11 @@ static void fsl_imx6ul_init(Object *obj)
+     object_initialize_child(obj, "usbmisc", &s->usbmisc, TYPE_IMX_USBMISC);
+     object_initialize_child(obj, "lcdif", &s->lcdif, TYPE_IMX_LCDIF);
+ 
++    for (i = 0; i < FSL_IMX6UL_NUM_ADCS; i++) {
++        snprintf(name, NAME_SIZE, "adc%d", i + 1);
++        object_initialize_child(obj, name, &s->adc[i], TYPE_IMX6_ADC);
++    }
++
+     /*
+      * SRC
+      */
+@@ -675,14 +680,20 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+      * ADCs
+      */
+     for (i = 0; i < FSL_IMX6UL_NUM_ADCS; i++) {
+-        static const hwaddr FSL_IMX6UL_ADCn_ADDR[FSL_IMX6UL_NUM_ADCS] = {
+-            FSL_IMX6UL_ADC1_ADDR,
+-            FSL_IMX6UL_ADC2_ADDR,
++        static const struct {
++            hwaddr addr;
++            unsigned int irq;
++        } adc_table[FSL_IMX6UL_NUM_ADCS] = {
++            { FSL_IMX6UL_ADC1_ADDR, FSL_IMX6UL_ADC1_IRQ },
++            { FSL_IMX6UL_ADC2_ADDR, FSL_IMX6UL_ADC2_IRQ },
+         };
+ 
+-        snprintf(name, NAME_SIZE, "adc%d", i);
+-        create_unimplemented_device(name, FSL_IMX6UL_ADCn_ADDR[i],
+-                                    FSL_IMX6UL_ADCn_SIZE);
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->adc[i]), 0, adc_table[i].addr);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc[i]), 0,
++                           qdev_get_gpio_in(gic, adc_table[i].irq));
+     }
+ 
+     /*
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+index 96b5f14..7d80699 100644
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -16,6 +16,7 @@
+ #include "hw/arm/machines-qom.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/qdev-properties.h"
++#include "qapi/visitor.h"
+ #include "system/block-backend-global-state.h"
+ #include "system/block-backend-io.h"
+ #include "system/reset.h"
+@@ -117,9 +118,22 @@ static void onyx_reset(MachineState *machine, ResetType type)
+     }
+ }
+ 
++/* /machine/wheel-position: the adc's signed detent count, either way round. */
++static void onyx_get_wheel(Object *obj, Visitor *v, const char *name,
++                           void *opaque, Error **errp)
++{
++    visit_type_int64(v, name, opaque, errp);
++}
++
++static void onyx_set_wheel(Object *obj, Visitor *v, const char *name,
++                           void *opaque, Error **errp)
++{
++    visit_type_int64(v, name, opaque, errp);
++}
++
+ static void onyx_init(MachineState *machine)
+ {
+-    DeviceState *soc, *board;
++    DeviceState *soc, *board, *adc;
+     BlockBackend *nand = blk_by_name("nand");
+     uint8_t *fuses;
+ 
+@@ -130,6 +144,17 @@ static void onyx_init(MachineState *machine)
+     soc = qdev_new(TYPE_FSL_IMX6UL);
+     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
+     qdev_prop_set_bit(soc, "usb0-peripheral", true);
++    /*
++     * ADC1 (nestlabs,vf610-adc-magwheel): Hall pair on channels 7 and 6,
++     * adc-div-battery on channel 4 behind a 169k/124k divider and the
++     * 1.8 V reference. 3756 reads as a 3.90 V pack.
++     */
++    adc = DEVICE(&FSL_IMX6UL(soc)->adc[0]);
++    qdev_prop_set_uint32(adc, "wheel-channel1", 7);
++    qdev_prop_set_uint32(adc, "wheel-channel2", 6);
++    qdev_prop_set_uint32(adc, "battery-channel", 4);
++    qdev_prop_set_uint32(adc, "ch0-sample", 3756);
++    qdev_prop_set_bit(adc, "ungated", true);
+     if (nand) {
+         qdev_prop_set_drive_err(DEVICE(&FSL_IMX6UL(soc)->gpmi), "drive", nand,
+                                 &error_fatal);
+@@ -157,6 +182,9 @@ static void onyx_init(MachineState *machine)
+                           qdev_get_gpio_in(board,
+                                            FLINTSTONE_BOARD_IN_BEEPER_ENABLE));
+     i2c_slave_create_simple(FSL_IMX6UL(soc)->i2c[1].bus, "lm3695", 0x63);
++    object_property_add(OBJECT(machine), "wheel-position", "int",
++                        onyx_get_wheel, onyx_set_wheel, NULL,
++                        &IMX6_ADC(adc)->wheel_position);
+     object_property_add_alias(OBJECT(machine), "usb-vbus",
+                               OBJECT(&FSL_IMX6UL(soc)->usb0_udc), "vbus");
+     object_property_add_alias(OBJECT(machine), "usb-connected",
+diff --git a/include/hw/adc/imx6_adc.h b/include/hw/adc/imx6_adc.h
+index 528bed8..7cd1550 100644
+--- a/include/hw/adc/imx6_adc.h
++++ b/include/hw/adc/imx6_adc.h
+@@ -31,6 +31,10 @@ struct Imx6AdcState {
+     /* The outside world */
+     bool gate;              /* level of the gate line */
+     bool gate_active_low;   /* hall-enable: low = powered */
++    bool ungated;           /* front end always powered; gate line unused */
++    uint32_t battery_ch;    /* channel of the battery divider */
++    uint32_t wheel_ch1;     /* Hall channel at mid1 (sine) */
++    uint32_t wheel_ch2;     /* Hall channel at mid2 (cosine) */
+ 
+     /* The wheel (adc@02280000) */
+     int64_t wheel_position; /* detents, either way round, from the UI */
+diff --git a/include/hw/arm/fsl-imx6ul.h b/include/hw/arm/fsl-imx6ul.h
+index 61944ab..4cf29bd 100644
+--- a/include/hw/arm/fsl-imx6ul.h
++++ b/include/hw/arm/fsl-imx6ul.h
+@@ -18,6 +18,7 @@
+ #define FSL_IMX6UL_H
+ 
+ #include "hw/cpu/a15mpcore.h"
++#include "hw/adc/imx6_adc.h"
+ #include "hw/misc/imx6ul_ccm.h"
+ #include "hw/display/imx_lcdif.h"
+ #include "hw/usb/cihdrc-udc.h"
+@@ -96,6 +97,7 @@ struct FslIMX6ULState {
+     IMXUSBPHYState     usbphy[FSL_IMX6UL_NUM_USB_PHYS];
+     ChipideaState      usb[FSL_IMX6UL_NUM_USBS];
+     ImxLcdifState      lcdif;
++    Imx6AdcState       adc[FSL_IMX6UL_NUM_ADCS];
+     CIHDRCUDCState     usb0_udc;
+     IMXUSBMiscState    usbmisc;
+     bool              usb0_peripheral;
+-- 
+2.56.1
+

@@ -2,8 +2,11 @@
 
 Nest Thermostat E: i.MX6UL rev1.2, Cortex-A7, 128 MiB LPDDR2 and
 512 MiB NAND. The machine provides NAND/UBI, UARTs, LCDIF scanout,
-I2C with LM3695 backlight, front button, USB device controller and SDMA
-initialization. Ring, backplate, radio and CAAM cryptography are not modelled.
+I2C with LM3695 backlight, front button, USB device controller, SDMA
+initialization and ADC1: the battery divider on channel 4 (a 3.90 V pack)
+and the ring's Hall pair on channels 7 and 6, turned through
+`/machine/wheel-position`. Backplate, radio and CAAM cryptography are not
+modelled.
 
 ## Development Linux
 

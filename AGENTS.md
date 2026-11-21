@@ -44,7 +44,7 @@ shellcheck --severity=warning $(git ls-files '*.sh')
 - diamond3: i.MX6SX SoC container + `diamond3` machine, GPMI NAND/BCH, a boot-ROM stub that loads U-Boot from NAND (applies the IVT's DCD), LCDIF, Vivante GC400T GPU (software 3D pipeline), BCM43341 SDIO Wi-Fi, vf610 ADC magwheel, PWM piezo, EM357 Thread radio SPI.
 - j49: OMAP3 peripherals (INTC, GP timers, PRCM, GPMC+BCH4 NAND, TPS65921, UART, I2C, GPIO, WDT, MMCHS, McSPI, SDMA, DSS) + `j49` machine, WL1271 Wi-Fi, ADBS-A320 ring sensor.
 
-- onyx: i.MX6UL with MMDC, GPMI/BCH, LCDIF, LM3695, GPIO button, peripheral USB and SDMA initialization. Closed fuses are the default; `secure-boot=off` selects open development fuses. An optional mask ROM can load the public SDP U-Boot over USB. Ring, backplate and radio are not modelled.
+- onyx: i.MX6UL with MMDC, GPMI/BCH, LCDIF, LM3695, GPIO button, peripheral USB, SDMA initialization and ADC1 (battery, ring Hall pair). Closed fuses are the default; `secure-boot=off` selects open development fuses. An optional mask ROM can load the public SDP U-Boot over USB. Backplate and radio are not modelled.
 
 **Host side (Python, standard library only)** — QEMU exposes chardevs and QMP over sockets; these processes are the "rest of the hardware":
 
