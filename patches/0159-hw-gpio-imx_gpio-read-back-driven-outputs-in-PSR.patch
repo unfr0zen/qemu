@@ -1,0 +1,38 @@
+From b004af1eb7e1ca06c85a356719be6ed03a441e59 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 02:05:28 -0500
+Subject: [PATCH 159/161] hw/gpio: imx_gpio: read back driven outputs in PSR
+
+PSR masked out the output bits, so a line configured as an output read
+back 0 whatever DR drove. A GPIO pad keeps its input path, and Linux's
+gpio-mxc reads every line's value from PSR: the stock Onyx nlclient
+checks its backplate reset line through sysfs after driving it, and
+reported "failed to set the backplate hard reset Gpio back to 0" on
+every hard reset (the line is active low).
+
+PSR now returns DR for outputs and the input level for inputs, as DR
+reads already do.
+---
+ hw/gpio/imx_gpio.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/hw/gpio/imx_gpio.c b/hw/gpio/imx_gpio.c
+index 5abf208..712bf7f 100644
+--- a/hw/gpio/imx_gpio.c
++++ b/hw/gpio/imx_gpio.c
+@@ -160,7 +160,11 @@ static uint64_t imx_gpio_read(void *opaque, hwaddr offset, unsigned size)
+         break;
+ 
+     case PSR_ADDR:
+-        reg_value = s->psr & ~s->gdir;
++        /*
++         * The pad's level: a GPIO pad keeps its input path, so an output
++         * reads back what DR drives (Linux's gpio-mxc reads outputs here).
++         */
++        reg_value = (s->dr & s->gdir) | (s->psr & ~s->gdir);
+         break;
+ 
+     case ICR1_ADDR:
+-- 
+2.56.1
+
