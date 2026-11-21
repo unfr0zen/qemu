@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 20:58:48 -0500
+Subject: [PATCH] hw/arm: onyx emulate the boot ROM USB-boot state
+
+The stock loader runs its factory boot command when the mask ROM
+entered it over USB: U-Boot's is_boot_from_usb() reads USBPHY1_PWD
+bit 20, which the reset value keeps set. A usb-boot=on machine
+property clears it after device reset, leaving the machine in the
+state the ROM leaves after a serial-download boot, so the locked boot
+path (UART muxed out, FIT signature checks retained) can be exercised
+without a mask ROM dump.
+---
+ hw/arm/onyx.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -27,6 +27,7 @@
+ struct OnyxMachineState {
+     MachineState parent_obj;
+     bool secure_boot;
++    bool usb_boot;
+     char *boot_rom;
+ };
+ 
+@@ -101,6 +102,18 @@
+     /* DDR is host RAM; DCD execution and DDR training are not modelled. */
+     cpu_physical_memory_write(start, image, len);
+     cpu_set_pc(first_cpu, entry);
++
++    if (ONYX_MACHINE(machine)->usb_boot) {
++        /*
++         * Emulate the state the boot ROM leaves after a USB serial-download
++         * boot: U-Boot's is_boot_from_usb() reads USBPHY1_PWD bit 20, which
++         * the reset value keeps set. Clearing it through the MMIO interface
++         * keeps the USB PHY device state consistent.
++         */
++        uint32_t pwd = 0x001e1c00 & ~BIT(20);
++
++        cpu_physical_memory_write(FSL_IMX6UL_USBPHY1_ADDR, &pwd, sizeof(pwd));
++    }
+ }
+ 
+ static void onyx_reset(MachineState *machine, ResetType type)
+@@ -197,6 +210,16 @@
+     s->secure_boot = true;
+ }
+ 
++static bool onyx_get_usb_boot(Object *obj, Error **errp)
++{
++    return ONYX_MACHINE(obj)->usb_boot;
++}
++
++static void onyx_set_usb_boot(Object *obj, bool value, Error **errp)
++{
++    ONYX_MACHINE(obj)->usb_boot = value;
++}
++
+ static bool onyx_get_secure_boot(Object *obj, Error **errp)
+ {
+     return ONYX_MACHINE(obj)->secure_boot;
+@@ -230,6 +253,8 @@
+ 
+     object_class_property_add_bool(oc, "secure-boot", onyx_get_secure_boot,
+                                    onyx_set_secure_boot);
++    object_class_property_add_bool(oc, "usb-boot", onyx_get_usb_boot,
++                                   onyx_set_usb_boot);
+     object_class_property_add_str(oc, "boot-rom", onyx_get_boot_rom,
+                                   onyx_set_boot_rom);
+     mc->desc = "Nest Thermostat E (Onyx, i.MX6UL)";

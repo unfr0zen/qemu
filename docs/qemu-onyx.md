@@ -56,6 +56,12 @@ remain closed: without a valid per-unit unlock token, the loader disconnects
 UART and retains FIT signature checks. Emulation does not authenticate HAB
 signatures or provide an unlock for physical closed devices.
 
+`usb-boot=on` emulates the machine state the mask ROM leaves after a USB
+serial-download boot (USBPHY1_PWD bit 20 cleared), so the stock loader runs
+its factory USB boot command (`bootcmd_mfg`) exactly as it does on a device
+entered through the ROM over USB — with closed fuses and FIT signature
+checks still enforced.
+
 The NAND boot stub loads the IVT image at data offset `0x100000`, sets
 boot clocks and jumps to U-Boot. It does not execute DCD or train DDR.
 
