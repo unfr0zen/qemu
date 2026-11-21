@@ -1,0 +1,96 @@
+From ce0e728fb54cd8274c0435ec620f1a21b285b426 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 02:05:28 -0500
+Subject: [PATCH 161/161] hw/arm: onyx: the piezo on PWM8
+
+The i.MX6UL's PWMs were unimplemented regions, so the stock firmware's
+clicks went nowhere. Instantiate the i.MX PWM model for PWM1-8; each
+reports its output frequency on its "tone" line. The Onyx's piezo is
+PWM8 (product.config beep_controller 7, perclk 24 MHz) with its enable
+on GPIO2_IO06 (beep_enable_gpio 38, active low); PWM8's tone drives the
+board's BEEPER line, which the UI plays: a click is 2 kHz for 3 ms.
+---
+ hw/arm/fsl-imx6ul.c         | 15 +++++++++++----
+ hw/arm/onyx.c               |  5 +++++
+ include/hw/arm/fsl-imx6ul.h |  2 ++
+ 3 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/hw/arm/fsl-imx6ul.c b/hw/arm/fsl-imx6ul.c
+index cb9e055..579c914 100644
+--- a/hw/arm/fsl-imx6ul.c
++++ b/hw/arm/fsl-imx6ul.c
+@@ -61,6 +61,11 @@ static void fsl_imx6ul_init(Object *obj)
+         object_initialize_child(obj, name, &s->adc[i], TYPE_IMX6_ADC);
+     }
+ 
++    for (i = 0; i < FSL_IMX6UL_NUM_PWMS; i++) {
++        snprintf(name, NAME_SIZE, "pwm%d", i + 1);
++        object_initialize_child(obj, name, &s->pwm[i], TYPE_IMX_PWM);
++    }
++
+     /*
+      * SRC
+      */
+@@ -668,7 +673,7 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+     }
+ 
+     /*
+-     * PWMs
++     * PWMs: each reports its output's frequency on its "tone" line.
+      */
+     for (i = 0; i < FSL_IMX6UL_NUM_PWMS; i++) {
+         static const hwaddr FSL_IMX6UL_PWMn_ADDR[FSL_IMX6UL_NUM_PWMS] = {
+@@ -682,9 +687,11 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+             FSL_IMX6UL_PWM8_ADDR,
+         };
+ 
+-        snprintf(name, NAME_SIZE, "pwm%d", i);
+-        create_unimplemented_device(name, FSL_IMX6UL_PWMn_ADDR[i],
+-                                    FSL_IMX6UL_PWMn_SIZE);
++        if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwm[i]), errp)) {
++            return;
++        }
++        sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwm[i]), 0,
++                        FSL_IMX6UL_PWMn_ADDR[i]);
+     }
+ 
+     /*
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+index 7d80699..5ea81a8 100644
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -181,6 +181,11 @@ static void onyx_init(MachineState *machine)
+     qdev_connect_gpio_out(DEVICE(&FSL_IMX6UL(soc)->gpio[1]), 6,
+                           qdev_get_gpio_in(board,
+                                            FLINTSTONE_BOARD_IN_BEEPER_ENABLE));
++    /* The piezo: PWM8 (product.config beep_controller 7), 24 MHz perclk. */
++    qdev_connect_gpio_out_named(DEVICE(&FSL_IMX6UL(soc)->pwm[7]), "tone", 0,
++                                qdev_get_gpio_in_named(board,
++                                                       FLINTSTONE_BOARD_BEEPER,
++                                                       0));
+     i2c_slave_create_simple(FSL_IMX6UL(soc)->i2c[1].bus, "lm3695", 0x63);
+     object_property_add(OBJECT(machine), "wheel-position", "int",
+                         onyx_get_wheel, onyx_set_wheel, NULL,
+diff --git a/include/hw/arm/fsl-imx6ul.h b/include/hw/arm/fsl-imx6ul.h
+index 4cf29bd..f7602be 100644
+--- a/include/hw/arm/fsl-imx6ul.h
++++ b/include/hw/arm/fsl-imx6ul.h
+@@ -19,6 +19,7 @@
+ 
+ #include "hw/cpu/a15mpcore.h"
+ #include "hw/adc/imx6_adc.h"
++#include "hw/misc/imx_pwm.h"
+ #include "hw/misc/imx6ul_ccm.h"
+ #include "hw/display/imx_lcdif.h"
+ #include "hw/usb/cihdrc-udc.h"
+@@ -98,6 +99,7 @@ struct FslIMX6ULState {
+     ChipideaState      usb[FSL_IMX6UL_NUM_USBS];
+     ImxLcdifState      lcdif;
+     Imx6AdcState       adc[FSL_IMX6UL_NUM_ADCS];
++    IMXPWMState        pwm[FSL_IMX6UL_NUM_PWMS];
+     CIHDRCUDCState     usb0_udc;
+     IMXUSBMiscState    usbmisc;
+     bool              usb0_peripheral;
+-- 
+2.56.1
+

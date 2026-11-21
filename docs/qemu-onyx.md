@@ -5,7 +5,9 @@ Nest Thermostat E: i.MX6UL rev1.2, Cortex-A7, 128 MiB LPDDR2 and
 I2C with LM3695 backlight, front button, USB device controller, SDMA
 for the ECSPIs (panel, EM35x radio) and the UARTs, and ADC1: the battery
 divider on channel 4 (a 3.90 V pack) and the ring's Hall pair on channels
-7 and 6, turned through `/machine/wheel-position`. The launcher runs
+7 and 6, turned through `/machine/wheel-position`, and PWM8 for the piezo
+(the UI plays its clicks, 2 kHz for 3 ms). The firmware presents 60 frames
+a second. The launcher runs
 `ui/backplate.py --board onyx` on UART3 (`/dev/ttysensormcu0`): it reports
 the firmware the unit's own backplate ran (mono 1.4.11, BSL 4.0, model
 "X") and acks the onyx's MCU mode request (0x8b, ack 0x36). The radio and
