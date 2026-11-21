@@ -116,11 +116,11 @@ def launch(args):
             command = docker + shlex.split(os.environ.get("QEMU_DOCKER_ARGS", "")) + [args.docker] + command
         ui_command = [sys.executable, str(REPO / "ui/ui.py"),
                       "--board", str(Path(directory) / "board.sock"),
-                      "--pins", "button=HU-BUTTON,wifi_reset=WIFI-RESET,hall_enable=HALL-ENABLE",
+                      "--pins", "button=HU-BUTTON,wifi_reset=WIFI-RESET,hall_enable=HALL-ENABLE,beeper_en=BEEPER-EN",
                       "--qmp", f"tcp:127.0.0.1:{qmp}",
                       "--console", f"tcp:127.0.0.1:{console}", "--echo-console",
                       "--screen-file", str(Path(directory) / "screen.ppm"),
-                      "--screen-period", "1", "--port", str(http),
+                      "--port", str(http),
                       "--name", "Nest onyx", "--face", "onyx",
                       "--backplate", f"tcp:127.0.0.1:{bpctl}", "--parent", str(os.getpid())]
         keyboard = sys.stdin.isatty() and sys.stdout.isatty()
