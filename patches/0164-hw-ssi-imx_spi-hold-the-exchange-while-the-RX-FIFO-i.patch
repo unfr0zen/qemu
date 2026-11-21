@@ -1,0 +1,51 @@
+From 90f5b99131d06eb4432e3148e86b632dc937605d Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:14:48 -0500
+Subject: [PATCH 164/166] hw/ssi: imx_spi: hold the exchange while the RX FIFO
+ is full
+
+An exchange is instant here, so a DMA feeding TXDATA could run a long
+transfer through before the DMA reading RXDATA starts, overflowing the
+RX FIFO: Linux's spi-imx then misses the bytes it reads back by PIO
+after the RX DMA ("I/O Error in RX tail"). On hardware the bus clock
+paces the exchange and the RX DMA keeps up. Stop at a full RX FIFO and
+go on once RXDATA is read.
+---
+ hw/ssi/imx_spi.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/hw/ssi/imx_spi.c b/hw/ssi/imx_spi.c
+index 77d22a2..ccc160c 100644
+--- a/hw/ssi/imx_spi.c
++++ b/hw/ssi/imx_spi.c
+@@ -183,6 +183,15 @@ static void imx_spi_flush_txfifo(IMXSPIState *s)
+     while (!fifo32_is_empty(&s->tx_fifo)) {
+         int tx_burst = 0;
+ 
++        /*
++         * The bus clock paces the exchange: with the RX FIFO full the
++         * next word waits until RXDATA is read, as a DMA reading RX
++         * behind the one feeding TX always catches up in hardware.
++         */
++        if (fifo32_is_full(&s->rx_fifo)) {
++            return;
++        }
++
+         if (s->burst_length <= 0) {
+             s->burst_length = imx_spi_burst_length(s);
+ 
+@@ -313,6 +322,11 @@ static uint64_t imx_spi_read(void *opaque, hwaddr offset, unsigned size)
+             } else {
+                 /* read from the RX FIFO */
+                 value = fifo32_pop(&s->rx_fifo);
++                if (imx_spi_channel_is_master(s) &&
++                    (s->regs[ECSPI_CONREG] &
++                     (ECSPI_CONREG_SMC | ECSPI_CONREG_XCH))) {
++                    imx_spi_flush_txfifo(s);
++                }
+             }
+             break;
+         case ECSPI_TXDATA:
+-- 
+2.56.1
+
