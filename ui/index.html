@@ -469,7 +469,7 @@
   // cover's own grey, and lit pixels show through it. Each pixel becomes
   // its colour at full brightness, as opaque as its brightest channel
   // (scaled by how much light the cover passes), over the lens.
-  const COVER = 0.7;
+  const COVER = 0.9;
   function frost(ctx, w, h) {
     const img = ctx.getImageData(0, 0, w, h), px = img.data;
     for (let i = 0; i < px.length; i += 4) {
