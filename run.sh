@@ -151,11 +151,10 @@ fi
 if [ "$machine" = onyx ]; then
     if [ "$usb" = 1 ] || [ "$cloud" = 1 ] || [ "$sleep" = 1 ] ||
         [ -n "$hostname$stock_image$mqtt$nic_extra$ssh_port$root" ] || [ "$gdb" = 1 ]; then
-        echo "ERROR: Onyx supports --nand, --ui and --ui-port; provisioning, networking and board helpers are not modelled" >&2
+        echo "ERROR: Onyx supports --nand, --ui, --ui-port and --no-provision; networking and board helpers are not modelled" >&2
         exit 1
     fi
     usb=0
-    provision=0
 fi
 omap=0
 if [ "$machine" = j49 ] || [ "$machine" = diamond ]; then omap=1; fi
@@ -327,9 +326,25 @@ ICOUNT_ARGS=""
 [ "$QEMU_ICOUNT" != "off" ] && ICOUNT_ARGS="-icount $QEMU_ICOUNT"
 
 if [ "$machine" = onyx ]; then
+    tag="imx6-qemu-build:$(shasum -a 256 "$script_path/docker/Dockerfile" | cut -c1-12)"
+    # The pre-boot (root / nest, root over ssh, quiet console, display on)
+    # drives U-Boot's prompt and a shell on the console. Closed fuses
+    # disconnect that UART, so its short boot runs with open fuses; the
+    # boot below keeps the fuses it is given.
+    if [ "$provision" = 1 ]; then
+        onyx_pre="-M onyx,secure-boot=off -m 128M -nographic -nic none -parallel none -watchdog-action none"
+        if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
+            python3 "$script_path/scripts/provision.py" --onyx -- \
+                docker run --rm -i --init -v "$repo_root:$repo_root" \
+                -w "$repo_root" "$tag" "$QEMU" $onyx_pre \
+                -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
+        else
+            python3 "$script_path/scripts/provision.py" --onyx -- "$QEMU" $onyx_pre \
+                -drive if=none,id=nand,format=raw,file="$NAND",snapshot=off
+        fi || echo "provision: booting the unit as it is" >&2
+    fi
     set -- -- "$@"
     if [ "$builddir" = build-docker ] || [ "$QEMU_FORCE_DOCKER" = 1 ]; then
-        tag="imx6-qemu-build:$(shasum -a 256 "$script_path/docker/Dockerfile" | cut -c1-12)"
         set -- --docker "$tag" "$@"
     fi
     [ "$ui" = 1 ] && set -- --ui "$@"

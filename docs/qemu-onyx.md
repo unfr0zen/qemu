@@ -53,8 +53,16 @@ ROM NAND boot with FCB/ECC and closed-device HAB verification are unsupported.
 ## Stock firmware
 
 ```sh
-./run.sh --onyx --ui
+./run.sh --onyx --nand onyx-logical.bin --ui    # first boot
+./run.sh --onyx --ui -machine secure-boot=off   # console login
 ```
+
+The pre-boot (`scripts/provision.py --onyx`) gives root the password
+`nest`, allows root over ssh, keeps all but critical messages off the
+console and keeps the screen on; `--no-provision` skips it. It boots
+with open fuses for U-Boot's prompt. With closed fuses, the default,
+U-Boot disconnects the console UART and the kernel's console is
+`/dev/null`, so a console login needs `-machine secure-boot=off`.
 
 This uses `.qemu/onyx/nand-state.bin`. To generate it from an existing
 logical NAND and a stock Onyx `.imx` loader:

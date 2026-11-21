@@ -41,6 +41,11 @@ Anything already in place is left alone. run.sh runs this before every
 boot, on the NAND that boot uses; nothing is kept on the host, so every
 checkout and every NAND image behave the same.
 
+The onyx (--onyx) boots the same way, its kernel's command line ending in
+"run final_bootm_command" rather than "bootm". It gets the login, ssh,
+console and display steps only: its WiFi, backplate and network are not
+modelled, so there is nothing for the rest to set up.
+
 The j49 (--j49 NAND) has no U-Boot prompt to stop at:
 its release U-Boot is silent. There the shell comes from the unit's own
 environment, edited as fw_setenv would (j49_env.py): the boot command's
@@ -64,7 +69,7 @@ file system on each at its next mount. The root file systems, the U-Boot
 environment and the factory provision volume are not touched; the root is
 never mounted read-write.
 
-Usage: provision.py [--ssid QEMU | --factory] [--j49 NAND]
+Usage: provision.py [--ssid QEMU | --factory] [--onyx | --j49 NAND]
                     [--transcript FILE] -- QEMU-COMMAND...
        (the command must boot the machine with -nographic and the NAND
        writable: its serial console is driven over stdin/stdout)
@@ -149,7 +154,7 @@ def printenv(con, name):
     return m.group(1).decode() if m else None
 
 
-def shell(con, root_rw=True, root=None):
+def shell(con, root_rw=True, root=None, need_mac=True):
     """From power-on to a root shell on the stock kernel, booted from the
     root file system U-Boot boots (a system update switches it; root=N
     switches it to rootN first, as the update does); return the MAC and
@@ -165,25 +170,36 @@ def shell(con, root_rw=True, root=None):
             break
     else:
         raise RuntimeError("no U-Boot prompt")
+    # The onyx's U-Boot runs on its default environment, without ethaddr;
+    # only the WiFi step needs the MAC.
     mac = printenv(con, "ethaddr")
-    if not mac or not re.fullmatch(r"[0-9A-Fa-f:]{17}", mac):
+    if mac and re.fullmatch(r"[0-9A-Fa-f:]{17}", mac):
+        mac = mac.replace(":", "").lower()
+    elif need_mac:
         raise RuntimeError("U-Boot has no ethaddr")
-    mac = mac.replace(":", "").lower()
     if root is not None:
         set_root(con, root)
     # bootcmd tries its boot commands in order ("run nandboot1 ||
     # run nandboot0 || ..."); the first is the active one. Run it as it
     # is, with the kernel's init replaced by a shell.
-    m = re.match(r"run (\w+)", printenv(con, "bootcmd") or "")
-    boot = printenv(con, m.group(1)) if m else None
+    bootcmd = printenv(con, "bootcmd") or ""
+    m = re.match(r"run (\w+)", bootcmd)
+    first = m.group(1) if m else None
+    if not m and bootcmd.startswith('if test "$bootside" != "1"'):
+        # The onyx's: nandboot1 first when bootside is 1, else nandboot0.
+        first = "nandboot1" if printenv(con, "bootside") == "1" else "nandboot0"
+    boot = printenv(con, first) if first else None
     root = re.search(r"root=ubi0:(\w+)", boot or "")
-    if not root or " && bootm " not in boot:
+    # The command line is the setenv bootargs just before the boot itself:
+    # " && bootm " on the diamond3, " && run final_bootm_command" on the onyx.
+    start = re.search(r" && (bootm |run final_bootm_command)", boot or "")
+    if not root or not start:
         raise RuntimeError(f"no root file system in U-Boot's bootcmd "
-                           f"({m.group(1) if m else 'bootcmd'}: {boot})")
+                           f"({first or 'bootcmd'}: {boot})")
     # The saved environment can disable the console with /dev/null. The
     # provisioning shell needs UART1; leave the saved environment alone.
-    con.send("setenv console ttymxc0; " +
-             boot.replace(" && bootm ", " init=/bin/sh && bootm ", 1) + "\n")
+    con.send("setenv console ttymxc0; " + boot[:start.start()] +
+             " init=/bin/sh" + boot[start.start():] + "\n")
     deadline = time.time() + 120
     while time.time() < deadline:
         con.send("echo RDY$((6*7))\n")
@@ -527,6 +543,8 @@ def main():
     ap.add_argument("--root", type=int, choices=(0, 1),
                     help="boot this root file system first from now on "
                          "(the diamond3's U-Boot env; run.sh --root0/--root1)")
+    ap.add_argument("--onyx", action="store_true",
+                    help="an onyx: only the login, console and display steps")
     ap.add_argument("--j49", metavar="NAND",
                     help="the j49 whose NAND image this is")
     ap.add_argument("--transcript", help="save the console session here")
@@ -550,24 +568,26 @@ def main():
             done.append(factory(con))
             con.run("sync")
         else:
-            mac, root = shell(con, root=args.root)
+            mac, root = shell(con, root=args.root, need_mac=not args.onyx)
             done.append(f"root file system: {root}")
             done.append(root_login(con))
             done.append(ssh_login(con))
             done.append(quiet_console(con))
             done.append(screen(con, args.sleep))
-            done.append(hostname(con, args.hostname))
-            if con.run("mount -t ubifs ubi0:user-config "
-                       "/media/user-config") != 0:
-                raise RuntimeError("could not mount user-config")
-            done.append(wifi(con, mac, args.ssid))
-            done.append(onboarding(con))
-            done.append(wiring(con))
-            done.append(nestlocal(con))
-            done.append(resolv(con))
-            # Unmounting commits the UBIFS journals before we pull the plug.
-            if con.run("sync; umount /media/user-config") != 0:
-                raise RuntimeError("user-config did not unmount cleanly")
+            if not args.onyx:
+                done.append(hostname(con, args.hostname))
+                if con.run("mount -t ubifs ubi0:user-config "
+                           "/media/user-config") != 0:
+                    raise RuntimeError("could not mount user-config")
+                done.append(wifi(con, mac, args.ssid))
+                done.append(onboarding(con))
+                done.append(wiring(con))
+                done.append(nestlocal(con))
+                done.append(resolv(con))
+                # Unmounting commits the UBIFS journals before we pull
+                # the plug.
+                if con.run("sync; umount /media/user-config") != 0:
+                    raise RuntimeError("user-config did not unmount cleanly")
             if con.run("mount -o remount,ro /") != 0:
                 raise RuntimeError(f"{root} did not remount read-only")
     except RuntimeError as e:

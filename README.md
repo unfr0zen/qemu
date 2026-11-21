@@ -81,8 +81,9 @@ You supply the NAND image; formats in [docs/nand-image.md](docs/nand-image.md).
 ```
 
 Onyx's UI provides serial console and QMP only; display, ring, backplate,
-radio, networking and USB are not modelled. It skips provisioning and disables
-watchdog resets for bring-up. `--onyx --nand FILE` seeds its working copy from
+radio, networking and USB are not modelled. Its pre-boot gives root the
+password `nest`, allows root over ssh, quiets the console and keeps the screen
+on; it disables watchdog resets for bring-up. `--onyx --nand FILE` seeds its working copy from
 a prepared Onyx NAND image; no `-bios` or separate firmware files are required.
 
 | Option | Effect |
