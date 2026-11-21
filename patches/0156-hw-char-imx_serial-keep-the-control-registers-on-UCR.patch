@@ -1,0 +1,83 @@
+From b6580b956401d6dd3c9d03f11cc99cc20861dd70 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 01:38:24 -0500
+Subject: [PATCH 156/158] hw/char: imx_serial: keep the control registers on
+ UCR2.SRST
+
+Clearing UCR2.SRST ran the device's full reset, which also zeroed UCR1,
+UCR3 and UFCR. The reference manual resets only the state machines, the
+FIFOs, USR1, USR2, UBIR, UBMR, UBRC, URXD, UTXD and UTS[6:3].
+
+The vendor i.MX6 Linux driver soft-resets the UART in every TX flush
+(imx_flush_buffer). The stock Onyx nlclient flushes before each
+backplate reset, so UCR1 lost UARTEN and the RX DMA enables, and the
+port received nothing more until it was reopened.
+
+Split a soft reset out of the full one and use it for SRST.
+---
+ hw/char/imx_serial.c | 28 ++++++++++++++++++++--------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/hw/char/imx_serial.c b/hw/char/imx_serial.c
+index d739358..e7936a7 100644
+--- a/hw/char/imx_serial.c
++++ b/hw/char/imx_serial.c
+@@ -145,27 +145,39 @@ static void imx_serial_rx_fifo_ageing_timer_restart(void *opaque)
+     }
+ }
+ 
+-static void imx_serial_reset(IMXSerialState *s)
++/*
++ * UCR2.SRST: resets the transmit and receive state machines, the FIFOs,
++ * USR1, USR2, UBIR, UBMR, UBRC, URXD, UTXD and UTS[6:3]. The control
++ * registers keep their values (the Linux driver soft-resets the UART on
++ * every TX flush and expects its DMA and interrupt enables to survive).
++ */
++static void imx_serial_soft_reset(IMXSerialState *s)
+ {
+-
+     s->usr1 = USR1_TRDY | USR1_RXDS;
+     /*
+      * Fake attachment of a terminal: assert RTS.
+      */
+     s->usr1 |= USR1_RTSS;
+     s->usr2 = USR2_TXFE | USR2_TXDC | USR2_DCDIN;
+-    s->uts1 = UTS1_RXEMPTY | UTS1_TXEMPTY;
+-    s->ucr1 = 0;
+-    s->ucr2 = UCR2_SRST;
+-    s->ucr3 = 0x700;
++    s->uts1 = (s->uts1 & ~(UTS1_TXEMPTY | UTS1_RXEMPTY | UTS1_TXFULL |
++                           UTS1_RXFULL)) | UTS1_RXEMPTY | UTS1_TXEMPTY;
+     s->ubmr = 0;
+     s->ubrc = 4;
+-    s->ufcr = BIT(11) | BIT(0);
+ 
+     fifo32_reset(&s->rx_fifo);
+     timer_del(&s->ageing_timer);
+ }
+ 
++static void imx_serial_reset(IMXSerialState *s)
++{
++    s->uts1 = 0;
++    imx_serial_soft_reset(s);
++    s->ucr1 = 0;
++    s->ucr2 = UCR2_SRST;
++    s->ucr3 = 0x700;
++    s->ufcr = BIT(11) | BIT(0);
++}
++
+ static void imx_serial_reset_at_boot(DeviceState *dev)
+ {
+     IMXSerialState *s = IMX_SERIAL(dev);
+@@ -315,7 +327,7 @@ static void imx_serial_write(void *opaque, hwaddr offset,
+          * register will have to be implemented more fully.
+          */
+         if (!(value & UCR2_SRST)) {
+-            imx_serial_reset(s);
++            imx_serial_soft_reset(s);
+             imx_update(s);
+             value |= UCR2_SRST;
+         }
+-- 
+2.56.1
+
