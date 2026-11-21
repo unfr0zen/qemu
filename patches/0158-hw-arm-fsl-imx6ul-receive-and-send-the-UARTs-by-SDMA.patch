@@ -1,0 +1,264 @@
+From 7cddb68784205a68f1462807ae8eda4c7171f225 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 01:38:40 -0500
+Subject: [PATCH 158/158] hw/arm: fsl-imx6ul: receive and send the UARTs by
+ SDMA
+
+The stock Onyx kernel runs the backplate's UART3 (and the BLE UART2)
+by DMA: the vendor driver enables UCR1.RDMAEN/TDMAEN when the port has
+RTS/CTS and keeps a cyclic SDMA receive ring, which it never got data
+into.
+
+The UART raises its DMA requests: RX while its FIFO holds data, then
+once more when a DMA has drained it, TX while the transmitter is on.
+The SDMA ends a UART receive BD early on that last request, as the
+UART scripts do when URXD has no character: the BD's count becomes the
+bytes received, which the driver reads back as the period's length.
+
+The i.MX6UL wires UART2-8 to the SDMA events the vendor device tree
+gives them; UART1, the console, has none.
+---
+ hw/arm/fsl-imx6ul.c          | 32 +++++++++++++++++++++++++++--
+ hw/char/imx_serial.c         | 19 +++++++++++++++++
+ hw/misc/imx6_sdma.c          | 40 ++++++++++++++++++++++++++----------
+ hw/misc/imx6_sdma.h          |  1 +
+ include/hw/char/imx_serial.h |  5 +++++
+ 5 files changed, 84 insertions(+), 13 deletions(-)
+
+diff --git a/hw/arm/fsl-imx6ul.c b/hw/arm/fsl-imx6ul.c
+index abd5d2a..cb9e055 100644
+--- a/hw/arm/fsl-imx6ul.c
++++ b/hw/arm/fsl-imx6ul.c
+@@ -165,6 +165,14 @@ static void fsl_imx6ul_init(Object *obj)
+     }
+ }
+ 
++/* SDMA events of UART1-8 (RX, TX); -1: none. */
++static const struct {
++    int rx, tx;
++} uart_events[FSL_IMX6UL_NUM_UARTS] = {
++    { -1, -1 }, { 27, 28 }, { 29, 30 }, { 31, 32 },
++    { 33, 34 }, { 0, 47 }, { 43, 44 }, { 45, 46 },
++};
++
+ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+ {
+     MachineState *ms = MACHINE(qdev_get_machine());
+@@ -173,6 +181,7 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+     int i;
+     char name[NAME_SIZE];
+     DeviceState *gic;
++    uint64_t uart_rx = 0;
+     SysBusDevice *gicsbd;
+     DeviceState *cpu;
+ 
+@@ -607,10 +616,18 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+ 
+     /*
+      * SDMA. ECSPIn requests RX on event 1 + 2n and TX on event 2 + 2n
+-     * (n from 1; i.MX6UL RM, SDMA event mapping).
++     * (n from 1; i.MX6UL RM, SDMA event mapping). UART2-8 use the events
++     * the vendor device tree gives them; UART1, the console, has none.
+      */
++    for (i = 0; i < FSL_IMX6UL_NUM_UARTS; i++) {
++        if (uart_events[i].rx >= 0) {
++            uart_rx |= BIT_ULL(uart_events[i].rx);
++        }
++    }
+     qdev_prop_set_uint64(DEVICE(&s->sdma), "rx-events",
+-                         BIT_ULL(3) | BIT_ULL(5) | BIT_ULL(7) | BIT_ULL(9));
++                         BIT_ULL(3) | BIT_ULL(5) | BIT_ULL(7) | BIT_ULL(9) |
++                         uart_rx);
++    qdev_prop_set_uint64(DEVICE(&s->sdma), "uart-events", uart_rx);
+     sysbus_realize(SYS_BUS_DEVICE(&s->sdma), &error_abort);
+     sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdma), 0, FSL_IMX6UL_SDMA_ADDR);
+     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdma), 0,
+@@ -623,6 +640,17 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+                                     qdev_get_gpio_in(DEVICE(&s->sdma),
+                                                      4 + 2 * i));
+     }
++    for (i = 0; i < FSL_IMX6UL_NUM_UARTS; i++) {
++        if (uart_events[i].rx < 0) {
++            continue;
++        }
++        qdev_connect_gpio_out_named(DEVICE(&s->uart[i]), "dma-rx-req", 0,
++                                    qdev_get_gpio_in(DEVICE(&s->sdma),
++                                                     uart_events[i].rx));
++        qdev_connect_gpio_out_named(DEVICE(&s->uart[i]), "dma-tx-req", 0,
++                                    qdev_get_gpio_in(DEVICE(&s->sdma),
++                                                     uart_events[i].tx));
++    }
+ 
+     /*
+      * SAIs (Audio SSI (Synchronous Serial Interface))
+diff --git a/hw/char/imx_serial.c b/hw/char/imx_serial.c
+index e7936a7..bcbe2ff 100644
+--- a/hw/char/imx_serial.c
++++ b/hw/char/imx_serial.c
+@@ -93,6 +93,18 @@ static void imx_update(IMXSerialState *s)
+     usr2 = s->usr2 & mask;
+ 
+     qemu_set_irq(s->irq, usr1 || usr2);
++
++    /*
++     * DMA requests. RX while the FIFO holds data, then once more when a
++     * DMA has drained it: the SDMA's UART script reads URXD then, finds
++     * no character and ends the transfer with what it has, as it does
++     * on the hardware's ageing and idle requests. TX whenever the
++     * transmitter is on: characters leave as they are written.
++     */
++    qemu_set_irq(s->dma_rx_req, (s->ucr1 & UCR1_RDMAEN) &&
++                 (!(s->uts1 & UTS1_RXEMPTY) || s->rx_dma_end));
++    qemu_set_irq(s->dma_tx_req, (s->ucr1 & UCR1_TDMAEN) &&
++                 (s->ucr2 & UCR2_TXEN));
+ }
+ 
+ static void imx_serial_rx_fifo_push(IMXSerialState *s, uint32_t value)
+@@ -166,6 +178,7 @@ static void imx_serial_soft_reset(IMXSerialState *s)
+ 
+     fifo32_reset(&s->rx_fifo);
+     timer_del(&s->ageing_timer);
++    s->rx_dma_end = false;
+ }
+ 
+ static void imx_serial_reset(IMXSerialState *s)
+@@ -217,10 +230,14 @@ static uint64_t imx_serial_read(void *opaque, hwaddr offset,
+             if (rx_used == 0) {
+                 s->usr2 &= ~USR2_RDR;
+                 s->uts1 |= UTS1_RXEMPTY;
++                s->rx_dma_end = s->ucr1 & UCR1_RDMAEN;
+             }
+             imx_update(s);
+             imx_serial_rx_fifo_ageing_timer_restart(s);
+             qemu_chr_fe_accept_input(&s->chr);
++        } else if (s->rx_dma_end) {
++            s->rx_dma_end = false;
++            imx_update(s);
+         }
+         value = c;
+         break;
+@@ -504,6 +521,8 @@ static void imx_serial_init(Object *obj)
+                             "tx-connected", 1);
+     qdev_init_gpio_in_named(DEVICE(obj), imx_serial_rx_connected,
+                             "rx-connected", 1);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->dma_rx_req, "dma-rx-req", 1);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->dma_tx_req, "dma-tx-req", 1);
+ }
+ 
+ static const Property imx_serial_properties[] = {
+diff --git a/hw/misc/imx6_sdma.c b/hw/misc/imx6_sdma.c
+index 34c1110..59ef713 100644
+--- a/hw/misc/imx6_sdma.c
++++ b/hw/misc/imx6_sdma.c
+@@ -22,13 +22,16 @@
+  * follows the events CHNENBL enables for it; while an event's request
+  * line is high, the channel moves one word per step (the BD command is
+  * the width: 0 for 32 bits, else bytes). Events in the rx-events mask
+- * read the peripheral into memory, the others write memory to it. A
+- * finished BD drops DONE and raises the channel's interrupt if it has
+- * INTR. With CONT the channel passes to the next BD, or back to the base
+- * one after WRAP, and waits there until the driver hands that BD back
+- * with DONE (a cyclic ring re-arms its BDs in memory only); without CONT
+- * the transfer is over and the channel stops. A channel also stops on
+- * H_STATSTOP.
++ * read the peripheral into memory, the others write memory to it.
++ * UART receive events (uart-events) end their BD early, as the UART
++ * scripts do: a URXD read without CHARRDY means the burst is over, and
++ * the BD finishes with the bytes it has as its count (nothing happens
++ * if it has none yet). A finished BD drops DONE and raises the channel's
++ * interrupt if it has INTR. With CONT the channel passes to the next BD,
++ * or back to the base one after WRAP, and waits there until the driver
++ * hands that BD back with DONE (a cyclic ring re-arms its BDs in memory
++ * only); without CONT the transfer is over and the channel stops. A
++ * channel also stops on H_STATSTOP.
+  *
+  * Transfers run in a bottom half, so a peripheral that raises a request
+  * while the model writes it does not re-enter the model.
+@@ -71,6 +74,8 @@
+ #define BD_CONT         0x04
+ #define BD_INTR         0x08
+ 
++#define URXD_CHARRDY    BIT(15)
++
+ #define C0_SETDM        0x01
+ #define C0_GETDM        0x02
+ 
+@@ -187,15 +192,26 @@ static bool sdma_channel_step(Imx6SdmaState *s, int ch)
+ 
+     if (s->pos[ch] < count) {
+         if (s->rx_events & BIT_ULL(e)) {
+-            stl_le_p(word, sdma_ldl(per));
+-            dma_memory_write(&address_space_memory, buf, word, width,
+-                             MEMTXATTRS_UNSPECIFIED);
++            uint32_t v = sdma_ldl(per);
++
++            if ((s->uart_events & BIT_ULL(e)) && !(v & URXD_CHARRDY)) {
++                if (!s->pos[ch]) {
++                    return true;
++                }
++                mode = (mode & ~0xffff) | s->pos[ch];
++                count = s->pos[ch];
++            } else {
++                stl_le_p(word, v);
++                dma_memory_write(&address_space_memory, buf, word, width,
++                                 MEMTXATTRS_UNSPECIFIED);
++                s->pos[ch] += width;
++            }
+         } else {
+             dma_memory_read(&address_space_memory, buf, word, width,
+                             MEMTXATTRS_UNSPECIFIED);
+             sdma_stl(per, ldl_le_p(word));
++            s->pos[ch] += width;
+         }
+-        s->pos[ch] += width;
+     }
+     if (s->pos[ch] >= count) {
+         sdma_stl(bd, mode & ~(BD_DONE << 16));
+@@ -353,6 +369,8 @@ static void imx6_sdma_unrealize(DeviceState *dev)
+ static const Property imx6_sdma_properties[] = {
+     /* Events whose peripheral is the source (the RX side). */
+     DEFINE_PROP_UINT64("rx-events", Imx6SdmaState, rx_events, 0),
++    /* Of those, the i.MX UARTs' (their bursts end early). */
++    DEFINE_PROP_UINT64("uart-events", Imx6SdmaState, uart_events, 0),
+ };
+ 
+ static const VMStateDescription imx6_sdma_vmstate = {
+diff --git a/hw/misc/imx6_sdma.h b/hw/misc/imx6_sdma.h
+index 46d9931..0bc86a9 100644
+--- a/hw/misc/imx6_sdma.h
++++ b/hw/misc/imx6_sdma.h
+@@ -32,6 +32,7 @@ struct Imx6SdmaState {
+     uint32_t regs[IMX6_SDMA_REG_SIZE / 4];
+ 
+     uint64_t rx_events;     /* events whose transfers read the peripheral */
++    uint64_t uart_events;   /* RX events of i.MX UARTs (URXD) */
+     uint64_t requests;      /* DMA request lines, one per event */
+     uint32_t running;       /* started channels */
+     uint32_t bd[IMX6_SDMA_CHANNELS];    /* BD each channel is on */
+diff --git a/include/hw/char/imx_serial.h b/include/hw/char/imx_serial.h
+index bff3a14..282556c 100644
+--- a/include/hw/char/imx_serial.h
++++ b/include/hw/char/imx_serial.h
+@@ -66,7 +66,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMXSerialState, IMX_SERIAL)
+ 
+ #define UCR1_TRDYEN     (1<<13)   /* Tx Ready Interrupt Enable */
+ #define UCR1_RRDYEN     (1<<9)    /* Rx Ready Interrupt Enable */
++#define UCR1_RDMAEN     BIT(8)    /* Rx DMA request enable */
+ #define UCR1_TXMPTYEN   (1<<6)    /* Tx Empty Interrupt Enable */
++#define UCR1_TDMAEN     BIT(3)    /* Tx DMA request enable */
+ #define UCR1_UARTEN     (1<<0)    /* UART Enable */
+ 
+ #define UCR2_ATEN       (1<<3)    /* Ageing Timer Enable */
+@@ -125,6 +127,9 @@ struct IMXSerialState {
+     CharFrontend chr;
+     bool tx_connected;
+     bool rx_connected;
++    qemu_irq dma_rx_req;
++    qemu_irq dma_tx_req;
++    bool rx_dma_end;    /* a burst drained: one more RX DMA request */
+ };
+ 
+ #endif
+-- 
+2.56.1
+
