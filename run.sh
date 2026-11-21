@@ -327,7 +327,8 @@ ICOUNT_ARGS=""
 
 if [ "$machine" = onyx ]; then
     tag="imx6-qemu-build:$(shasum -a 256 "$script_path/docker/Dockerfile" | cut -c1-12)"
-    # The pre-boot (root / nest, root over ssh, quiet console, display on)
+    # The pre-boot (root / nest, root over ssh, quiet console, display on,
+    # the backplate's wiring as the saved one)
     # drives U-Boot's prompt and a shell on the console. Closed fuses
     # disconnect that UART, so its short boot runs with open fuses; the
     # boot below keeps the fuses it is given.

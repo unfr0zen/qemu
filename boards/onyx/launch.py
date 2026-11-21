@@ -63,8 +63,20 @@ def launch(args):
     container = f"onyx-{os.getpid()}"
     docker = ["docker", "run", "--rm", "--init", "--name", container,
               "-v", f"{REPO}:{REPO}", "-w", str(REPO)]
+    # The backplate (sensor) MCU on UART3, /dev/ttysensormcu0: ui/backplate.py.
+    bind = "0.0.0.0" if args.docker else "127.0.0.1"
+    bp = pick_port(8110)
+    command += ["-chardev", f"socket,id=bp,host={bind},port={bp},server=on,"
+                "wait=off,nodelay=on"]
+    if args.docker:
+        docker += ["-p", f"127.0.0.1:{bp}:{bp}"]
+    backplate = [sys.executable, str(REPO / "ui/backplate.py"),
+                 "--serial", f"tcp:127.0.0.1:{bp}", "--board", "onyx",
+                 "--flash", args.nand + ".backplate", "--parent", str(os.getpid())]
     if not args.ui:
-        command += ["-nographic", *extra]
+        command += ["-nographic", "-serial", "mon:stdio", "-serial", "null",
+                    "-serial", "chardev:bp", *extra]
+        subprocess.Popen(backplate, stdin=subprocess.DEVNULL)
         if args.docker:
             docker += ["-it"] if sys.stdin.isatty() else ["-i"]
             command = docker + shlex.split(os.environ.get("QEMU_DOCKER_ARGS", "")) + [args.docker] + command
@@ -89,11 +101,12 @@ def launch(args):
         http = pick_port(args.ui_port)
         qmp = pick_port(8101)
         console = pick_port(qmp + 1)
-        bind = "0.0.0.0" if args.docker else "127.0.0.1"
+        bpctl = pick_port(console + 1)
         command += ["-display", "none", "-monitor", "none",
                     "-qmp", f"tcp:{bind}:{qmp},server=on,wait=off",
                     "-chardev", f"socket,id=con,host={bind},port={console},"
                     "server=on,wait=on,nodelay=on", "-serial", "chardev:con",
+                    "-serial", "null", "-serial", "chardev:bp",
                     "-chardev", f"socket,id=boardui,path={directory}/board.sock,server=on,wait=off",
                     "-global", "driver=flintstone.board,property=chardev,value=boardui",
                     *extra]
@@ -108,7 +121,8 @@ def launch(args):
                       "--console", f"tcp:127.0.0.1:{console}", "--echo-console",
                       "--screen-file", str(Path(directory) / "screen.ppm"),
                       "--screen-period", "1", "--port", str(http),
-                      "--name", "Nest onyx", "--face", "onyx", "--parent", str(os.getpid())]
+                      "--name", "Nest onyx", "--face", "onyx",
+                      "--backplate", f"tcp:127.0.0.1:{bpctl}", "--parent", str(os.getpid())]
         keyboard = sys.stdin.isatty() and sys.stdout.isatty()
         if keyboard:
             ui_command.append("--keyboard")
@@ -124,6 +138,8 @@ def launch(args):
             children.append(ui)
             qemu = subprocess.Popen(command, stdin=subprocess.DEVNULL)
             children.append(qemu)
+            children.append(subprocess.Popen(backplate + ["--control", f"tcp:127.0.0.1:{bpctl}"],
+                                             stdin=subprocess.DEVNULL))
             sdp = None
             if args.sdp_image:
                 sdp = subprocess.Popen(sdp_command)
@@ -131,7 +147,7 @@ def launch(args):
             print(f"onyx UI: http://127.0.0.1:{http}", file=sys.stderr)
             print(f"  USB host socket: {usb_socket}",
                   file=sys.stderr)
-            print("  LCDIF/serial/QMP; ring, backplate and radio are not modelled.",
+            print(f"  backplate tcp:{bp} (control {bpctl}); the radio is not modelled.",
                   file=sys.stderr)
             while qemu.poll() is None:
                 if sdp and sdp.poll() not in (None, 0):

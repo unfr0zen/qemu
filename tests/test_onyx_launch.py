@@ -166,7 +166,11 @@ class OnyxLaunchTests(unittest.TestCase):
             ui_args = json.loads((self.repo / 'ui-args.json').read_text())
             self.assertEqual(ui_args[ui_args.index('--port') + 1], '18075')
             self.assertIn('--echo-console', ui_args)
-            self.assertNotIn('--backplate', ui_args)
+            # UART3 is the backplate's serial, its control port the UI's.
+            serials = [args[index + 1] for index, arg in enumerate(args) if arg == '-serial']
+            self.assertEqual(serials, ['chardev:con', 'null', 'chardev:bp'])
+            self.assertTrue(any(device.startswith('socket,id=bp,') for device in devices))
+            self.assertTrue(ui_args[ui_args.index('--backplate') + 1].startswith('tcp:127.0.0.1:'))
             self.assertTrue(ui_args[ui_args.index('--board') + 1].endswith('/board.sock'))
             process.send_signal(signal.SIGTERM)
             self.assertEqual(process.wait(timeout=10), 128 + signal.SIGTERM)

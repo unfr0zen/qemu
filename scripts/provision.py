@@ -43,7 +43,7 @@ checkout and every NAND image behave the same.
 
 The onyx (--onyx) boots the same way, its kernel's command line ending in
 "run final_bootm_command" rather than "bootm". It gets the login, ssh,
-console and display steps only: its WiFi, backplate and network are not
+console, display and wiring steps: its WiFi and network are not
 modelled, so there is nothing for the rest to set up.
 
 The j49 (--j49 NAND) has no U-Boot prompt to stop at:
@@ -544,7 +544,8 @@ def main():
                     help="boot this root file system first from now on "
                          "(the diamond3's U-Boot env; run.sh --root0/--root1)")
     ap.add_argument("--onyx", action="store_true",
-                    help="an onyx: only the login, console and display steps")
+                    help="an onyx: only the login, console, display and "
+                         "wiring steps")
     ap.add_argument("--j49", metavar="NAND",
                     help="the j49 whose NAND image this is")
     ap.add_argument("--transcript", help="save the console session here")
@@ -576,18 +577,19 @@ def main():
             done.append(screen(con, args.sleep))
             if not args.onyx:
                 done.append(hostname(con, args.hostname))
-                if con.run("mount -t ubifs ubi0:user-config "
-                           "/media/user-config") != 0:
-                    raise RuntimeError("could not mount user-config")
+            if con.run("mount -t ubifs ubi0:user-config "
+                       "/media/user-config") != 0:
+                raise RuntimeError("could not mount user-config")
+            if not args.onyx:
                 done.append(wifi(con, mac, args.ssid))
                 done.append(onboarding(con))
-                done.append(wiring(con))
+            done.append(wiring(con))
+            if not args.onyx:
                 done.append(nestlocal(con))
                 done.append(resolv(con))
-                # Unmounting commits the UBIFS journals before we pull
-                # the plug.
-                if con.run("sync; umount /media/user-config") != 0:
-                    raise RuntimeError("user-config did not unmount cleanly")
+            # Unmounting commits the UBIFS journals before we pull the plug.
+            if con.run("sync; umount /media/user-config") != 0:
+                raise RuntimeError("user-config did not unmount cleanly")
             if con.run("mount -o remount,ro /") != 0:
                 raise RuntimeError(f"{root} did not remount read-only")
     except RuntimeError as e:

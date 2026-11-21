@@ -166,6 +166,10 @@ MSG_END_BUF = 0x2f
 # front -> back firmware update requests
 MSG_SWITCH = 0x82
 MSG_SAFETY_TEMP = 0x89
+# The onyx's front sets the MCU's mode (0x8b, "Setting the MCU mode to N")
+# and waits for 0x36, its MCU mode set ack (wire type -> event table)
+MSG_SET_MCU_MODE = 0x8b
+MSG_MCU_MODE_ACK = 0x36
 MSG_FLUSH = 0xa2
 MSG_UPDATE_BEGIN = 0x91
 MSG_UPDATE_RECORD = 0x92
@@ -220,6 +224,23 @@ J49_MONO = dict(version="4.2.8", description="TFE (BP_D2D)",
                  host="jenkins-agent-143-v17-emb-prod", user="jenkins-slave",
                  date="2019-04-03 17:36:54")
 J49_BSL = dict(J49_MONO, version="3.1", description="BSL")
+# The onyx's: what its own backplate reported (nlclient's log on the unit:
+# Mono 1.4.11, BSL 4.0, model "X", which nlclient takes as Backplate-7.19),
+# with the build strings the onyx plist ships for those versions.
+ONYX_MODEL = b"X"
+ONYX_MONO = dict(version="1.4.11", description="TFE (BP_ONYX1_EVT)",
+                 host="jenkins-agent-191-v17-emb-prod", user="jenkins-slave",
+                 date="2019-03-14 16:48:28")
+ONYX_BSL = dict(ONYX_MONO, version="4.0", description="BSL")
+
+# Per board: model, stock mono and BSL, the mono family a saved flash must
+# belong to, and whether the front has a near PIR (hasnearpirsensor).
+BOARDS = {
+    "diamond3": (b"Backplate-6.0", MONO, BSL, "TFE (BP_A", False),
+    "j49": (J49_MODEL, J49_MONO, J49_BSL, "TFE (BP_D2", True),
+    "diamond": (J49_MODEL, J49_MONO, J49_BSL, "TFE (BP_D2", True),
+    "onyx": (ONYX_MODEL, ONYX_MONO, ONYX_BSL, "TFE (BP_ONYX", False),
+}
 
 
 def srec_image(records):
@@ -311,16 +332,14 @@ class Backplate:
         self.period = period
         self.wires = wires
         self.attached = threading.Event()     # the front unit reset us
-        self.board = board
-        self.model = J49_MODEL if board != "diamond3" else b"Backplate-6.0"
-        self.mono = dict(J49_MONO if board != "diamond3" else MONO)
-        self.bsl = dict(J49_BSL if board != "diamond3" else BSL)
+        self.model, mono, bsl, family, self.near_pir = BOARDS[board]
+        self.mono, self.bsl = dict(mono), dict(bsl)
         self.flash_file = flash_file
         if flash_file and os.path.exists(flash_file):
             with open(flash_file) as f:
                 saved = json.load(f)
             # Keep saved firmware only for the selected backplate family.
-            if saved["mono"]["description"].startswith("TFE (BP_D2") == (board != "diamond3"):
+            if saved["mono"]["description"].startswith(family):
                 self.mono, self.bsl = saved["mono"], saved["bsl"]
         self.update = None                    # (kind, {seq: record}) in the BSL
         self.buf = b""
@@ -455,7 +474,7 @@ class Backplate:
         if self.presence:
             self.send(MSG_PIR, struct.pack("<HH", 0x03E8, 0x03E8))
             # The j49's near PIR: someone close, past stock's threshold (15).
-            if self.board != "diamond3":
+            if self.near_pir:
                 self.send(MSG_NEAR_PIR, struct.pack("<H", 100))
 
     def flush(self):
@@ -570,7 +589,7 @@ class Backplate:
         if (low is not None and self.temp_c < low) or (high is not None and self.temp_c > high):
             fired |= WAKE_TEMP
         if self.presence:
-            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.board != "diamond3" else 0)
+            fired |= WAKE_PIR | (WAKE_NEAR_PIR if self.near_pir else 0)
         return fired & (self.wake_sources | WAKE_TIMER)
 
     def serve_forever(self):
@@ -650,6 +669,8 @@ class Backplate:
             self.send(MSG_ACK_SWITCH, payload)
         elif mtype == MSG_SAFETY_TEMP:
             self.send(MSG_SAFETY_TEMP_DATA, bytes(24))
+        elif mtype == MSG_SET_MCU_MODE:
+            self.send(MSG_MCU_MODE_ACK, payload)
         elif mtype == MSG_FLUSH:
             self.flush()
         elif mtype == MSG_TEMP_COMP and len(payload) == 2:
@@ -713,7 +734,7 @@ def main():
                     help="connected terminals, of " + ",".join(WIRE_INDEX))
     ap.add_argument("--control", metavar="tcp:HOST:PORT",
                     help="take room and wiring changes as JSON lines here")
-    ap.add_argument("--board", choices=("diamond3", "j49", "diamond"), default="diamond3",
+    ap.add_argument("--board", choices=tuple(BOARDS), default="diamond3",
                     help="backplate board model; Diamond uses the provisional j49 model")
     ap.add_argument("--flash", metavar="FILE",
                     help="the MCU's flash: the firmware it runs, kept across "
