@@ -1,0 +1,569 @@
+From 365482f601e37d543dd4256a9b7e4038d2c937b8 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:50:16 -0500
+Subject: [PATCH] hw/misc: imx6_sdma: run ECSPI transfers on DMA requests
+
+The SDMA was a probe stub: channel 0 looked ready and no other channel
+ever moved data. The stock Onyx kernel drives the EM35x radio's ECSPI4
+through SDMA, so its transfers timed out:
+
+  spi_master spi3: I/O Error in DMA TX:59
+
+Model what the scripts do at the driver's level. Channel 0 runs its
+BDs, keeping the contexts C0_SETDM loads (gReg[6] is the peripheral's
+data register). Other channels follow the events CHNENBL enables and
+move one word per step while the request line is high, BD by BD, with
+DONE, INTR and WRAP as the driver sets them; an rx-events mask gives
+the direction. Transfers run in a bottom half.
+
+The ECSPI raises its RX and TX DMA requests from DMAREG, and the
+i.MX6UL wires ECSPI1-4 to SDMA events 3-10. The 6SX wires no events.
+---
+ hw/arm/fsl-imx6ul.c      |  13 +-
+ hw/misc/imx6_sdma.c      | 332 +++++++++++++++++++++++++++++++++++----
+ hw/misc/imx6_sdma.h      |  14 +-
+ hw/ssi/imx_spi.c         |  15 ++
+ include/hw/ssi/imx_spi.h |   4 +
+ 5 files changed, 342 insertions(+), 36 deletions(-)
+
+diff --git a/hw/arm/fsl-imx6ul.c b/hw/arm/fsl-imx6ul.c
+index 3e0d01b..abd5d2a 100644
+--- a/hw/arm/fsl-imx6ul.c
++++ b/hw/arm/fsl-imx6ul.c
+@@ -606,12 +606,23 @@ static void fsl_imx6ul_realize(DeviceState *dev, Error **errp)
+     }
+ 
+     /*
+-     * SDMA
++     * SDMA. ECSPIn requests RX on event 1 + 2n and TX on event 2 + 2n
++     * (n from 1; i.MX6UL RM, SDMA event mapping).
+      */
++    qdev_prop_set_uint64(DEVICE(&s->sdma), "rx-events",
++                         BIT_ULL(3) | BIT_ULL(5) | BIT_ULL(7) | BIT_ULL(9));
+     sysbus_realize(SYS_BUS_DEVICE(&s->sdma), &error_abort);
+     sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdma), 0, FSL_IMX6UL_SDMA_ADDR);
+     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdma), 0,
+                        qdev_get_gpio_in(gic, FSL_IMX6UL_SDMA_IRQ));
++    for (i = 0; i < FSL_IMX6UL_NUM_ECSPIS; i++) {
++        qdev_connect_gpio_out_named(DEVICE(&s->spi[i]), "dma-rx-req", 0,
++                                    qdev_get_gpio_in(DEVICE(&s->sdma),
++                                                     3 + 2 * i));
++        qdev_connect_gpio_out_named(DEVICE(&s->spi[i]), "dma-tx-req", 0,
++                                    qdev_get_gpio_in(DEVICE(&s->sdma),
++                                                     4 + 2 * i));
++    }
+ 
+     /*
+      * SAIs (Audio SSI (Synchronous Serial Interface))
+diff --git a/hw/misc/imx6_sdma.c b/hw/misc/imx6_sdma.c
+index 7a67e19..b09cbc1 100644
+--- a/hw/misc/imx6_sdma.c
++++ b/hw/misc/imx6_sdma.c
+@@ -1,19 +1,34 @@
+ /*
+- * i.MX6 SDMA emulation — a stub that answers the probe.
++ * i.MX6 SDMA emulation.
+  *
+- * The 4.1.15 imx-sdma driver maps the block, loads its ROM scripts
+- * (through the shared RAM the model reports as RAM), then brings up
+- * channel 0: it points H_C0PTR at the channel's control block and spins
+- * on H_INTR bit 0 ("CH0 ready") — the emulated core is supposed to have
+- * run the context-load script and raised the interrupt. There is no core
+- * here, so the stub keeps bit 0 set: the driver sees CH0 ready at once,
+- * the probe completes and every DMA client (the vendor kernel uses none
+- * on the console path) would still have nothing behind it.
++ * The SDMA is a small RISC core running scripts from ROM and from the
++ * firmware the driver loads. There is no core here: the model performs
++ * what the scripts do, at the level of the driver's data structures
++ * (drivers/dma/imx-sdma.c, v4.1).
+  *
+- *   imx-sdma 20ec000.sdma: Timeout waiting for CH0 ready
++ * H_C0PTR points at an array of channel control blocks (CCB, 16 bytes
++ * each: current and base buffer descriptor). A buffer descriptor (BD,
++ * 12 bytes) holds mode (count 15:0, status 23:16, command 31:24), the
++ * buffer address and an extended address. Writing a channel's bit to
++ * H_START runs it; a BD belongs to the SDMA while its status has DONE.
+  *
+- * Drivers/dt: arch/arm/boot/dts/imx6sx.dtsi (sdma@020ec000, SPI 2),
+- * drivers/dma/imx-sdma.c v4.1 (SDMA_H_* offsets).
++ * Channel 0 is the control channel. Its BDs carry commands: C0_SETDM
++ * copies words into the SDMA's data memory, which is how the driver
++ * loads each channel's 32-word context at 2048 + 32 * channel. The model
++ * keeps those contexts; script loads (C0_SETPM) have nothing to run them.
++ * The context's gReg[6] is the peripheral's data register.
++ *
++ * Other channels move data between memory and a peripheral. A channel
++ * follows the events CHNENBL enables for it; while an event's request
++ * line is high, the channel moves one word per step (the BD command is
++ * the width: 0 for 32 bits, else bytes). Events in the rx-events mask
++ * read the peripheral into memory, the others write memory to it. A
++ * finished BD drops DONE, raises the channel's interrupt if it has INTR
++ * and passes to the next BD, or back to the base one after WRAP. A
++ * channel stops at a BD that is not DONE, or on H_STATSTOP.
++ *
++ * Transfers run in a bottom half, so a peripheral that raises a request
++ * while the model writes it does not re-enter the model.
+  *
+  * Copyright (c) 2026
+  *
+@@ -25,11 +40,15 @@
+ 
+ #include "qemu/osdep.h"
+ #include "hw/misc/imx6_sdma.h"
++#include "hw/core/irq.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/sysbus.h"
+ #include "migration/vmstate.h"
+-#include "qemu/log.h"
++#include "qemu/bswap.h"
++#include "qemu/main-loop.h"
+ #include "qemu/module.h"
++#include "system/address-spaces.h"
++#include "system/dma.h"
+ 
+ /* Host interface registers (drivers/dma/imx-sdma.c, enum sdma_h_*) */
+ #define SDMA_H_C0PTR    0x000
+@@ -37,23 +56,229 @@
+ #define SDMA_H_STATSTOP 0x008
+ #define SDMA_H_START    0x00c
+ #define SDMA_H_RESET    0x024
+-#define SDMA_H_INTRMSK  0x02c
+-#define SDMA_H_CONFIG   0x038
++#define SDMA_CHNENBL0   0x200   /* one register per event, bit per channel */
+ 
+-#define SDMA_INTR_CH0   BIT(0)
++#define SDMA_CCB_SIZE   16
++#define SDMA_BD_SIZE    12
++#define SDMA_CTX_DM     2048    /* data memory word address, channel 0 */
++#define SDMA_CTX_SHP    8       /* gReg[6], after the two state words */
+ 
+-static uint64_t imx6_sdma_read(void *opaque, hwaddr off, unsigned size)
++#define BD_DONE         0x01
++#define BD_WRAP         0x02
++#define BD_INTR         0x08
++
++#define C0_SETDM        0x01
++#define C0_GETDM        0x02
++
++/* Steps per bottom-half run before yielding to the rest of QEMU. */
++#define SDMA_STEP_BUDGET 65536
++
++static void sdma_update_irq(Imx6SdmaState *s)
++{
++    qemu_set_irq(s->irq, s->intr != 0);
++}
++
++static uint32_t sdma_ldl(hwaddr addr)
++{
++    return address_space_ldl_le(&address_space_memory, addr,
++                                MEMTXATTRS_UNSPECIFIED, NULL);
++}
++
++static void sdma_stl(hwaddr addr, uint32_t val)
++{
++    address_space_stl_le(&address_space_memory, addr, val,
++                         MEMTXATTRS_UNSPECIFIED, NULL);
++}
++
++static hwaddr sdma_ccb(Imx6SdmaState *s, int ch)
++{
++    return s->regs[SDMA_H_C0PTR / 4] + ch * SDMA_CCB_SIZE;
++}
++
++/* C0_SETDM / C0_GETDM: words between memory and the context area. */
++static void sdma_data_memory(Imx6SdmaState *s, uint32_t dm, hwaddr buf,
++                             uint32_t words, bool set)
++{
++    uint32_t i;
++
++    for (i = 0; i < words; i++) {
++        uint32_t w = dm + i - SDMA_CTX_DM;
++
++        if (dm + i < SDMA_CTX_DM || w >= ARRAY_SIZE(s->ctx)) {
++            continue;
++        }
++        if (set) {
++            s->ctx[w] = sdma_ldl(buf + i * 4);
++        } else {
++            sdma_stl(buf + i * 4, s->ctx[w]);
++        }
++    }
++}
++
++static void sdma_run_channel0(Imx6SdmaState *s)
++{
++    hwaddr bd = sdma_ldl(sdma_ccb(s, 0));
++    int n;
++
++    for (n = 0; n < 64; n++, bd += SDMA_BD_SIZE) {
++        uint32_t mode = sdma_ldl(bd);
++        uint32_t status = (mode >> 16) & 0xff;
++
++        if (!(status & BD_DONE)) {
++            break;
++        }
++        switch (mode >> 24) {
++        case C0_SETDM:
++        case C0_GETDM:
++            sdma_data_memory(s, sdma_ldl(bd + 8), sdma_ldl(bd + 4),
++                             mode & 0xffff, (mode >> 24) == C0_SETDM);
++            break;
++        default:
++            /* Script loads and the rest: no core to give them to. */
++            break;
++        }
++        sdma_stl(bd, mode & ~(BD_DONE << 16));
++        if (status & BD_WRAP) {
++            break;
++        }
++    }
++    s->intr |= BIT(0);
++}
++
++/* The first requesting event channel `ch` follows, or -1. */
++static int sdma_channel_event(Imx6SdmaState *s, int ch)
++{
++    int e;
++
++    for (e = 0; e < IMX6_SDMA_EVENTS; e++) {
++        if ((s->requests & BIT_ULL(e)) &&
++            (s->regs[SDMA_CHNENBL0 / 4 + e] & BIT(ch))) {
++            return e;
++        }
++    }
++    return -1;
++}
++
++/* Move one word on channel `ch`; false when it has nothing to do. */
++static bool sdma_channel_step(Imx6SdmaState *s, int ch)
++{
++    int e = sdma_channel_event(s, ch);
++    hwaddr bd = s->bd[ch];
++    hwaddr per = s->ctx[ch * IMX6_SDMA_CTX_WORDS + SDMA_CTX_SHP];
++    uint32_t mode, status, count, width;
++    uint8_t word[4] = { 0 };
++    hwaddr buf;
++
++    if (e < 0) {
++        return false;
++    }
++    mode = sdma_ldl(bd);
++    status = (mode >> 16) & 0xff;
++    if (!(status & BD_DONE)) {
++        s->running &= ~BIT(ch);
++        return false;
++    }
++    count = mode & 0xffff;
++    width = (mode >> 24) & 3 ? (mode >> 24) & 3 : 4;
++    buf = sdma_ldl(bd + 4) + s->pos[ch];
++
++    if (s->pos[ch] < count) {
++        if (s->rx_events & BIT_ULL(e)) {
++            stl_le_p(word, sdma_ldl(per));
++            dma_memory_write(&address_space_memory, buf, word, width,
++                             MEMTXATTRS_UNSPECIFIED);
++        } else {
++            dma_memory_read(&address_space_memory, buf, word, width,
++                            MEMTXATTRS_UNSPECIFIED);
++            sdma_stl(per, ldl_le_p(word));
++        }
++        s->pos[ch] += width;
++    }
++    if (s->pos[ch] >= count) {
++        sdma_stl(bd, mode & ~(BD_DONE << 16));
++        if (status & BD_INTR) {
++            s->intr |= BIT(ch);
++        }
++        s->bd[ch] = status & BD_WRAP ? sdma_ldl(sdma_ccb(s, ch) + 4)
++                                     : bd + SDMA_BD_SIZE;
++        s->pos[ch] = 0;
++    }
++    return true;
++}
++
++static void sdma_run(void *opaque)
+ {
+     Imx6SdmaState *s = IMX6_SDMA(opaque);
++    int budget = SDMA_STEP_BUDGET;
++    bool progress;
++    int ch;
+ 
+-    if (off == SDMA_H_INTR) {
+-        /* CH0 is always ready — there is nothing here to run it. */
+-        return s->intr | SDMA_INTR_CH0;
++    do {
++        progress = false;
++        for (ch = 1; ch < IMX6_SDMA_CHANNELS; ch++) {
++            if ((s->running & BIT(ch)) && sdma_channel_step(s, ch)) {
++                progress = true;
++                budget--;
++            }
++        }
++    } while (progress && budget > 0);
++    if (progress) {
++        qemu_bh_schedule(s->bh);
+     }
+-    if (off < sizeof(s->regs)) {
+-        return s->regs[off / 4];
++    sdma_update_irq(s);
++}
++
++static void sdma_event(void *opaque, int n, int level)
++{
++    Imx6SdmaState *s = IMX6_SDMA(opaque);
++
++    if (level) {
++        s->requests |= BIT_ULL(n);
++        qemu_bh_schedule(s->bh);
++    } else {
++        s->requests &= ~BIT_ULL(n);
++    }
++}
++
++static void sdma_start(Imx6SdmaState *s, uint32_t channels)
++{
++    int ch;
++
++    if (channels & BIT(0)) {
++        sdma_run_channel0(s);
++    }
++    for (ch = 1; ch < IMX6_SDMA_CHANNELS; ch++) {
++        if ((channels & BIT(ch)) && !(s->running & BIT(ch))) {
++            s->bd[ch] = sdma_ldl(sdma_ccb(s, ch));
++            s->pos[ch] = 0;
++            s->running |= BIT(ch);
++        }
++    }
++    qemu_bh_schedule(s->bh);
++    sdma_update_irq(s);
++}
++
++static void sdma_reset_state(Imx6SdmaState *s)
++{
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->ctx, 0, sizeof(s->ctx));
++    s->intr = 0;
++    s->running = 0;
++}
++
++static uint64_t imx6_sdma_read(void *opaque, hwaddr off, unsigned size)
++{
++    Imx6SdmaState *s = IMX6_SDMA(opaque);
++
++    switch (off) {
++    case SDMA_H_INTR:
++        return s->intr;
++    case SDMA_H_STATSTOP:
++    case SDMA_H_START:
++        return s->running;
++    default:
++        return off < sizeof(s->regs) ? s->regs[off / 4] : 0;
+     }
+-    return 0;
+ }
+ 
+ static void imx6_sdma_write(void *opaque, hwaddr off, uint64_t val,
+@@ -61,18 +286,30 @@ static void imx6_sdma_write(void *opaque, hwaddr off, uint64_t val,
+ {
+     Imx6SdmaState *s = IMX6_SDMA(opaque);
+ 
+-    if (off == SDMA_H_INTR) {
++    switch (off) {
++    case SDMA_H_INTR:
+         /* W1C: acknowledge the raised channel interrupts. */
+         s->intr &= ~val;
++        sdma_update_irq(s);
+         return;
+-    }
+-    if (off == SDMA_H_RESET) {
+-        memset(s->regs, 0, sizeof(s->regs));
+-        s->intr = 0;
++    case SDMA_H_START:
++        sdma_start(s, val);
+         return;
+-    }
+-    if (off < sizeof(s->regs)) {
+-        s->regs[off / 4] = val;
++    case SDMA_H_STATSTOP:
++        s->running &= ~val;
++        return;
++    case SDMA_H_RESET:
++        sdma_reset_state(s);
++        sdma_update_irq(s);
++        return;
++    default:
++        if (off < sizeof(s->regs)) {
++            s->regs[off / 4] = val;
++        }
++        if (off >= SDMA_CHNENBL0 &&
++            off < SDMA_CHNENBL0 + IMX6_SDMA_EVENTS * 4) {
++            qemu_bh_schedule(s->bh);
++        }
+     }
+ }
+ 
+@@ -84,6 +321,11 @@ static const MemoryRegionOps imx6_sdma_ops = {
+     .valid.max_access_size = 4,
+ };
+ 
++static void imx6_sdma_reset(DeviceState *dev)
++{
++    sdma_reset_state(IMX6_SDMA(dev));
++}
++
+ static void imx6_sdma_realize(DeviceState *dev, Error **errp)
+ {
+     Imx6SdmaState *s = IMX6_SDMA(dev);
+@@ -92,15 +334,34 @@ static void imx6_sdma_realize(DeviceState *dev, Error **errp)
+                           TYPE_IMX6_SDMA, IMX6_SDMA_REG_SIZE);
+     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
++    qdev_init_gpio_in(dev, sdma_event, IMX6_SDMA_EVENTS);
++    s->bh = qemu_bh_new_guarded(sdma_run, s,
++                                &dev->mem_reentrancy_guard);
+ }
+ 
++static void imx6_sdma_unrealize(DeviceState *dev)
++{
++    qemu_bh_delete(IMX6_SDMA(dev)->bh);
++}
++
++static const Property imx6_sdma_properties[] = {
++    /* Events whose peripheral is the source (the RX side). */
++    DEFINE_PROP_UINT64("rx-events", Imx6SdmaState, rx_events, 0),
++};
++
+ static const VMStateDescription imx6_sdma_vmstate = {
+     .name = TYPE_IMX6_SDMA,
+-    .version_id = 1,
+-    .minimum_version_id = 1,
++    .version_id = 2,
++    .minimum_version_id = 2,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT32_ARRAY(regs, Imx6SdmaState, IMX6_SDMA_REG_SIZE / 4),
+         VMSTATE_UINT32(intr, Imx6SdmaState),
++        VMSTATE_UINT64(requests, Imx6SdmaState),
++        VMSTATE_UINT32(running, Imx6SdmaState),
++        VMSTATE_UINT32_ARRAY(bd, Imx6SdmaState, IMX6_SDMA_CHANNELS),
++        VMSTATE_UINT32_ARRAY(pos, Imx6SdmaState, IMX6_SDMA_CHANNELS),
++        VMSTATE_UINT32_ARRAY(ctx, Imx6SdmaState,
++                             IMX6_SDMA_CHANNELS * IMX6_SDMA_CTX_WORDS),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+@@ -110,8 +371,11 @@ static void imx6_sdma_class_init(ObjectClass *oc, const void *data)
+     DeviceClass *dc = DEVICE_CLASS(oc);
+ 
+     dc->realize = imx6_sdma_realize;
++    dc->unrealize = imx6_sdma_unrealize;
+     dc->vmsd = &imx6_sdma_vmstate;
+-    dc->desc = "i.MX6 SDMA (probe stub)";
++    dc->desc = "i.MX6 SDMA";
++    device_class_set_legacy_reset(dc, imx6_sdma_reset);
++    device_class_set_props(dc, imx6_sdma_properties);
+ }
+ 
+ static const TypeInfo imx6_sdma_info = {
+diff --git a/hw/misc/imx6_sdma.h b/hw/misc/imx6_sdma.h
+index ae6a70b..46d9931 100644
+--- a/hw/misc/imx6_sdma.h
++++ b/hw/misc/imx6_sdma.h
+@@ -1,5 +1,5 @@
+ /*
+- * i.MX6 SDMA emulation — a stub, see imx6_sdma.c.
++ * i.MX6 SDMA emulation, see imx6_sdma.c.
+  *
+  * Copyright (c) 2026
+  *
+@@ -18,14 +18,26 @@
+ OBJECT_DECLARE_SIMPLE_TYPE(Imx6SdmaState, IMX6_SDMA)
+ 
+ #define IMX6_SDMA_REG_SIZE  0x4000
++#define IMX6_SDMA_CHANNELS  32
++#define IMX6_SDMA_EVENTS    48
++#define IMX6_SDMA_CTX_WORDS 32
+ 
+ struct Imx6SdmaState {
+     SysBusDevice parent_obj;
+ 
+     MemoryRegion iomem;
+     qemu_irq irq;
++    QEMUBH *bh;
+     uint32_t intr;
+     uint32_t regs[IMX6_SDMA_REG_SIZE / 4];
++
++    uint64_t rx_events;     /* events whose transfers read the peripheral */
++    uint64_t requests;      /* DMA request lines, one per event */
++    uint32_t running;       /* started channels */
++    uint32_t bd[IMX6_SDMA_CHANNELS];    /* BD each channel is on */
++    uint32_t pos[IMX6_SDMA_CHANNELS];   /* bytes moved within that BD */
++    /* Channel contexts, as channel 0 loads them into data memory. */
++    uint32_t ctx[IMX6_SDMA_CHANNELS * IMX6_SDMA_CTX_WORDS];
+ };
+ 
+ #endif /* HW_MISC_IMX6_SDMA_H */
+diff --git a/hw/ssi/imx_spi.c b/hw/ssi/imx_spi.c
+index 8e014b7..77d22a2 100644
+--- a/hw/ssi/imx_spi.c
++++ b/hw/ssi/imx_spi.c
+@@ -88,6 +88,7 @@ static void imx_spi_rxfifo_reset(IMXSPIState *s)
+ 
+ static void imx_spi_update_irq(IMXSPIState *s)
+ {
++    uint32_t dma = s->regs[ECSPI_DMAREG];
+     int level;
+ 
+     if (fifo32_is_empty(&s->rx_fifo)) {
+@@ -118,6 +119,18 @@ static void imx_spi_update_irq(IMXSPIState *s)
+ 
+     qemu_set_irq(s->irq, level);
+ 
++    /*
++     * DMA requests: TX while the TX FIFO holds no more than TX_THRESHOLD
++     * words. RX while the RX FIFO holds any: the DMA moves single words,
++     * so the threshold, which only paces the hardware's bursts, and the
++     * RX tail request (RXTDEN) need no separate model.
++     */
++    qemu_set_irq(s->dma_tx_req, (dma & ECSPI_DMAREG_TEDEN) &&
++                 fifo32_num_used(&s->tx_fifo) <=
++                 EXTRACT(dma, ECSPI_DMAREG_TX_THRESHOLD));
++    qemu_set_irq(s->dma_rx_req, (dma & ECSPI_DMAREG_RXDEN) &&
++                 !fifo32_is_empty(&s->rx_fifo));
++
+     DPRINTF("IRQ level is %d\n", level);
+ }
+ 
+@@ -470,6 +483,8 @@ static void imx_spi_realize(DeviceState *dev, Error **errp)
+     for (i = 0; i < ECSPI_NUM_CS; ++i) {
+         sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->cs_lines[i]);
+     }
++    qdev_init_gpio_out_named(dev, &s->dma_rx_req, "dma-rx-req", 1);
++    qdev_init_gpio_out_named(dev, &s->dma_tx_req, "dma-tx-req", 1);
+ 
+     fifo32_create(&s->tx_fifo, ECSPI_FIFO_SIZE);
+     fifo32_create(&s->rx_fifo, ECSPI_FIFO_SIZE);
+diff --git a/include/hw/ssi/imx_spi.h b/include/hw/ssi/imx_spi.h
+index 9a95127..3eb99ab 100644
+--- a/include/hw/ssi/imx_spi.h
++++ b/include/hw/ssi/imx_spi.h
+@@ -62,6 +62,8 @@
+ #define ECSPI_DMAREG_RXTDEN (1 << 31)
+ #define ECSPI_DMAREG_RXDEN (1 << 23)
+ #define ECSPI_DMAREG_TEDEN (1 << 7)
++#define ECSPI_DMAREG_TX_THRESHOLD_SHIFT 0
++#define ECSPI_DMAREG_TX_THRESHOLD_LENGTH 6
+ #define ECSPI_DMAREG_RX_THRESHOLD_SHIFT 16
+ #define ECSPI_DMAREG_RX_THRESHOLD_LENGTH 6
+ 
+@@ -93,6 +95,8 @@ struct IMXSPIState {
+     qemu_irq irq;
+ 
+     qemu_irq cs_lines[ECSPI_NUM_CS];
++    qemu_irq dma_rx_req;
++    qemu_irq dma_tx_req;
+ 
+     SSIBus *bus;
+ 
+-- 
+2.56.1
+

@@ -606,7 +606,7 @@ The machine is a patch series on QEMU v11.0.0 (`98b060d`) in
 | 0001–0005 | i.MX6SX SoC container (Cortex-A9, GIC, the 6SX memory map from `fdt@3`) and the `diamond3` machine |
 | 0006, 0014 | GPMI NAND controller with APBH DMA and BCH |
 | 0007 | Boot ROM stub: loads U-Boot from NAND, resets the CPU on watchdog reboot |
-| 0008, 0009 | SDMA and MMDC stubs, enough for their probes |
+| 0008, 0009, 0155 | SDMA (channel 0 context loads, BD transfers on peripheral DMA requests; the 6SX wires none) and an MMDC stub |
 | 0010 | PFUZE200 PMIC on i2c4 |
 | 0011, 0016, 0018, 0019 | vf610 ADCs: the magwheel's two Hall channels (`wheel-position`, `-global imx6.adc.wheel-degrees=N`), the battery divider |
 | 0012, 0013, 0017 | LCDIF scanout with its interrupts, and the SoC wiring of the above |
