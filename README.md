@@ -14,9 +14,7 @@ QEMU machines that boot the stock firmware of Nest Learning Thermostats from the
 | --- | --- | --- | --- |
 | `-M diamond3` | diamond3 (Display-3.4) | i.MX6SoloX | U-Boot 2014.04, Linux 4.1.15, UBIFS root |
 | `-M j49` | j49 (Display-2.x) | TI AM3703 | x-loader, U-Boot 2012.10, Linux 2.6.37, JFFS2 root |
-
-[Nest Thermostat E (`onyx`)](docs/qemu-onyx.md) has a separate U-Boot UART
-bring-up target, not full firmware boot support.
+| `-M onyx` | [Nest Thermostat E](docs/qemu-onyx.md) (Display-4.x) | i.MX6UL | U-Boot 2015.04, Linux 4.1.15, UBIFS root |
 
 - Modelled: display, ring, button, piezo, backplate, WiFi, Thread radio.
 - diamond3 USB: automatic host attachment on supported Linux hosts;
@@ -81,9 +79,11 @@ You supply the NAND image; formats in [docs/nand-image.md](docs/nand-image.md).
 ```
 
 Onyx's UI provides the display, ring, button, piezo, backplate, serial
-console and QMP; radio, networking and USB are not modelled. Its pre-boot gives root the
+console, QMP and WiFi (`--ssh`, `--cloud`, `--mqtt` as on the diamond3);
+the Thread radio and USB are not modelled. Its pre-boot gives root the
 password `nest`, allows root over ssh, quiets the console, keeps the screen
-on and saves the backplate's wiring; it disables watchdog resets for bring-up. `--onyx --nand FILE` seeds its working copy from
+on, saves the `QEMU` WiFi network and the backplate's wiring; it disables
+watchdog resets for bring-up. `--onyx --nand FILE` seeds its working copy from
 a prepared Onyx NAND image; no `-bios` or separate firmware files are required.
 
 | Option | Effect |

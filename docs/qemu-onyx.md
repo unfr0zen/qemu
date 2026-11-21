@@ -10,8 +10,12 @@ divider on channel 4 (a 3.90 V pack) and the ring's Hall pair on channels
 a second. The launcher runs
 `ui/backplate.py --board onyx` on UART3 (`/dev/ttysensormcu0`): it reports
 the firmware the unit's own backplate ran (mono 1.4.11, BSL 4.0, model
-"X") and acks the onyx's MCU mode request (0x8b, ack 0x36). The radio and
-CAAM cryptography are not modelled.
+"X") and acks the onyx's MCU mode request (0x8b, ack 0x36). WiFi is the
+diamond3's BCM43341 model on usdhc2 (brcmfmac, brcmfmac43340-sdio; WL_REG_ON
+GPIO2_IO16, host wake GPIO2_IO17) on QEMU's user network: the unit joins
+"QEMU" and gets 10.0.2.15, offline unless `--cloud`; `--ssh PORT` and
+`--mqtt HOST[:PORT]` work as on the diamond3. The Thread radio and CAAM
+cryptography are not modelled.
 
 ## Development Linux
 
@@ -64,7 +68,9 @@ ROM NAND boot with FCB/ECC and closed-device HAB verification are unsupported.
 
 The pre-boot (`scripts/provision.py --onyx`) gives root the password
 `nest`, allows root over ssh, keeps all but critical messages off the
-console and keeps the screen on; `--no-provision` skips it. It boots
+console, keeps the screen on, saves the `QEMU` WiFi network (with slirp's
+gateway and DNS; the MAC is the saved environment's `ethaddr`) and the
+backplate's wiring, and marks the setup done; `--no-provision` skips it. It boots
 with open fuses for U-Boot's prompt. With closed fuses, the default,
 U-Boot disconnects the console UART and the kernel's console is
 `/dev/null`, so a console login needs `-machine secure-boot=off`.
