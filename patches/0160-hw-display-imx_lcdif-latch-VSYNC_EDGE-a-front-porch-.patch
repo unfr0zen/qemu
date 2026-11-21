@@ -1,0 +1,152 @@
+From eabea540b3485e6c0c212b816185dde1ca0019cf Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 02:05:28 -0500
+Subject: [PATCH 160/161] hw/display: imx_lcdif: latch VSYNC_EDGE a front porch
+ after frame done
+
+CUR_FRAME_DONE and VSYNC_EDGE latched at the same instant. The stock
+Onyx nlclient pans (mxsfb waits for CUR_FRAME_DONE) and then waits for
+VSYNC (FBIO_WAITFORVSYNC clears VSYNC_EDGE and waits for the next one):
+with both at frame end, every present cost two frames and the UI ran
+at a steady 30 fps.
+
+The panel's VSYNC follows the last active line by the vertical front
+porch. Take it from what mxsfb programs (VDCTRL1 period, VDCTRL3
+vertical wait, TRANSFER_COUNT height; the Onyx: 336 - 8 - 320 = 8
+lines, 0.4 ms) and latch VSYNC_EDGE that much after CUR_FRAME_DONE;
+without a porch both still latch together. The Onyx now presents every
+frame, 60 per second.
+---
+ hw/display/imx_lcdif.c         | 44 ++++++++++++++++++++++++++++++----
+ include/hw/display/imx_lcdif.h |  1 +
+ 2 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/hw/display/imx_lcdif.c b/hw/display/imx_lcdif.c
+index 998d4f7..bf6f708 100644
+--- a/hw/display/imx_lcdif.c
++++ b/hw/display/imx_lcdif.c
+@@ -19,10 +19,16 @@
+  *   - TRANSFER_COUNT (+0x30): VCOUNT << 16 | HCOUNT — the frame geometry.
+  *   - CUR_BUF (+0x40) / NEXT_BUF (+0x50): the DMA addresses; the driver
+  *     only ever writes NEXT_BUF (pan), the hardware flips it at frame end.
+- *   - TIMING, VDCTRL0..4, DVICTRL*, DEBUG0: stored, nothing reads them.
++ *   - VDCTRL1 (VSYNC_PERIOD, lines) and VDCTRL3 (VERTICAL_WAIT_CNT: the
++ *     sync pulse and back porch, lines): with TRANSFER_COUNT's height they
++ *     give the vertical front porch. TIMING, VDCTRL0/2/4, DVICTRL* and
++ *     DEBUG0 are stored, nothing reads them.
+  * While RUN is set a frame ends every 1/60 s of virtual time: NEXT_BUF
+- * moves to CUR_BUF and CUR_FRAME_DONE + VSYNC_EDGE latch in CTRL1; the IRQ
+- * is the OR of the enabled status bits.
++ * moves to CUR_BUF and CUR_FRAME_DONE latches in CTRL1. VSYNC_EDGE
++ * latches a front porch later, as the panel's VSYNC follows the last
++ * active line: a client that pans (waiting for CUR_FRAME_DONE) and then
++ * waits for VSYNC gets both in the same frame. The IRQ is the OR of the
++ * enabled status bits.
+  *
+  * Pixel formats: WORD_LENGTH 3 = 32 bpp RGB888 unpacked (one u32 per
+  * pixel, B in byte 0, G in 1, R in 2 — QEMU's x8r8g8b8), WORD_LENGTH 0 =
+@@ -92,6 +98,19 @@ static bool lcdif_running(ImxLcdifState *s)
+            !(ctrl & (CTRL_SFTRST | CTRL_CLKGATE));
+ }
+ 
++/* The vertical front porch the driver programmed, as virtual time. */
++static int64_t lcdif_front_porch_ns(ImxLcdifState *s)
++{
++    uint32_t period = s->regs[LCDC_VDCTRL1 / 4];
++    uint32_t wait = s->regs[LCDC_VDCTRL3 / 4] & 0xffff;
++    uint32_t active = s->regs[LCDC_TRANSFER_COUNT / 4] >> 16;
++
++    if (!period || wait + active >= period) {
++        return 0;
++    }
++    return LCDIF_FRAME_NS * (int64_t)(period - wait - active) / period;
++}
++
+ static void lcdif_update_irq(ImxLcdifState *s)
+ {
+     uint32_t ctrl1 = s->regs[LCDC_CTRL1 / 4];
+@@ -100,6 +119,16 @@ static void lcdif_update_irq(ImxLcdifState *s)
+                          (ctrl1 >> CTRL1_IRQ_ENABLE_SHIFT) & 0xf);
+ }
+ 
++static void lcdif_vsync(void *opaque)
++{
++    ImxLcdifState *s = opaque;
++
++    if (lcdif_running(s)) {
++        s->regs[LCDC_CTRL1 / 4] |= CTRL1_VSYNC_EDGE_IRQ;
++        lcdif_update_irq(s);
++    }
++}
++
+ /* Frame end: flip to the buffer the driver queued, latch the status bits. */
+ static void lcdif_frame_end(void *opaque)
+ {
+@@ -111,9 +140,10 @@ static void lcdif_frame_end(void *opaque)
+     if (s->regs[LCDC_NEXT_BUF / 4]) {
+         s->regs[LCDC_CUR_BUF / 4] = s->regs[LCDC_NEXT_BUF / 4];
+     }
+-    s->regs[LCDC_CTRL1 / 4] |= CTRL1_CUR_FRAME_DONE_IRQ | CTRL1_VSYNC_EDGE_IRQ;
++    s->regs[LCDC_CTRL1 / 4] |= CTRL1_CUR_FRAME_DONE_IRQ;
+     lcdif_update_irq(s);
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    timer_mod(s->vsync_timer, now + lcdif_front_porch_ns(s));
+     s->frame_deadline += LCDIF_FRAME_NS;
+     if (s->frame_deadline <= now) {
+         s->frame_deadline += ((now - s->frame_deadline) / LCDIF_FRAME_NS + 1) *
+@@ -245,6 +275,7 @@ static void imx_lcdif_write(void *opaque, hwaddr off, uint64_t val,
+             timer_mod(s->frame_timer, s->frame_deadline);
+         } else {
+             timer_del(s->frame_timer);
++            timer_del(s->vsync_timer);
+         }
+     }
+     if ((off & ~0xc) == LCDC_CTRL1) {
+@@ -272,7 +303,7 @@ static int lcdif_post_load(void *opaque, int version)
+ 
+ static const VMStateDescription vmstate_imx_lcdif = {
+     .name = TYPE_IMX_LCDIF,
+-    .version_id = 3,
++    .version_id = 4,
+     .minimum_version_id = 2,
+     .post_load = lcdif_post_load,
+     .fields = (const VMStateField[]) {
+@@ -280,6 +311,7 @@ static const VMStateDescription vmstate_imx_lcdif = {
+         VMSTATE_BOOL(invalidate, ImxLcdifState),
+         VMSTATE_TIMER_PTR(frame_timer, ImxLcdifState),
+         VMSTATE_INT64_V(frame_deadline, ImxLcdifState, 3),
++        VMSTATE_TIMER_PTR_V(vsync_timer, ImxLcdifState, 4),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+@@ -291,6 +323,7 @@ static void imx_lcdif_reset(DeviceState *dev)
+     memset(s->regs, 0, sizeof(s->regs));
+     s->invalidate = true;
+     timer_del(s->frame_timer);
++    timer_del(s->vsync_timer);
+     qemu_irq_lower(s->irq);
+ }
+ 
+@@ -305,6 +338,7 @@ static void imx_lcdif_realize(DeviceState *dev, Error **errp)
+ 
+     s->con = graphic_console_init(dev, 0, &imx_lcdif_gfx_ops, s);
+     s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, lcdif_frame_end, s);
++    s->vsync_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, lcdif_vsync, s);
+ }
+ 
+ static void imx_lcdif_class_init(ObjectClass *oc, const void *data)
+diff --git a/include/hw/display/imx_lcdif.h b/include/hw/display/imx_lcdif.h
+index a3f6f31..7d85143 100644
+--- a/include/hw/display/imx_lcdif.h
++++ b/include/hw/display/imx_lcdif.h
+@@ -24,6 +24,7 @@ struct ImxLcdifState {
+     qemu_irq irq;
+     QemuConsole *con;
+     QEMUTimer *frame_timer;         /* end of each scanned-out frame */
++    QEMUTimer *vsync_timer;         /* the VSYNC edge after it */
+     int64_t frame_deadline;
+ 
+     bool invalidate;
+-- 
+2.56.1
+
