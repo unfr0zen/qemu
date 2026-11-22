@@ -596,6 +596,9 @@ def make_handler(board, log, screen, qmp, pins, name, backplate=None, filesystem
                 self.vendor(self.path[len("/vendor/"):])
             elif self.path.startswith("/font/"):
                 self.font(self.path[len("/font/"):])
+            elif self.path == "/favicon.ico":
+                with open(os.path.join(HERE, "favicon.ico"), "rb") as f:
+                    self.send_body(200, "image/x-icon", f.read())
             else:
                 self.send_body(404, "text/plain", b"not found\n")
 
