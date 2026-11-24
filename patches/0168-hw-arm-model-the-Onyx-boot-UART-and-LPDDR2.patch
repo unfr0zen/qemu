@@ -1,0 +1,138 @@
+From 8ee3efd3d11528e0a53ea76f170a291ebfb09fb7 Mon Sep 17 00:00:00 2001
+From: will <will-tm@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:34:06 -0500
+Subject: [PATCH] hw/arm: model the Onyx boot UART and LPDDR2
+
+Honor the UART1 TX pad drive strength while keeping the reset console available. Support the byte and halfword register accesses used by LPDDR2 setup. Mirror the 128 MiB RAM in the upper half of the 256 MiB CS0 window so the bootloader can size it.
+---
+ hw/arm/onyx.c           |  7 +++++++
+ hw/misc/imx6_mmdc.c     | 17 +++++++++++------
+ hw/misc/imx6ul_iomuxc.c | 11 ++++++++---
+ 3 files changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/hw/arm/onyx.c b/hw/arm/onyx.c
+index b87eb15..b6de5fe 100644
+--- a/hw/arm/onyx.c
++++ b/hw/arm/onyx.c
+@@ -33,6 +33,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(OnyxMachineState, ONYX_MACHINE)
+ 
+ struct OnyxMachineState {
+     MachineState parent_obj;
++    MemoryRegion ram_alias;
+     bool secure_boot;
+     bool usb_boot;
+     char *boot_rom;
+@@ -287,6 +288,12 @@ static void onyx_init(MachineState *machine)
+     stl_le_p(fuses + 0x4e0, 1500U << 20);
+     memory_region_add_subregion(get_system_memory(), FSL_IMX6UL_MMDC_ADDR,
+                                 machine->ram);
++    /* The 128 MiB LPDDR2 repeats in the board's 256 MiB CS0 window. */
++    memory_region_init_alias(&ONYX_MACHINE(machine)->ram_alias, OBJECT(machine),
++                             "onyx.ram-alias", machine->ram, 0, ONYX_RAM_SIZE);
++    memory_region_add_subregion(get_system_memory(),
++                                FSL_IMX6UL_MMDC_ADDR + ONYX_RAM_SIZE,
++                                &ONYX_MACHINE(machine)->ram_alias);
+     if (ONYX_MACHINE(machine)->boot_rom) {
+         if (machine->firmware ||
+             get_image_size(ONYX_MACHINE(machine)->boot_rom, &error_fatal) !=
+diff --git a/hw/misc/imx6_mmdc.c b/hw/misc/imx6_mmdc.c
+index 857bb61..0b7d854 100644
+--- a/hw/misc/imx6_mmdc.c
++++ b/hw/misc/imx6_mmdc.c
+@@ -65,19 +65,26 @@ static uint64_t imx6_mmdc_read(void *opaque, hwaddr off, unsigned size)
+     } else {
+         val = 0;
+     }
+-    if (off == MMDC_MAPSR) {
++    if (off / 4 == MMDC_MAPSR / 4) {
+         val = deposit32(val, BP_MAPSR_PSS, 1,
+                         !extract32(val, BP_MAPSR_PSD, 1));
+         val = deposit32(val, BP_MAPSR_DVACK, 1,
+                         extract32(val, BP_MAPSR_DVFS, 1));
+     }
+-    return val;
++    return extract32(val, (off % 4) * 8, size * 8);
+ }
+ 
+ static void imx6_mmdc_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+ {
+     Imx6MmdcState *s = IMX6_MMDC(opaque);
++    unsigned shift = (off % 4) * 8;
++
++    off &= ~(hwaddr)3;
++    if (off >= sizeof(s->regs)) {
++        return;
++    }
++    val = deposit32(s->regs[off / 4], shift, size * 8, val);
+ 
+     if (off == MMDC_MDSCR) {
+         /* Configuration and LPDDR2 mode-register reads complete at once. */
+@@ -93,16 +100,14 @@ static void imx6_mmdc_write(void *opaque, hwaddr off, uint64_t val,
+     } else if (off == MMDC_MPDGCTRL0) {
+         val = deposit32(val, BP_RST_RD_FIFO, 1, 0);
+     }
+-    if (off < sizeof(s->regs)) {
+-        s->regs[off / 4] = val;
+-    }
++    s->regs[off / 4] = val;
+ }
+ 
+ static const MemoryRegionOps imx6_mmdc_ops = {
+     .read = imx6_mmdc_read,
+     .write = imx6_mmdc_write,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid.min_access_size = 4,
++    .valid.min_access_size = 1,
+     .valid.max_access_size = 4,
+ };
+ 
+diff --git a/hw/misc/imx6ul_iomuxc.c b/hw/misc/imx6ul_iomuxc.c
+index bed7b10..5a645f1 100644
+--- a/hw/misc/imx6ul_iomuxc.c
++++ b/hw/misc/imx6ul_iomuxc.c
+@@ -1,7 +1,7 @@
+ /*
+  * i.MX6UL IOMUXC register storage and UART1 DCE pad routing.
+  *
+- * Other peripheral routes and electrical pad characteristics are not modelled.
++ * The UART1 TX pad driver's enable is modelled along with mux selection.
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ #include "qemu/osdep.h"
+@@ -12,13 +12,17 @@
+ 
+ #define UART1_TX_MUX  0x084
+ #define UART1_RX_MUX  0x088
++#define UART1_TX_PAD  0x310
+ #define UART1_RX_SEL  0x624
+ #define MUX_MODE_MASK 0xf
++#define PAD_DSE_MASK  (7 << 3)
++#define UART1_TX_PAD_RESET 0x10b0
+ 
+ static void imx6ul_iomuxc_update(IMX6ULIOMUXCState *s)
+ {
+     qemu_set_irq(s->uart1_tx,
+-                 (s->regs[UART1_TX_MUX / 4] & MUX_MODE_MASK) == 0);
++                 (s->regs[UART1_TX_MUX / 4] & MUX_MODE_MASK) == 0 &&
++                 (s->regs[UART1_TX_PAD / 4] & PAD_DSE_MASK) != 0);
+     qemu_set_irq(s->uart1_rx,
+                  (s->regs[UART1_RX_MUX / 4] & MUX_MODE_MASK) == 0 &&
+                  (s->regs[UART1_RX_SEL / 4] & 7) == 3);
+@@ -38,7 +42,7 @@ static void imx6ul_iomuxc_write(void *opaque, hwaddr offset, uint64_t value,
+ 
+     s->regs[offset / 4] = value;
+     if (offset == UART1_TX_MUX || offset == UART1_RX_MUX ||
+-        offset == UART1_RX_SEL) {
++        offset == UART1_TX_PAD || offset == UART1_RX_SEL) {
+         imx6ul_iomuxc_update(s);
+     }
+ }
+@@ -56,6 +60,7 @@ static void imx6ul_iomuxc_reset_hold(Object *obj, ResetType type)
+     IMX6ULIOMUXCState *s = IMX6UL_IOMUXC(obj);
+ 
+     memset(s->regs, 0, sizeof(s->regs));
++    s->regs[UART1_TX_PAD / 4] = UART1_TX_PAD_RESET;
+     imx6ul_iomuxc_update(s);
+ }
+ 

@@ -81,6 +81,20 @@ class OnyxHardwareTests(unittest.TestCase):
         self.write(0x021b001c, 0)
         self.assertEqual(self.read(0x021b001c), 0)
 
+    def test_mmdc_subword_access(self):
+        self.write(0x021b0000, 0x83100000)
+        self.assertEqual(int(self.command("readw 0x021b0002")[1], 16), 0x8310)
+        self.command("writeb 0x021b0001 0x12")
+        self.assertEqual(self.read(0x021b0000), 0x83101200)
+        self.command("writew 0x021b0406 0x20")
+        self.assertEqual(int(self.command("readw 0x021b0406")[1], 16), 0x220)
+
+    def test_lpddr2_cs0_mirror(self):
+        self.write(0x88000000, 0x89abcdef)
+        self.assertEqual(self.read(0x80000000), 0x89abcdef)
+        self.write(0x80000000, 0)
+        self.assertEqual(self.read(0x88000000), 0)
+
     def test_fuses_and_temperature(self):
         self.assertEqual(self.read(0x021bc420), 0x51454d55)
         self.assertEqual(self.read(0x021bc460), 2)
@@ -100,8 +114,9 @@ class OnyxHardwareTests(unittest.TestCase):
             self.write(address, value)
             self.assertEqual(self.read(address), value)
         self.monitor("system_reset")
-        for address in (0x020e0084, 0x020e0088, 0x020e0310, 0x020e0624):
+        for address in (0x020e0084, 0x020e0088, 0x020e0624):
             self.assertEqual(self.read(address), 0)
+        self.assertEqual(self.read(0x020e0310), 0x10b0)
         self.write(0x02020040, ord("A"))
         self.assertEqual(self.uart.recv(1), b"A")
 
@@ -117,6 +132,13 @@ class OnyxHardwareTests(unittest.TestCase):
         self.write(0x020e0084, 0x10)  # SION does not change the mux mode.
         self.write(0x02020040, ord("B"))
         self.assertEqual(self.uart.recv(1), b"B")
+        self.write(0x020e0310, 0)  # A zero drive strength disables the TX pad.
+        self.write(0x02020040, ord("X"))
+        self.assertFalse(select.select([self.uart], [], [], 0.05)[0])
+        self.assertTrue(self.read(0x02020098) & 8)  # TXDC still completes.
+        self.write(0x020e0310, 0x1b0b1)
+        self.write(0x02020040, ord("C"))
+        self.assertEqual(self.uart.recv(1), b"C")
 
     def receive_byte(self):
         deadline = time.monotonic() + 1
